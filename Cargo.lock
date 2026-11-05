@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "expandrv-autostart",
  "expandrv-backends",
  "expandrv-core",
  "expandrv-ipc",
@@ -845,6 +846,14 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "expandrv-autostart"
+version = "0.1.0"
+dependencies = [
+ "expandrv-core",
  "windows 0.62.2",
 ]
 
