@@ -49,3 +49,6 @@ secrets/
 
 # 개발과 설계 문서
 docs/
+
+# 에이전트 작업 트리
+.claude/worktrees/
