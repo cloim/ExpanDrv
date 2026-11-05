@@ -35,17 +35,16 @@ fn local_backend_mount_end_to_end() {
             Arc::new(LocalBackend::new(root.path()).unwrap()),
             rt.handle().clone(),
             VfsOptions {
-                read_only: false,
                 metadata_ttl: Duration::from_secs(5),
-                staging_dir: staging.path().to_owned(),
                 op_timeout: Duration::from_secs(30),
+                ..VfsOptions::new(staging.path().to_owned())
             },
         )
         .unwrap(),
     );
     let mount_point = free_drive();
     let drive = MountedDrive::mount(
-        vfs,
+        vfs.clone(),
         &MountOptions {
             mount_point: mount_point.clone(),
             label: "ExpanDrvTest".into(),
@@ -56,6 +55,8 @@ fn local_backend_mount_end_to_end() {
     .unwrap();
     let m = |rel: &str| PathBuf::from(format!("{mount_point}\\{rel}"));
     let local = |rel: &str| root.path().join(rel);
+    // 업로드는 핸들 정리 후 백그라운드로 진행되므로 원격 확인 전에 기다립니다.
+    let settle = || vfs.sync(Duration::from_secs(30)).unwrap();
 
     // 열거와 읽기(대소문자 무시)
     let mut names: Vec<_> = fs::read_dir(m(""))
@@ -69,6 +70,7 @@ fn local_backend_mount_end_to_end() {
     // 새 파일 쓰기(1 MiB 넘게)와 업로드
     let big: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
     fs::write(m("sub\\big.bin"), &big).unwrap();
+    settle();
     assert_eq!(fs::read(local("sub/big.bin")).unwrap(), big);
 
     // 기존 파일 부분 수정
@@ -87,6 +89,7 @@ fn local_backend_mount_end_to_end() {
         f.read_to_string(&mut s).unwrap();
         assert_eq!(s, "012XY56789!");
     }
+    settle();
     assert_eq!(fs::read(local("existing.txt")).unwrap(), b"012XY56789!");
 
     // 디렉터리 생성, 이름 변경, 덮어쓰기 이동
@@ -97,6 +100,7 @@ fn local_backend_mount_end_to_end() {
     fs::write(m("a.txt"), b"A").unwrap();
     fs::write(m("b.txt"), b"B").unwrap();
     fs::rename(m("a.txt"), m("b.txt")).unwrap();
+    settle();
     assert_eq!(fs::read(local("b.txt")).unwrap(), b"A");
     fs::rename(m("newdir"), m("renamed")).unwrap();
     assert_eq!(
@@ -121,6 +125,7 @@ fn local_backend_mount_end_to_end() {
         .unwrap();
     f.set_len(4).unwrap();
     drop(f);
+    settle();
     assert_eq!(fs::read(local("existing.txt")).unwrap(), b"012X");
 
     drop(drive);

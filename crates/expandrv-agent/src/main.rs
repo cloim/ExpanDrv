@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// 마운트 해제 때 남은 업로드를 기다리는 최대 시간
+const UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Parser)]
 #[command(
     name = "expandrv",
@@ -214,13 +217,11 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(appdata).join("ExpanDrv").join("config.toml"))
 }
 
-fn staging_dir(id: &str) -> Result<PathBuf> {
+/// 드라이브별 캐시 폴더(`%LOCALAPPDATA%\ExpanDrv\cache\<id>`). 스테이징과 메타 DB를 둡니다.
+fn cache_dir(id: &str) -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Config("LOCALAPPDATA 환경 변수가 없습니다".into()))?;
-    Ok(PathBuf::from(base)
-        .join("ExpanDrv")
-        .join("staging")
-        .join(id))
+    Ok(PathBuf::from(base).join("ExpanDrv").join("cache").join(id))
 }
 
 /// 드라이브 id로 고정된 볼륨 일련번호(FNV-1a)
@@ -317,12 +318,14 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
             VfsOptions {
                 read_only: d.read_only,
                 metadata_ttl: Duration::from_secs(d.cache.metadata_ttl_secs),
-                staging_dir: staging_dir(&d.id)?,
-                op_timeout: Duration::from_secs(120),
+                block_size: u64::from(d.cache.block_size_mib) << 20,
+                memory_cache_bytes: (d.cache.memory_limit_mib as usize) << 20,
+                meta_db: Some(cache_dir(&d.id)?.join("meta.db")),
+                ..VfsOptions::new(cache_dir(&d.id)?.join("staging"))
             },
         )?;
         let drive = MountedDrive::mount(
-            Arc::new(vfs),
+            Arc::new(vfs.clone()),
             &MountOptions {
                 mount_point: d.mount_point.clone(),
                 label: d.label.clone(),
@@ -337,7 +340,7 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
                 let _ = tx.send(id);
             }
         });
-        mounted.push((d.id.clone(), signal, drive));
+        mounted.push((d.id.clone(), signal, drive, vfs));
     }
     println!("Ctrl+C 또는 `expandrv unmount <id>`로 해제합니다.");
 
@@ -348,17 +351,25 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
                 id = rx.recv() => id,
             }
         });
-        match next {
+        let leaving: Vec<_> = match next {
             Some(id) => {
-                mounted.retain(|(mid, _, _)| *mid != id);
-                println!("해제했습니다: {id}");
+                let (out, keep) = mounted.into_iter().partition(|m| m.0 == id);
+                mounted = keep;
+                out
             }
-            None => {
-                for (_, signal, _) in &mounted {
-                    signal.set();
-                }
-                mounted.clear();
-                println!("모든 드라이브를 해제했습니다.");
+            None => std::mem::take(&mut mounted),
+        };
+        for (id, signal, drive, vfs) in leaving {
+            signal.set();
+            // 새 쓰기를 막은 뒤 남은 업로드를 마칩니다.
+            drop(drive);
+            let pending = vfs.pending_uploads();
+            if pending > 0 {
+                println!("{id}: 남은 업로드 {pending}개를 마치는 중입니다");
+            }
+            match vfs.sync(UPLOAD_DRAIN_TIMEOUT) {
+                Ok(()) => println!("해제했습니다: {id}"),
+                Err(e) => eprintln!("{id}: {e}"),
             }
         }
     }
