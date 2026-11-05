@@ -7,9 +7,16 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["sftp"]
 webdav = []
-sftp = []
+sftp = [
+    "dep:russh",
+    "dep:russh-sftp",
+    "dep:futures",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:data-encoding",
+]
 s3 = []
 ftp = []
 
@@ -20,6 +27,12 @@ bytes.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"], optional = true }
+russh-sftp = { version = "3.0.1", optional = true }
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", optional = true }
+data-encoding = { version = "2", optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
