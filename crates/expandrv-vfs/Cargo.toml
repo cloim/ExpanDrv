@@ -1,0 +1,21 @@
+[package]
+name = "expandrv-vfs"
+description = "ExpanDrv VFS 코어: 핸들 테이블, 메타 캐시, 스테이징 쓰기와 업로드"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+expandrv-core.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+expandrv-backends.workspace = true
+
+[lints]
+workspace = true
