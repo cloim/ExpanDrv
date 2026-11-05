@@ -190,10 +190,10 @@ impl Shared {
     fn forget(&self, path: &RemotePath) {
         self.meta.invalidate_tree(path);
         self.blocks.invalidate(path);
-        if let Some(store) = &self.store {
-            if let Err(e) = store.forget_tree(path) {
-                tracing::warn!(%path, error = %e, "메타 저장소 정리 실패");
-            }
+        if let Some(store) = &self.store
+            && let Err(e) = store.forget_tree(path)
+        {
+            tracing::warn!(%path, error = %e, "메타 저장소 정리 실패");
         }
     }
 
@@ -430,10 +430,10 @@ impl Shared {
             if !self.meta.replace_dir_if(&dir, &old, Arc::new(new.clone())) || diff.is_empty() {
                 continue;
             }
-            if let Some(store) = &self.store {
-                if let Err(e) = store.save_dir(&dir, &new) {
-                    tracing::warn!(%dir, error = %e, "메타 저장 실패");
-                }
+            if let Some(store) = &self.store
+                && let Err(e) = store.save_dir(&dir, &new)
+            {
+                tracing::warn!(%dir, error = %e, "메타 저장 실패");
             }
             for c in diff.iter().filter(|c| c.kind != ChangeKind::Added) {
                 self.blocks.invalidate(&c.path);
@@ -562,10 +562,10 @@ impl Vfs {
             Some(l) => l,
             None => match s.run(s.backend.list(path)) {
                 Ok(l) => {
-                    if let Some(store) = &s.store {
-                        if let Err(e) = store.save_dir(path, &l) {
-                            tracing::warn!(%path, error = %e, "메타 저장 실패");
-                        }
+                    if let Some(store) = &s.store
+                        && let Err(e) = store.save_dir(path, &l)
+                    {
+                        tracing::warn!(%path, error = %e, "메타 저장 실패");
                     }
                     let l = Arc::new(l);
                     s.meta.put_dir(path, l.clone());
@@ -653,10 +653,10 @@ impl Vfs {
             Err(Error::NotFound) => {}
             Err(e) => return Err(e),
         }
-        if let Some(parent) = path.parent() {
-            if !self.stat(&parent)?.1.is_dir() {
-                return Err(Error::NotADirectory);
-            }
+        if let Some(parent) = path.parent()
+            && !self.stat(&parent)?.1.is_dir()
+        {
+            return Err(Error::NotADirectory);
         }
         let s = &self.s;
         let entry = match kind {
@@ -981,10 +981,10 @@ impl Vfs {
 
     pub fn quota(&self) -> Quota {
         let mut q = self.s.quota.lock();
-        if let Some((v, at)) = *q {
-            if at.elapsed() < QUOTA_TTL {
-                return v;
-            }
+        if let Some((v, at)) = *q
+            && at.elapsed() < QUOTA_TTL
+        {
+            return v;
         }
         let v = self.s.run(self.s.backend.quota()).unwrap_or_default();
         *q = Some((v, Instant::now()));
