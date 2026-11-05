@@ -881,6 +881,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "expandrv-log"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "expandrv-vfs"
 version = "0.1.0"
 dependencies = [

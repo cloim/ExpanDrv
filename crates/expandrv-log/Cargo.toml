@@ -1,0 +1,18 @@
+[package]
+name = "expandrv-log"
+description = "ExpanDrv 로그 개인정보와 비밀 값 마스킹"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+regex = "1.11"
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tracing.workspace = true
+
+[lints]
+workspace = true
