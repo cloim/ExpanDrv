@@ -34,8 +34,17 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 
+# 배포 크기 목표(10MB 안팎)에 맞춰 크기 우선으로 최적화하고, 파일 I/O 핫 경로만 속도 최적화를 유지합니다.
+# WinFsp 콜백의 패닉을 오류 상태로 바꾸려면 unwind가 필요합니다.
 [profile.release]
+opt-level = "s"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "unwind"
+
+[profile.release.package.expandrv-vfs]
+opt-level = 3
+
+[profile.release.package.expandrv-winfsp]
+opt-level = 3
