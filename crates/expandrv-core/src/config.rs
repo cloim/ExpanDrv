@@ -5,11 +5,26 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// 현재 설정 스키마 버전. 형식이 바뀌면 올리고 [`migrate`]에 변환 단계를 추가합니다.
+pub const CONFIG_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// 설정 스키마 버전. 없으면 0(초기 형식)으로 봅니다.
+    #[serde(default)]
+    pub version: u32,
     #[serde(default, rename = "drive")]
     pub drives: Vec<DriveConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            drives: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,7 +42,50 @@ pub struct DriveConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub transfer: TransferConfig,
+    /// 에이전트가 시작할 때 자동으로 마운트할지 여부
+    #[serde(default)]
+    pub auto_mount: bool,
+    /// 이 드라이브의 원격 연결에 쓸 프록시
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
     pub backend: BackendConfig,
+}
+
+/// SOCKS5 또는 HTTP CONNECT 프록시. 자격 증명은 URL이 아닌 별도 필드로 둡니다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// `socks5://host:port`, `socks5h://host:port`(원격 DNS) 또는 `http://host:port`
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<SecretSource>,
+}
+
+impl ProxyConfig {
+    /// URL 형식을 확인하고 (scheme, host, port)를 돌려줍니다.
+    pub fn parse(&self) -> Result<(&str, &str, u16)> {
+        let bad = |why: &str| Error::Config(format!("프록시 {:?}: {why}", self.url));
+        let (scheme, rest) = self
+            .url
+            .split_once("://")
+            .ok_or_else(|| bad("scheme://host:port 형식이 아닙니다"))?;
+        if !matches!(scheme, "socks5" | "socks5h" | "http") {
+            return Err(bad("socks5, socks5h, http만 지원합니다"));
+        }
+        let rest = rest.trim_end_matches('/');
+        if rest.contains('@') || rest.contains('/') {
+            return Err(bad("자격 증명과 경로는 URL에 넣을 수 없습니다"));
+        }
+        let (host, port) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| bad("포트가 없습니다"))?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let port = port.parse().map_err(|_| bad("포트가 올바르지 않습니다"))?;
+        if host.is_empty() {
+            return Err(bad("호스트가 없습니다"));
+        }
+        Ok((scheme, host, port))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,9 +223,11 @@ pub enum FtpTls {
 pub enum SecretSource {
     /// 환경 변수에서 읽습니다.
     Env { var: String },
+    /// Windows 자격 증명 관리자에 DPAPI(현재 사용자)로 암호화해 저장한 값입니다.
+    Credential { target: String },
 }
 
-/// [`SecretSource`]를 실제 값으로 바꿉니다. 3단계에서 DPAPI와 Credential Manager 구현이 추가됩니다.
+/// [`SecretSource`]를 실제 값으로 바꿉니다.
 pub trait SecretResolver: Send + Sync {
     fn resolve(&self, source: &SecretSource) -> Result<SecretString>;
 }
@@ -181,6 +241,9 @@ impl SecretResolver for EnvSecrets {
             SecretSource::Env { var } => std::env::var(var)
                 .map(SecretString::from)
                 .map_err(|_| Error::Config(format!("환경 변수 {var}가 없습니다"))),
+            SecretSource::Credential { .. } => {
+                Err(Error::Unsupported("자격 증명 저장소 해석기가 필요합니다"))
+            }
         }
     }
 }
@@ -204,17 +267,49 @@ fn default_true() -> bool {
     true
 }
 
+/// 이전 스키마의 설정 표를 현재 형식으로 바꿉니다. 바꾼 경우 이전 버전을 돌려줍니다.
+pub fn migrate(table: &mut toml::Table) -> Result<Option<u32>> {
+    let from = match table.get("version") {
+        None => 0,
+        Some(v) => v
+            .as_integer()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Error::Config("version이 올바르지 않습니다".into()))?,
+    };
+    if from > CONFIG_VERSION {
+        return Err(Error::Config(format!(
+            "설정 버전 {from}은 이 프로그램({CONFIG_VERSION})보다 새롭습니다"
+        )));
+    }
+    if from == CONFIG_VERSION {
+        return Ok(None);
+    }
+    // v0 -> v1: 필드 변경 없이 버전만 기록합니다. 이후 단계는 여기에 순서대로 추가합니다.
+    table.insert(
+        "version".into(),
+        toml::Value::Integer(CONFIG_VERSION.into()),
+    );
+    Ok(Some(from))
+}
+
 impl Config {
-    /// 파일이 없으면 빈 설정을 돌려줍니다.
+    /// 파일이 없으면 빈 설정을 돌려줍니다. 이전 형식이면 `.v<버전>.bak`으로 백업하고 새 형식으로 저장합니다.
     pub fn load(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e.into()),
         };
-        let cfg: Config =
-            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        let parse_err =
+            |e: &dyn std::fmt::Display| Error::Config(format!("{}: {e}", path.display()));
+        let mut table: toml::Table = toml::from_str(&text).map_err(|e| parse_err(&e))?;
+        let migrated = migrate(&mut table)?;
+        let cfg: Config = table.try_into().map_err(|e| parse_err(&e))?;
         cfg.validate()?;
+        if let Some(from) = migrated {
+            std::fs::copy(path, path.with_extension(format!("toml.v{from}.bak")))?;
+            cfg.save(path)?;
+        }
         Ok(cfg)
     }
 
@@ -232,6 +327,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        for d in &self.drives {
+            if let Some(p) = &d.proxy {
+                p.parse()?;
+            }
+        }
         let mut ids = std::collections::HashSet::new();
         let mut mounts = std::collections::HashSet::new();
         for d in &self.drives {
@@ -290,7 +390,9 @@ root = 'C:\tmp'
 
     #[test]
     fn parses_and_roundtrips() {
-        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        let mut cfg: Config = toml::from_str(SAMPLE).unwrap();
+        assert_eq!(cfg.version, 0);
+        cfg.version = CONFIG_VERSION;
         cfg.validate().unwrap();
         assert_eq!(cfg.drives.len(), 2);
         assert_eq!(cfg.drives[0].backend.kind(), "webdav");
@@ -320,6 +422,76 @@ root = 'C:\tmp'
             r#"password = "plain""#,
         );
         assert!(toml::from_str::<Config>(&bad).is_err());
+    }
+
+    #[test]
+    fn migrates_unversioned_file_with_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("toml.v0.bak")).unwrap(),
+            SAMPLE
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("version = 1")
+        );
+        // 두 번째 불러오기에서는 다시 백업하지 않습니다.
+        std::fs::remove_file(path.with_extension("toml.v0.bak")).unwrap();
+        Config::load(&path).unwrap();
+        assert!(!path.with_extension("toml.v0.bak").exists());
+    }
+
+    #[test]
+    fn rejects_newer_config_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 99\n").unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn proxy_url_validation() {
+        let p = |url: &str| ProxyConfig {
+            url: url.into(),
+            username: None,
+            password: None,
+        };
+        assert_eq!(
+            p("socks5://127.0.0.1:1080").parse().unwrap(),
+            ("socks5", "127.0.0.1", 1080)
+        );
+        assert_eq!(
+            p("http://proxy.example.com:3128/").parse().unwrap().1,
+            "proxy.example.com"
+        );
+        assert_eq!(p("socks5h://[::1]:1080").parse().unwrap().1, "::1");
+        for bad in [
+            "ftp://h:1",
+            "socks5://u:p@h:1",
+            "http://h",
+            "http://h:x",
+            "h:1",
+        ] {
+            assert!(p(bad).parse().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn credential_source_roundtrips() {
+        let s: SecretSource =
+            toml::from_str("from = \"credential\"\ntarget = \"ExpanDrv/nas/password\"").unwrap();
+        assert_eq!(
+            s,
+            SecretSource::Credential {
+                target: "ExpanDrv/nas/password".into()
+            }
+        );
+        assert!(EnvSecrets.resolve(&s).is_err());
     }
 
     #[test]

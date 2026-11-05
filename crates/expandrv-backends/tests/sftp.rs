@@ -58,7 +58,7 @@ fn pattern(len: usize) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sftp_crud_against_real_server() {
     let Some(cfg) = base_config() else { return };
-    let be = expandrv_backends::connect(&BackendConfig::Sftp(cfg), &EnvSecrets)
+    let be = expandrv_backends::connect(&BackendConfig::Sftp(cfg), None, &EnvSecrets)
         .await
         .unwrap();
     assert_eq!(be.kind(), "sftp");

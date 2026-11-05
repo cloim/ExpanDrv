@@ -1,6 +1,6 @@
 //! 스토리지 백엔드 모음. 네트워크 백엔드는 기능 플래그로 분리합니다.
 
-use expandrv_core::config::{BackendConfig, SecretResolver};
+use expandrv_core::config::{BackendConfig, ProxyConfig, SecretResolver};
 use expandrv_core::{Backend, Error, Result};
 use std::sync::Arc;
 
@@ -27,8 +27,12 @@ pub(crate) fn install_crypto_provider() {
 /// 설정으로 백엔드를 만들고 연결과 인증을 확인합니다.
 pub async fn connect(
     cfg: &BackendConfig,
+    proxy: Option<&ProxyConfig>,
     secrets: &dyn SecretResolver,
 ) -> Result<Arc<dyn Backend>> {
+    if proxy.is_some() {
+        return Err(Error::Unsupported("프록시"));
+    }
     match cfg {
         BackendConfig::Local { root } => Ok(Arc::new(local::LocalBackend::new(root)?)),
         #[cfg(feature = "webdav")]

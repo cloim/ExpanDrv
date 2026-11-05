@@ -643,9 +643,13 @@ mod minio {
         // 팩토리 경유 연결
         let mut c = cfg(&ep, &bucket, "");
         c.access_key_id = access_key();
-        let be = crate::connect(&expandrv_core::config::BackendConfig::S3(c), &secret())
-            .await
-            .unwrap();
+        let be = crate::connect(
+            &expandrv_core::config::BackendConfig::S3(c),
+            None,
+            &secret(),
+        )
+        .await
+        .unwrap();
         assert_eq!(be.kind(), "s3");
         assert!(!be.capabilities().rename_dir);
     }

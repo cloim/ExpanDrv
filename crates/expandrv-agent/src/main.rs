@@ -259,6 +259,8 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
         read_only: a.read_only,
         cache: CacheConfig::default(),
         transfer: TransferConfig::default(),
+        auto_mount: false,
+        proxy: None,
         backend: backend_config(a.backend)?,
     });
     cfg.save(cfg_path)?;
@@ -313,7 +315,11 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
     for d in drives {
         let signal = Arc::new(UnmountSignal::create(&d.id)?);
         let backend = expandrv_vfs::throttle(
-            rt.block_on(expandrv_backends::connect(&d.backend, &EnvSecrets))?,
+            rt.block_on(expandrv_backends::connect(
+                &d.backend,
+                d.proxy.as_ref(),
+                &EnvSecrets,
+            ))?,
             d.transfer.upload_kib_per_sec * 1024,
             d.transfer.download_kib_per_sec * 1024,
         );
@@ -416,7 +422,8 @@ fn run(cli: Cli) -> Result<()> {
                 .ok_or_else(|| Error::Config(format!("드라이브 {id}가 없습니다")))?;
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                let be = expandrv_backends::connect(&d.backend, &EnvSecrets).await?;
+                let be =
+                    expandrv_backends::connect(&d.backend, d.proxy.as_ref(), &EnvSecrets).await?;
                 let n = be.list(&expandrv_core::RemotePath::root()).await?.len();
                 println!("연결 성공: {} 루트 항목 {n}개", be.kind());
                 Ok(())
