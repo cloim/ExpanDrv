@@ -7,8 +7,17 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["sftp", "s3"]
-webdav = []
+default = ["webdav", "sftp", "s3"]
+webdav = [
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:quick-xml",
+    "dep:percent-encoding",
+    "dep:httpdate",
+    "dep:time",
+    "dep:sha2",
+    "dep:tokio-util",
+]
 sftp = [
     "dep:russh",
     "dep:russh-sftp",
@@ -36,24 +45,31 @@ bytes.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# SFTP 백엔드
+
+# HTTP 공용(WebDAV, S3): rustls만 사용
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "stream"], optional = true }
+quick-xml = { version = "0.41", features = ["serialize", "overlapped-lists"], optional = true }
+percent-encoding = { version = "2.3", optional = true }
+tokio-util = { version = "0.7.20", features = ["io"], optional = true }
+futures = { workspace = true, optional = true }
+
+# WebDAV
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+httpdate = { version = "1.0", optional = true }
+time = { version = "0.3", features = ["parsing"], optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# SFTP
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"], optional = true }
 russh-sftp = { version = "3.0.1", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
 data-encoding = { version = "2", optional = true }
 
-# S3 호환 백엔드
+# S3 호환
 rusty-s3 = { version = "0.10.2", default-features = false, features = ["rustcrypto"], optional = true }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"], optional = true }
-quick-xml = { version = "0.41", features = ["serialize", "overlapped-lists"], optional = true }
 serde = { workspace = true, optional = true }
 jiff = { version = "0.2.39", default-features = false, features = ["std"], optional = true }
-percent-encoding = { version = "2.3", optional = true }
-tokio-util = { version = "0.7.20", features = ["io"], optional = true }
-
-# 공용
-futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
