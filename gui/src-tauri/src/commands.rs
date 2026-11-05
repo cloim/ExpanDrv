@@ -95,6 +95,8 @@ pub struct DriveRow {
     pub state: &'static str,
     pub message: Option<String>,
     pub pending_uploads: u64,
+    /// 원격에서 받고 있는 블록 수
+    pub active_downloads: u64,
     pub auto_mount: bool,
     pub read_only: bool,
     /// 설정에 없는데 에이전트가 아직 들고 있는 드라이브면 false
@@ -135,6 +137,7 @@ pub fn merge_status(cfg: Option<&Config>, status: &AgentStatus) -> Vec<DriveRow>
                 state,
                 message,
                 pending_uploads: live.map_or(0, |s| s.pending_uploads),
+                active_downloads: live.map_or(0, |s| s.active_downloads),
                 auto_mount: d.auto_mount,
                 read_only: d.read_only,
                 configured: true,
@@ -154,6 +157,7 @@ pub fn merge_status(cfg: Option<&Config>, status: &AgentStatus) -> Vec<DriveRow>
             state,
             message,
             pending_uploads: s.pending_uploads,
+            active_downloads: s.active_downloads,
             auto_mount: false,
             read_only: false,
             configured: false,

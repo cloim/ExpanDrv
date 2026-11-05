@@ -57,6 +57,7 @@ fn merges_config_with_agent_status() {
         backend: "webdav".into(),
         state,
         pending_uploads: 3,
+        active_downloads: 2,
     };
     let status = AgentStatus {
         drives: vec![

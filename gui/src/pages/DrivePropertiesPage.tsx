@@ -44,6 +44,7 @@ const CACHE_FIELDS: { key: keyof CacheSettings; label: string; unit: string; min
   { key: 'blockSizeMib', label: '읽기 블록 크기', unit: 'MiB', min: 1, max: 64 },
   { key: 'memoryLimitMib', label: '블록 캐시 메모리 상한', unit: 'MiB', min: 8, max: 8192 },
   { key: 'pollIntervalSecs', label: '원격 변경 확인 주기', unit: '초, 0이면 끔', min: 0, max: 86400 },
+  { key: 'diskLimitMib', label: '암호화 디스크 캐시 상한', unit: 'MiB, 0이면 끔', min: 0, max: 1048576 },
 ];
 
 const TRANSFER_FIELDS: { key: keyof TransferSettings; label: string }[] = [
@@ -152,6 +153,7 @@ export function DrivePropertiesPage() {
           blockSizeMib: Number(draft.cache.blockSizeMib),
           memoryLimitMib: Number(draft.cache.memoryLimitMib),
           pollIntervalSecs: Number(draft.cache.pollIntervalSecs),
+          diskLimitMib: Number(draft.cache.diskLimitMib),
         },
         transfer: {
           uploadKibPerSec: Number(draft.transfer.uploadKibPerSec),

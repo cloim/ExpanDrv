@@ -12,6 +12,7 @@ export interface DriveRow {
   state: DriveState;
   message: string | null;
   pendingUploads: number;
+  activeDownloads: number;
   autoMount: boolean;
   readOnly: boolean;
   configured: boolean;
@@ -34,6 +35,7 @@ export interface CacheSettings {
   blockSizeMib: number;
   memoryLimitMib: number;
   pollIntervalSecs: number;
+  diskLimitMib: number;
 }
 
 export interface TransferSettings {

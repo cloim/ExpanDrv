@@ -15,12 +15,13 @@ type Busy = Record<string, 'mount' | 'unmount' | 'delete'>;
 
 function stateText(d: DriveRow) {
   if (d.state === 'mounted' && d.pendingUploads > 0) return '업로드 중';
+  if (d.state === 'mounted' && d.activeDownloads > 0) return '다운로드 중';
   if (d.state === 'unmounted' && d.pendingUploads > 0) return '해제 중';
   return STATE_LABEL[d.state];
 }
 
 function StateCell({ data }: { data: DriveRow }) {
-  const busy = data.pendingUploads > 0;
+  const busy = data.pendingUploads > 0 || data.activeDownloads > 0;
   return (
     <span className="inline-flex items-center gap-2">
       <Led state={data.state === 'mounted' ? 'on' : data.state === 'failed' ? 'fail' : 'off'} busy={busy} />
@@ -186,6 +187,14 @@ export function DrivesPage() {
         width: 96,
         cellRenderer: ({ value }: { value: number }) => (
           <span className={`kbd-mono ${value > 0 ? 'font-bold text-warn' : 'text-ink-3'}`}>{value}</span>
+        ),
+      },
+      {
+        field: 'activeDownloads',
+        headerName: '다운로드',
+        width: 88,
+        cellRenderer: ({ value }: { value: number }) => (
+          <span className={`kbd-mono ${value > 0 ? 'font-bold text-accent' : 'text-ink-3'}`}>{value}</span>
         ),
       },
       {

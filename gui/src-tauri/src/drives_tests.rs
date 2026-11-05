@@ -238,7 +238,7 @@ fn add_rolls_back_secrets_when_saving_fails() {
 fn patch(proxy: serde_json::Value) -> DrivePatch {
     json(serde_json::json!({
         "label": "NAS 2", "mountPoint": "v:", "readOnly": true, "autoMount": false,
-        "cache": { "metadataTtlSecs": 10, "blockSizeMib": 8, "memoryLimitMib": 128, "pollIntervalSecs": 0 },
+        "cache": { "metadataTtlSecs": 10, "blockSizeMib": 8, "memoryLimitMib": 128, "pollIntervalSecs": 0, "diskLimitMib": 256 },
         "transfer": { "uploadKibPerSec": 512, "downloadKibPerSec": 0 },
         "proxy": proxy
     }))
@@ -258,7 +258,7 @@ fn update_keeps_or_drops_proxy_password() {
     let d = cfg.drive("nas").unwrap();
     assert_eq!((d.label.as_str(), d.mount_point.as_str()), ("NAS 2", "V:"));
     assert!(d.read_only && !d.auto_mount);
-    assert_eq!(d.cache.block_size_mib, 8);
+    assert_eq!((d.cache.block_size_mib, d.cache.disk_limit_mib), (8, 256));
     assert_eq!(d.transfer.upload_kib_per_sec, 512);
     assert!(d.proxy.as_ref().unwrap().password.is_some());
     assert!(

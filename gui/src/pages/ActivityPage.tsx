@@ -71,12 +71,15 @@ export function ActivityPage() {
                 <li key={d.id} className="panel flex h-11 items-center gap-2.5 px-4 text-[13px]">
                   <Led
                     state={d.state === 'mounted' ? 'on' : d.state === 'failed' ? 'fail' : 'off'}
-                    busy={d.pendingUploads > 0}
+                    busy={d.pendingUploads > 0 || d.activeDownloads > 0}
                   />
                   <span className="kbd-mono font-semibold">{d.id}</span>
                   <span className="kbd-mono text-ink-3">{d.mountPoint}</span>
                   <span className={d.pendingUploads > 0 ? 'font-semibold text-warn' : 'text-ink-3'}>
                     업로드 대기 {d.pendingUploads}
+                  </span>
+                  <span className={d.activeDownloads > 0 ? 'font-semibold text-accent' : 'text-ink-3'}>
+                    다운로드 {d.activeDownloads}
                   </span>
                 </li>
               ))}

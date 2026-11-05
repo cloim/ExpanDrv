@@ -559,6 +559,7 @@ pub struct CacheInput {
     pub block_size_mib: u32,
     pub memory_limit_mib: u32,
     pub poll_interval_secs: u64,
+    pub disk_limit_mib: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -594,6 +595,7 @@ fn build_cache(c: CacheInput) -> Result<CacheConfig> {
         block_size_mib: in_range("블록 크기", c.block_size_mib, 1, 64)?,
         memory_limit_mib: in_range("캐시 메모리 상한", c.memory_limit_mib, 8, 8192)?,
         poll_interval_secs: in_range("변경 확인 주기", c.poll_interval_secs, 0, 86_400)?,
+        disk_limit_mib: in_range("디스크 캐시 상한", c.disk_limit_mib, 0, 1 << 20)?,
     })
 }
 
@@ -914,6 +916,7 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
             block_size_mib: d.cache.block_size_mib,
             memory_limit_mib: d.cache.memory_limit_mib,
             poll_interval_secs: d.cache.poll_interval_secs,
+            disk_limit_mib: d.cache.disk_limit_mib,
         },
         transfer: TransferInput {
             upload_kib_per_sec: d.transfer.upload_kib_per_sec,
