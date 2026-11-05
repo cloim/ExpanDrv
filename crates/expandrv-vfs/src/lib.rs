@@ -714,6 +714,11 @@ impl Vfs {
         match s.run(s.backend.stat(path)) {
             Ok(e) => {
                 s.meta.put_entry(path, e.clone());
+                if let Some(store) = &s.store
+                    && let Err(err) = store.save_entry(path, &e)
+                {
+                    tracing::debug!(%path, error = %err, "항목 저장 실패");
+                }
                 Ok((path.clone(), e))
             }
             Err(Error::NotFound) if s.backend.capabilities().case_sensitive => {
@@ -745,7 +750,15 @@ impl Vfs {
                         .find(|x| x.name.eq_ignore_ascii_case(name))
                         .map(|x| (parent.join(&x.name).unwrap_or(path.clone()), x))
                         .ok_or(Error::NotFound),
-                    None => Err(e),
+                    // 목록을 받은 적이 없으면 단일 항목 조회 기록을 씁니다.
+                    None => match s
+                        .store
+                        .as_ref()
+                        .and_then(|st| st.load_entry(path).ok().flatten())
+                    {
+                        Some(x) => Ok((path.clone(), x)),
+                        None => Err(e),
+                    },
                 }
             }
             Err(e) => Err(e),

@@ -58,6 +58,63 @@ impl MetaStore {
         })
     }
 
+    /// 단일 항목 조회 결과를 남깁니다. 목록을 받은 적 없는 폴더의 파일도 오프라인에서 열 수 있게 합니다.
+    pub fn save_entry(&self, path: &RemotePath, e: &Entry) -> Result<()> {
+        let (Some(dir), Some(name)) = (path.parent(), path.name()) else {
+            return Ok(());
+        };
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO entries(dir, name, is_dir, size, modified_ns, created_ns, etag, readonly)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    dir.as_str(),
+                    name,
+                    e.is_dir(),
+                    e.size as i64,
+                    to_ns(e.modified),
+                    to_ns(e.created),
+                    e.etag,
+                    e.readonly
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn load_entry(&self, path: &RemotePath) -> Result<Option<Entry>> {
+        let (Some(dir), Some(name)) = (path.parent(), path.name()) else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock();
+        let r = conn.query_row(
+            "SELECT name, is_dir, size, modified_ns, created_ns, etag, readonly
+             FROM entries WHERE dir = ?1 AND name = ?2",
+            params![dir.as_str(), name],
+            |r| {
+                Ok(Entry {
+                    name: r.get(0)?,
+                    kind: if r.get::<_, bool>(1)? {
+                        EntryKind::Dir
+                    } else {
+                        EntryKind::File
+                    },
+                    size: r.get::<_, i64>(2)? as u64,
+                    modified: from_ns(r.get(3)?),
+                    created: from_ns(r.get(4)?),
+                    etag: r.get(5)?,
+                    readonly: r.get(6)?,
+                })
+            },
+        );
+        match r {
+            Ok(e) => Ok(Some(e)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
     /// 업로드 저널: 아직 원격에 반영하지 않은 파일과 그 스테이징 파일, 편집 시작 때의 원격 버전
     pub fn journal_put(
         &self,

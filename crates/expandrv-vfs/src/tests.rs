@@ -727,3 +727,24 @@ fn disk_cache_is_invalidated_by_upload() {
     vfs.read(&h, 0, &mut buf).unwrap();
     assert_eq!(&buf, b"version-2");
 }
+
+#[test]
+fn offline_open_by_path_uses_saved_entry_and_disk_cache() {
+    let key = generate_cache_key().unwrap();
+    let f = fixture_with(|o| with_disk_cache(o, key));
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 239) as u8).collect();
+    std::fs::write(f.root.path().join("direct.bin"), &data).unwrap();
+    // 폴더 목록 없이 경로로 바로 엽니다.
+    let h = f.vfs.open(&p("/direct.bin")).unwrap();
+    let mut buf = vec![0u8; data.len()];
+    f.vfs.read(&h, 0, &mut buf).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    wait_disk_blocks(&f, 2);
+
+    f.backend.offline.store(true, Ordering::SeqCst);
+    let vfs = Vfs::new(f.backend.clone(), f._rt.handle().clone(), f.opts.clone()).unwrap();
+    let h = vfs.open(&p("/direct.bin")).unwrap();
+    let mut again = vec![0u8; data.len()];
+    assert_eq!(vfs.read(&h, 0, &mut again).unwrap(), data.len());
+    assert_eq!(again, data);
+}
