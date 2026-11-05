@@ -43,6 +43,9 @@ const WATCH_WINDOW: Duration = Duration::from_secs(600);
 const MAX_WATCHED_DIRS: usize = 64;
 /// 소비자가 없을 때 쌓아 둘 변경 알림 상한
 const MAX_PENDING_CHANGES: usize = 10_000;
+/// 이 시간 동안 쓰지 않은 읽기 블록은 메모리에서 비웁니다.
+const BLOCK_IDLE: Duration = Duration::from_secs(20);
+const BLOCK_TRIM_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
@@ -456,21 +459,30 @@ impl Vfs {
     ) -> Result<Self> {
         std::fs::create_dir_all(&opts.staging_dir)?;
         let store = opts.meta_db.as_deref().map(MetaStore::open).transpose()?;
-        Ok(Self {
-            s: Arc::new(Shared {
-                backend,
-                rt,
-                meta: MetaCache::new(opts.metadata_ttl),
-                store,
-                blocks: BlockCache::new(opts.block_size, opts.memory_cache_bytes),
-                nodes: Mutex::new(HashMap::new()),
-                quota: Mutex::new(None),
-                uploads: Semaphore::new(opts.max_parallel_uploads.max(1)),
-                watched: Mutex::new(HashMap::new()),
-                changes: Mutex::new(Vec::new()),
-                opts,
-            }),
-        })
+        let s = Arc::new(Shared {
+            backend,
+            rt,
+            meta: MetaCache::new(opts.metadata_ttl),
+            store,
+            blocks: BlockCache::new(opts.block_size, opts.memory_cache_bytes),
+            nodes: Mutex::new(HashMap::new()),
+            quota: Mutex::new(None),
+            uploads: Semaphore::new(opts.max_parallel_uploads.max(1)),
+            watched: Mutex::new(HashMap::new()),
+            changes: Mutex::new(Vec::new()),
+            opts,
+        });
+        // 유휴 블록 정리 작업. VFS가 사라지면 멈춥니다.
+        let weak = Arc::downgrade(&s);
+        s.rt.spawn(async move {
+            let mut tick = tokio::time::interval(BLOCK_TRIM_INTERVAL);
+            loop {
+                tick.tick().await;
+                let Some(s) = weak.upgrade() else { break };
+                s.blocks.trim_idle(BLOCK_IDLE);
+            }
+        });
+        Ok(Self { s })
     }
 
     pub fn read_only(&self) -> bool {
