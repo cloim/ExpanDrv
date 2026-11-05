@@ -74,6 +74,7 @@ struct Fixture {
     staging: tempfile::TempDir,
     backend: Arc<TestBackend>,
     vfs: Vfs,
+    opts: VfsOptions,
 }
 
 fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
@@ -96,13 +97,14 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
     opts.metadata_ttl = Duration::from_secs(60);
     opts.op_timeout = Duration::from_secs(10);
     tune(&mut opts);
-    let vfs = Vfs::new(backend.clone(), rt.handle().clone(), opts).unwrap();
+    let vfs = Vfs::new(backend.clone(), rt.handle().clone(), opts.clone()).unwrap();
     Fixture {
         _rt: rt,
         root,
         staging,
         backend,
         vfs,
+        opts,
     }
 }
 
@@ -437,4 +439,145 @@ fn throttle_wraps_only_when_limited() {
     let t = throttle(be.clone(), 1 << 20, 0);
     assert!(!Arc::ptr_eq(&t, &be));
     assert_eq!(t.kind(), "test");
+}
+
+/// 업로드 저널을 쓰는 픽스처(메타 DB 사용)
+fn journaled() -> Fixture {
+    fixture_with(|o| o.meta_db = Some(o.staging_dir.with_file_name("meta.db")))
+}
+
+/// 업로드가 계속 실패하는 상태에서 파일을 바꾸고 정리까지 마칩니다.
+fn edit_with_failing_upload(f: &Fixture, open: &str, rename_to: Option<&str>, body: &[u8]) {
+    f.backend.fail_writes.store(1_000, Ordering::SeqCst);
+    let h = f.vfs.open(&p(open)).unwrap();
+    f.vfs.overwrite(&h).unwrap();
+    f.vfs.write(&h, 0, body, false, false).unwrap();
+    if let Some(to) = rename_to {
+        f.vfs.rename(&h, &p(to), false).unwrap();
+    }
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert!(f.vfs.sync(Duration::from_millis(300)).is_err());
+}
+
+/// 기존 VFS를 끝낸 것처럼 정리하고 같은 설정으로 다시 엽니다. `crash`면 정리 코드를 돌리지 않습니다.
+fn restart(f: Fixture, crash: bool) -> (Fixture, Vfs) {
+    f.vfs.shutdown();
+    let old = f.vfs.clone();
+    if crash {
+        std::mem::forget(old);
+    } else {
+        drop(old);
+    }
+    f.backend.fail_writes.store(0, Ordering::SeqCst);
+    let vfs = Vfs::new(f.backend.clone(), f._rt.handle().clone(), f.opts.clone()).unwrap();
+    (f, vfs)
+}
+
+#[test]
+fn pending_upload_resumes_after_failed_shutdown() {
+    let f = journaled();
+    std::fs::write(f.root.path().join("doc.txt"), b"old").unwrap();
+    edit_with_failing_upload(&f, "/doc.txt", None, b"new content");
+    f.vfs.shutdown();
+    let Fixture {
+        _rt: rt,
+        root,
+        staging,
+        backend,
+        vfs,
+        opts,
+    } = f;
+    // 모든 핸들을 놓고 중단된 업로드 작업이 정리될 때까지 기다리면 노드 상태가 해제됩니다.
+    drop(vfs);
+    std::thread::sleep(Duration::from_millis(300));
+    let left = std::fs::read_dir(staging.path().join("stage"))
+        .unwrap()
+        .count();
+    assert_eq!(left, 1, "올리지 못한 스테이징 파일이 지워졌습니다");
+
+    backend.fail_writes.store(0, Ordering::SeqCst);
+    let vfs = Vfs::new(backend.clone(), rt.handle().clone(), opts).unwrap();
+    vfs.sync(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("doc.txt")).unwrap(),
+        b"new content"
+    );
+}
+
+#[test]
+fn pending_upload_resumes_after_crash_and_cleans_staging() {
+    let f = journaled();
+    std::fs::write(f.root.path().join("crash.bin"), b"old").unwrap();
+    edit_with_failing_upload(&f, "/crash.bin", None, b"survived");
+    assert_eq!(staging_files(&f), 1);
+    let (f, vfs) = restart(f, true);
+    vfs.sync(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        std::fs::read(f.root.path().join("crash.bin")).unwrap(),
+        b"survived"
+    );
+    assert_eq!(staging_files(&f), 0, "업로드 뒤 스테이징 파일이 남았습니다");
+    // 저널이 비었으므로 다시 열어도 올릴 것이 없습니다.
+    let again = Vfs::new(f.backend.clone(), f._rt.handle().clone(), f.opts.clone()).unwrap();
+    assert_eq!(again.pending_uploads(), 0);
+}
+
+#[test]
+fn recovered_upload_keeps_remote_change_and_writes_conflict_copy() {
+    let f = journaled();
+    std::fs::write(f.root.path().join("report.txt"), b"base").unwrap();
+    edit_with_failing_upload(&f, "/report.txt", None, b"local edit");
+    // 재시작 전에 다른 곳에서 원격 파일이 바뀝니다.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(f.root.path().join("report.txt"), b"remote edit by someone").unwrap();
+    let (f, vfs) = restart(f, true);
+    vfs.sync(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        std::fs::read(f.root.path().join("report.txt")).unwrap(),
+        b"remote edit by someone"
+    );
+    let copies: Vec<String> = std::fs::read_dir(f.root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("report (ExpanDrv 충돌 ") && n.ends_with(").txt"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(
+        std::fs::read(f.root.path().join(&copies[0])).unwrap(),
+        b"local edit"
+    );
+}
+
+#[test]
+fn journal_follows_rename_before_restart() {
+    let f = journaled();
+    std::fs::write(f.root.path().join("a.txt"), b"old").unwrap();
+    edit_with_failing_upload(&f, "/a.txt", Some("/b.txt"), b"renamed edit");
+    let (f, vfs) = restart(f, true);
+    vfs.sync(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        std::fs::read(f.root.path().join("b.txt")).unwrap(),
+        b"renamed edit"
+    );
+    assert!(!f.root.path().join("a.txt").exists());
+}
+
+#[test]
+fn conflict_name_format() {
+    let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    assert_eq!(
+        conflict_path(&p("/d/report.final.docx"), t)
+            .unwrap()
+            .as_str(),
+        "/d/report.final (ExpanDrv 충돌 2023-11-14 221320).docx"
+    );
+    assert_eq!(
+        conflict_path(&p("/.bashrc"), t).unwrap().as_str(),
+        "/.bashrc (ExpanDrv 충돌 2023-11-14 221320)"
+    );
+    assert_eq!(
+        conflict_path(&p("/noext"), UNIX_EPOCH).unwrap().as_str(),
+        "/noext (ExpanDrv 충돌 1970-01-01 000000)"
+    );
 }

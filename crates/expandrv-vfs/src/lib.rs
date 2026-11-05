@@ -27,9 +27,9 @@ use std::io::Write;
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
@@ -113,6 +113,8 @@ struct Shared {
     /// 최근 열거한 디렉터리와 그 시각
     watched: Mutex<HashMap<RemotePath, Instant>>,
     changes: Mutex<Vec<Change>>,
+    /// `shutdown` 이후에는 새 업로드를 시작하지 않습니다(남은 분량은 저널로 넘김).
+    closed: AtomicBool,
 }
 
 /// 열린 파일 또는 디렉터리 핸들. 같은 경로의 핸들은 하나의 노드를 공유합니다.
@@ -142,6 +144,25 @@ struct NodeState {
     /// 업로드 후 적용할 사용자 지정 수정 시각
     pending_mtime: Option<SystemTime>,
     deleted: bool,
+    /// 업로드 저널에 기록한 스테이징 파일 경로
+    journaled: Option<PathBuf>,
+    /// 편집을 시작할 때의 원격 버전. 복구 업로드에서 충돌 판단에 씁니다.
+    base_etag: Option<String>,
+    /// 이전 실행의 저널에서 되살린 노드
+    recovered: bool,
+}
+
+impl Drop for NodeState {
+    /// 올리지 못한 변경분은 스테이징 파일을 지우지 않고 저널과 함께 다음 실행으로 넘깁니다.
+    fn drop(&mut self) {
+        if self.dirty
+            && !self.deleted
+            && self.journaled.is_some()
+            && let Some(f) = self.staged.as_mut()
+        {
+            f.disable_cleanup(true);
+        }
+    }
 }
 
 impl NodeState {
@@ -220,7 +241,7 @@ impl Shared {
 
     fn schedule_upload(self: &Arc<Self>, node: &Arc<Node>, delay: Duration) {
         let mut st = node.state.lock();
-        if !st.dirty || st.deleted || st.upload.is_some() {
+        if !st.dirty || st.deleted || st.upload.is_some() || self.closed.load(Ordering::SeqCst) {
             return;
         }
         let generation = st.generation;
@@ -242,19 +263,35 @@ impl Shared {
                             size: st.entry.size,
                         },
                         st.pending_mtime,
+                        st.recovered.then(|| st.base_etag.clone()).flatten(),
                     )),
                     _ => None,
                 }
             };
-            let Some((path, source, mtime)) = job else {
+            let Some((path, source, mtime, recovered_base)) = job else {
                 s.upload_done(&n, generation, None);
                 return;
             };
             let result = async {
-                let mut e = s.backend.write(&path, source).await?;
+                // 복구 업로드인데 그사이 원격이 바뀌었으면 덮어쓰지 않고 충돌 사본으로 올립니다.
+                let mut target = path.clone();
+                let mut remote_kept = None;
+                if let Some(base) = &recovered_base
+                    && let Ok(remote) = s.backend.stat(&path).await
+                    && remote.etag.as_deref() != Some(base.as_str())
+                {
+                    target = conflict_path(&path, SystemTime::now())?;
+                    remote_kept = Some(remote);
+                }
+                let mut e = s.backend.write(&target, source).await?;
                 if let Some(m) = mtime.filter(|_| s.backend.capabilities().set_mtime) {
-                    s.backend.set_mtime(&path, m).await?;
+                    s.backend.set_mtime(&target, m).await?;
                     e.modified = Some(m);
+                }
+                if let Some(remote) = remote_kept {
+                    tracing::warn!(%path, conflict = %target, "원격 파일이 바뀌어 충돌 사본으로 올렸습니다");
+                    s.meta.invalidate(&target);
+                    return Ok(remote);
                 }
                 Ok(e)
             }
@@ -284,6 +321,14 @@ impl Shared {
                 st.staged = None;
                 st.pending_mtime = None;
                 st.failures = 0;
+                st.base_etag = None;
+                st.recovered = false;
+                if st.journaled.take().is_some()
+                    && let Some(store) = &self.store
+                    && let Err(e) = store.journal_remove(&path)
+                {
+                    tracing::warn!(%path, error = %e, "업로드 저널 정리 실패");
+                }
                 self.meta.invalidate(&path);
                 self.meta.put_entry(&path, entry);
                 self.blocks.invalidate(&path);
@@ -401,6 +446,70 @@ fn diff_listing(dir: &RemotePath, old: &[Entry], new: &[Entry]) -> Vec<Change> {
 }
 
 impl Shared {
+    /// 이전 실행의 업로드 저널을 읽어 남은 변경분을 다시 올립니다. 되살린 개수를 돌려줍니다.
+    fn recover(self: &Arc<Self>) -> usize {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let records = match store.journal_all() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "업로드 저널을 읽지 못했습니다");
+                return 0;
+            }
+        };
+        let mut count = 0;
+        for (path, staging, base_etag) in records {
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&staging)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(%path, staging = %staging.display(), error = %e, "스테이징 파일이 없어 업로드를 복구하지 못했습니다");
+                    let _ = store.journal_remove(&path);
+                    continue;
+                }
+            };
+            let temp = match TempPath::try_from_path(&staging) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(%path, error = %e, "스테이징 경로를 열지 못했습니다");
+                    continue;
+                }
+            };
+            let meta = file.metadata().ok();
+            let mut entry = Entry::file(
+                path.name().unwrap_or_default(),
+                meta.as_ref().map_or(0, |m| m.len()),
+            );
+            entry.modified = meta.and_then(|m| m.modified().ok());
+            let node = Arc::new(Node {
+                kind: EntryKind::File,
+                path: Mutex::new(path.clone()),
+                opens: AtomicUsize::new(0),
+                state: Mutex::new(NodeState {
+                    entry,
+                    staged: Some(NamedTempFile::from_parts(file, temp)),
+                    dirty: true,
+                    generation: 0,
+                    upload: None,
+                    failures: 0,
+                    pending_mtime: None,
+                    deleted: false,
+                    journaled: Some(staging),
+                    base_etag,
+                    recovered: true,
+                }),
+            });
+            self.nodes.lock().insert(path, node.clone());
+            self.schedule_upload(&node, Duration::ZERO);
+            count += 1;
+        }
+        count
+    }
+
     /// 최근 열거한 디렉터리를 다시 읽어 마지막 목록과 비교합니다.
     async fn poll_changes(&self) -> Vec<Change> {
         let dirs: Vec<RemotePath> = {
@@ -470,6 +579,7 @@ impl Vfs {
             uploads: Semaphore::new(opts.max_parallel_uploads.max(1)),
             watched: Mutex::new(HashMap::new()),
             changes: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
             opts,
         });
         // 유휴 블록 정리 작업. VFS가 사라지면 멈춥니다.
@@ -482,7 +592,24 @@ impl Vfs {
                 s.blocks.trim_idle(BLOCK_IDLE);
             }
         });
+        let recovered = s.recover();
+        if recovered > 0 {
+            tracing::info!(
+                count = recovered,
+                "이전 실행에서 남은 업로드를 이어서 올립니다"
+            );
+        }
         Ok(Self { s })
+    }
+
+    /// 마운트 해제 뒤 호출합니다. 진행 중 업로드를 멈추고 남은 변경분은 저널과 스테이징 파일로 남깁니다.
+    pub fn shutdown(&self) {
+        self.s.closed.store(true, Ordering::SeqCst);
+        for node in self.s.nodes.lock().values() {
+            if let Some((_, h)) = node.state.lock().upload.take() {
+                h.abort();
+            }
+        }
     }
 
     pub fn read_only(&self) -> bool {
@@ -641,6 +768,9 @@ impl Vfs {
                         failures: 0,
                         pending_mtime: None,
                         deleted: false,
+                        journaled: None,
+                        base_etag: None,
+                        recovered: false,
                     }),
                 })
             })
@@ -721,6 +851,24 @@ impl Vfs {
         Ok((pos - offset) as usize)
     }
 
+    /// 변경 표시와 함께 업로드 저널에 기록합니다. 스테이징 파일이 바뀌었으면 기록을 갱신합니다.
+    fn mark_dirty(&self, path: &RemotePath, st: &mut NodeState) {
+        st.dirty = true;
+        let (Some(store), Some(staged)) = (&self.s.store, &st.staged) else {
+            return;
+        };
+        if st.journaled.as_deref() == Some(staged.path()) {
+            return;
+        }
+        if st.journaled.is_none() {
+            st.base_etag = st.entry.etag.clone();
+        }
+        match store.journal_put(path, staged.path(), st.base_etag.as_deref()) {
+            Ok(()) => st.journaled = Some(staged.path().to_owned()),
+            Err(e) => tracing::warn!(%path, error = %e, "업로드 저널 기록 실패"),
+        }
+    }
+
     /// 스테이징 파일이 없으면 만들고 현재 원격 내용을 채웁니다.
     fn ensure_staged(&self, path: &RemotePath, st: &mut NodeState) -> Result<()> {
         if st.staged.is_some() {
@@ -777,7 +925,7 @@ impl Vfs {
         }
         st.entry.size = size.max(off + data.len() as u64);
         st.entry.modified = Some(SystemTime::now());
-        st.dirty = true;
+        self.mark_dirty(&path, &mut st);
         Ok((data.len(), st.entry.clone()))
     }
 
@@ -802,7 +950,7 @@ impl Vfs {
             .set_len(new_size)?;
         st.entry.size = new_size;
         st.entry.modified = Some(SystemTime::now());
-        st.dirty = true;
+        self.mark_dirty(&path, &mut st);
         Ok(st.entry.clone())
     }
 
@@ -887,6 +1035,11 @@ impl Vfs {
             }
         }
         drop(nodes);
+        if let Some(store) = &s.store
+            && let Err(e) = store.journal_move(&from, to)
+        {
+            tracing::warn!(%from, %to, error = %e, "업로드 저널 경로 갱신 실패");
+        }
         s.forget(&from);
         s.forget(to);
         for node in requeue {
@@ -930,6 +1083,11 @@ impl Vfs {
         st.staged = None;
         st.dirty = false;
         st.deleted = true;
+        if st.journaled.take().is_some()
+            && let Some(store) = &s.store
+        {
+            let _ = store.journal_remove(&path);
+        }
         drop(st);
         s.forget(&path);
         Ok(())
@@ -1060,3 +1218,31 @@ fn read_staged(staged: &NamedTempFile, size: u64, offset: u64, buf: &mut [u8]) -
 
 #[cfg(test)]
 mod tests;
+
+/// `이름 (ExpanDrv 충돌 2026-11-06 153012).확장자` 형태의 충돌 사본 경로(UTC)
+fn conflict_path(path: &RemotePath, now: SystemTime) -> Result<RemotePath> {
+    let name = path.name().unwrap_or_default();
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // 유닉스 일수를 그레고리력 날짜로 바꿉니다(H. Hinnant civil_from_days).
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let stamp = format!(
+        "{y:04}-{m:02}-{d:02} {:02}{:02}{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    );
+    let parent = path.parent().unwrap_or_else(RemotePath::root);
+    parent.join(&format!("{stem} (ExpanDrv 충돌 {stamp}){ext}"))
+}

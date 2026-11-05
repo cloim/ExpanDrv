@@ -45,12 +45,98 @@ impl MetaStore {
                  created_ns INTEGER,
                  etag TEXT,
                  readonly INTEGER NOT NULL,
-                 PRIMARY KEY(dir, name));",
+                 PRIMARY KEY(dir, name));
+             CREATE TABLE IF NOT EXISTS pending(
+                 path TEXT PRIMARY KEY,
+                 staging TEXT NOT NULL,
+                 base_etag TEXT,
+                 created_ns INTEGER NOT NULL);",
         )
         .map_err(db_err)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// 업로드 저널: 아직 원격에 반영하지 않은 파일과 그 스테이징 파일, 편집 시작 때의 원격 버전
+    pub fn journal_put(
+        &self,
+        path: &RemotePath,
+        staging: &Path,
+        base_etag: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO pending(path, staging, base_etag, created_ns) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    path.as_str(),
+                    staging.to_string_lossy(),
+                    base_etag,
+                    to_ns(Some(SystemTime::now()))
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn journal_remove(&self, path: &RemotePath) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM pending WHERE path = ?1", [path.as_str()])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 이름 변경으로 옮겨진 하위 트리의 저널 경로를 바꿉니다.
+    pub fn journal_move(&self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(db_err)?;
+        let moved: Vec<(String, RemotePath)> = {
+            let mut q = tx.prepare("SELECT path FROM pending").map_err(db_err)?;
+            let rows = q
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(db_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .filter_map(|p| {
+                    let new = RemotePath::parse(&p).ok()?.rebase(from, to)?;
+                    Some((p, new))
+                })
+                .collect()
+        };
+        for (old, new) in moved {
+            tx.execute(
+                "UPDATE OR REPLACE pending SET path = ?2 WHERE path = ?1",
+                params![old, new.as_str()],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// (원격 경로, 스테이징 파일, 원격 기준 버전)
+    pub fn journal_all(&self) -> Result<Vec<(RemotePath, std::path::PathBuf, Option<String>)>> {
+        let conn = self.conn.lock();
+        let mut q = conn
+            .prepare("SELECT path, staging, base_etag FROM pending ORDER BY created_ns")
+            .map_err(db_err)?;
+        let rows = q
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(p, s, e)| Some((RemotePath::parse(&p).ok()?, s.into(), e)))
+            .collect())
     }
 
     pub fn save_dir(&self, dir: &RemotePath, list: &[Entry]) -> Result<()> {
