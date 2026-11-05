@@ -6,6 +6,7 @@
 mod tests;
 mod xml;
 
+use crate::proxy::Proxy;
 use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::config::{S3Config, SecretResolver};
@@ -20,6 +21,7 @@ use rusty_s3::{Bucket, Credentials, Method, UrlStyle};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -56,13 +58,27 @@ pub struct S3Backend {
 impl S3Backend {
     /// 설정으로 백엔드를 만들고 버킷 접근을 확인합니다.
     pub async fn connect(cfg: &S3Config, secrets: &dyn SecretResolver) -> Result<Self> {
+        Self::connect_via(cfg, secrets, None).await
+    }
+
+    /// 프록시를 거쳐 연결합니다.
+    pub async fn connect_via(
+        cfg: &S3Config,
+        secrets: &dyn SecretResolver,
+        proxy: Option<Arc<Proxy>>,
+    ) -> Result<Self> {
         let secret = secrets.resolve(&cfg.secret_access_key)?;
-        let be = Self::new(cfg, &secret)?;
+        let be = Self::build(cfg, &secret, proxy.as_deref())?;
         be.verify().await?;
         Ok(be)
     }
 
+    #[cfg(test)]
     fn new(cfg: &S3Config, secret: &SecretString) -> Result<Self> {
+        Self::build(cfg, secret, None)
+    }
+
+    fn build(cfg: &S3Config, secret: &SecretString, proxy: Option<&Proxy>) -> Result<Self> {
         if cfg.bucket.trim().is_empty() {
             return Err(Error::Config("S3 버킷 이름이 비어 있습니다".into()));
         }
@@ -79,7 +95,11 @@ impl S3Backend {
         let bucket = Bucket::new(endpoint, style, cfg.bucket.trim().to_owned(), region)
             .map_err(|e| Error::Config(format!("S3 엔드포인트가 올바르지 않습니다: {e:?}")))?;
         crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder();
+        if let Some(p) = proxy {
+            http = http.proxy(p.reqwest()?);
+        }
+        let http = http
             .user_agent(concat!("ExpanDrv/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(120))

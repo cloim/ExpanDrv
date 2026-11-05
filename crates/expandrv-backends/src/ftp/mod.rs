@@ -7,6 +7,7 @@
 mod listing;
 mod wire;
 
+use crate::proxy::Proxy;
 use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::config::{FtpConfig, FtpTls, SecretResolver};
@@ -75,6 +76,7 @@ struct Params {
     tls_config: Arc<ClientConfig>,
     username: String,
     charset: Charset,
+    proxy: Option<Arc<Proxy>>,
 }
 
 struct Conn {
@@ -121,8 +123,16 @@ pub struct FtpBackend {
 impl FtpBackend {
     /// 연결과 로그인을 확인하고 백엔드를 만듭니다. 서버 인증서는 Windows 인증서 저장소로 검증합니다.
     pub async fn connect(cfg: &FtpConfig, secrets: &dyn SecretResolver) -> Result<Self> {
-        let tls = default_tls_config()?;
-        Self::connect_with_tls(cfg, secrets, tls).await
+        Self::connect_via(cfg, secrets, None).await
+    }
+
+    /// 프록시를 거쳐 연결합니다. 데이터 연결도 같은 프록시로 FTP 호스트에 엽니다.
+    pub async fn connect_via(
+        cfg: &FtpConfig,
+        secrets: &dyn SecretResolver,
+        proxy: Option<Arc<Proxy>>,
+    ) -> Result<Self> {
+        Self::open_backend(cfg, secrets, default_tls_config()?, proxy).await
     }
 
     /// 인증서 고정 등 TLS 검증 방식을 직접 정해 연결합니다. 평문(`tls = "none"`)이면 무시합니다.
@@ -131,6 +141,18 @@ impl FtpBackend {
         secrets: &dyn SecretResolver,
         tls_config: Arc<ClientConfig>,
     ) -> Result<Self> {
+        Self::open_backend(cfg, secrets, tls_config, None).await
+    }
+
+    async fn open_backend(
+        cfg: &FtpConfig,
+        secrets: &dyn SecretResolver,
+        tls_config: Arc<ClientConfig>,
+        proxy: Option<Arc<Proxy>>,
+    ) -> Result<Self> {
+        if proxy.is_some() && cfg.tls == FtpTls::Implicit {
+            return Err(Error::Unsupported("프록시와 암묵적 TLS FTP 조합"));
+        }
         let password = match &cfg.password {
             Some(src) => secrets.resolve(src)?,
             None => SecretString::from("anonymous@"),
@@ -149,6 +171,7 @@ impl FtpBackend {
             tls_config,
             username: cfg.username.clone(),
             charset,
+            proxy,
         };
         let (mut s, feats) = open(&params).await.map_err(Fail::into_error)?;
         let root = resolve_root(&mut s, &cfg.root)
@@ -309,9 +332,31 @@ async fn open_inner(p: &Params) -> suppaftp::FtpResult<(FtpStream, Feats)> {
     tls.resumption = rustls::client::Resumption::default();
     let tls = Arc::new(tls);
     let connector = || AsyncRustlsConnector::from(TlsConnector::from(Arc::clone(&tls)));
-    let mut s = match p.tls {
-        FtpTls::Implicit => FtpStream::connect_secure_implicit(addr, connector(), &p.host).await?,
-        FtpTls::None | FtpTls::Explicit => FtpStream::connect(addr).await?,
+    let mut s = match (&p.proxy, p.tls) {
+        (Some(proxy), _) => {
+            let stream = proxy
+                .connect(&p.host, p.port)
+                .await
+                .map_err(FtpError::ConnectionError)?;
+            // 프록시 뒤에서는 제어 연결의 상대 주소가 프록시이므로, 데이터 연결은 FTP 호스트와
+            // 서버가 알려 준 포트로 프록시 터널을 엽니다.
+            let (proxy, host) = (Arc::clone(proxy), p.host.clone());
+            FtpStream::connect_with_stream(stream)
+                .await?
+                .passive_stream_builder(move |addr| {
+                    let (proxy, host) = (Arc::clone(&proxy), host.clone());
+                    Box::pin(async move {
+                        proxy
+                            .connect(&host, addr.port())
+                            .await
+                            .map_err(FtpError::ConnectionError)
+                    })
+                })
+        }
+        (None, FtpTls::Implicit) => {
+            FtpStream::connect_secure_implicit(addr, connector(), &p.host).await?
+        }
+        (None, FtpTls::None | FtpTls::Explicit) => FtpStream::connect(addr).await?,
     };
     s.set_encoding(p.charset.clone()).await;
     if p.tls == FtpTls::Explicit {

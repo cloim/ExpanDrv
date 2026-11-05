@@ -5,6 +5,7 @@ mod tests;
 mod tls;
 mod xml;
 
+use crate::proxy::Proxy;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use expandrv_core::config::{SecretResolver, WebDavConfig};
@@ -15,6 +16,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderMap, RANGE};
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use xml::{DavResponse, PROPFIND_QUOTA, PROPFIND_STAT, Props};
@@ -77,12 +79,30 @@ pub struct WebDavBackend {
 impl WebDavBackend {
     /// 설정으로 클라이언트를 만들고 루트에 PROPFIND(Depth 0)를 보내 연결과 인증을 확인합니다.
     pub async fn connect(cfg: &WebDavConfig, secrets: &dyn SecretResolver) -> Result<Self> {
-        let be = Self::new(cfg, secrets)?;
+        Self::connect_via(cfg, secrets, None).await
+    }
+
+    /// 프록시를 거쳐 연결합니다.
+    pub async fn connect_via(
+        cfg: &WebDavConfig,
+        secrets: &dyn SecretResolver,
+        proxy: Option<Arc<Proxy>>,
+    ) -> Result<Self> {
+        let be = Self::build(cfg, secrets, proxy.as_deref())?;
         be.verify().await?;
         Ok(be)
     }
 
+    #[cfg(test)]
     fn new(cfg: &WebDavConfig, secrets: &dyn SecretResolver) -> Result<Self> {
+        Self::build(cfg, secrets, None)
+    }
+
+    fn build(
+        cfg: &WebDavConfig,
+        secrets: &dyn SecretResolver,
+        proxy: Option<&Proxy>,
+    ) -> Result<Self> {
         let mut base = Url::parse(cfg.url.trim())
             .map_err(|e| Error::Config(format!("WebDAV URL이 올바르지 않습니다: {e}")))?;
         let https = match base.scheme() {
@@ -128,6 +148,9 @@ impl WebDavBackend {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("ExpanDrv/", env!("CARGO_PKG_VERSION")))
             .tls_version_min(reqwest::tls::Version::TLS_1_2);
+        if let Some(p) = proxy {
+            builder = builder.proxy(p.reqwest()?);
+        }
         if let Some(pin) = &cfg.pinned_cert_sha256 {
             if !https {
                 return Err(Error::Config(

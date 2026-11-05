@@ -2,6 +2,7 @@
 
 mod known_hosts;
 
+use crate::proxy::Proxy;
 use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::config::{SecretResolver, SftpConfig};
@@ -42,6 +43,7 @@ struct Target {
     known_hosts: PathBuf,
     password: Option<SecretString>,
     key: Option<Arc<PrivateKey>>,
+    proxy: Option<Arc<Proxy>>,
 }
 
 struct Conn {
@@ -70,6 +72,15 @@ pub struct SftpBackend {
 
 impl SftpBackend {
     pub async fn connect(cfg: &SftpConfig, secrets: &dyn SecretResolver) -> Result<SftpBackend> {
+        Self::connect_via(cfg, secrets, None).await
+    }
+
+    /// 프록시를 거쳐 연결합니다. 재연결도 같은 프록시를 씁니다.
+    pub async fn connect_via(
+        cfg: &SftpConfig,
+        secrets: &dyn SecretResolver,
+        proxy: Option<Arc<Proxy>>,
+    ) -> Result<SftpBackend> {
         let password = cfg
             .password
             .as_ref()
@@ -102,6 +113,7 @@ impl SftpBackend {
             known_hosts,
             password,
             key,
+            proxy,
         };
 
         let conn = Arc::new(open_conn(&target).await?);
@@ -320,7 +332,18 @@ async fn open_conn(t: &Target) -> Result<Conn> {
         nodelay: true,
         ..Default::default()
     });
-    let connecting = client::connect(config, (t.host.as_str(), t.port), handler);
+    let connecting = async {
+        match &t.proxy {
+            Some(p) => {
+                let stream = p
+                    .connect(&t.host, t.port)
+                    .await
+                    .map_err(russh::Error::from)?;
+                client::connect_stream(config, stream, handler).await
+            }
+            None => client::connect(config, (t.host.as_str(), t.port), handler).await,
+        }
+    };
     let mut handle = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
         Err(_) => return Err(Error::Timeout),
         Ok(Ok(h)) => h,

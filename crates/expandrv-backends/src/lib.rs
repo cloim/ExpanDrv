@@ -7,6 +7,7 @@ use std::sync::Arc;
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod local;
+pub mod proxy;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "sftp")]
@@ -30,19 +31,33 @@ pub async fn connect(
     proxy: Option<&ProxyConfig>,
     secrets: &dyn SecretResolver,
 ) -> Result<Arc<dyn Backend>> {
-    if proxy.is_some() {
-        return Err(Error::Unsupported("프록시"));
+    let proxy = proxy
+        .map(|p| proxy::Proxy::from_config(p, secrets))
+        .transpose()?
+        .map(Arc::new);
+    if proxy.is_some() && matches!(cfg, BackendConfig::Local { .. }) {
+        return Err(Error::Config(
+            "로컬 폴더 드라이브에는 프록시를 쓸 수 없습니다".into(),
+        ));
     }
     match cfg {
         BackendConfig::Local { root } => Ok(Arc::new(local::LocalBackend::new(root)?)),
         #[cfg(feature = "webdav")]
-        BackendConfig::Webdav(c) => Ok(Arc::new(webdav::WebDavBackend::connect(c, secrets).await?)),
+        BackendConfig::Webdav(c) => Ok(Arc::new(
+            webdav::WebDavBackend::connect_via(c, secrets, proxy).await?,
+        )),
         #[cfg(feature = "sftp")]
-        BackendConfig::Sftp(c) => Ok(Arc::new(sftp::SftpBackend::connect(c, secrets).await?)),
+        BackendConfig::Sftp(c) => Ok(Arc::new(
+            sftp::SftpBackend::connect_via(c, secrets, proxy).await?,
+        )),
         #[cfg(feature = "s3")]
-        BackendConfig::S3(c) => Ok(Arc::new(s3::S3Backend::connect(c, secrets).await?)),
+        BackendConfig::S3(c) => Ok(Arc::new(
+            s3::S3Backend::connect_via(c, secrets, proxy).await?,
+        )),
         #[cfg(feature = "ftp")]
-        BackendConfig::Ftp(c) => Ok(Arc::new(ftp::FtpBackend::connect(c, secrets).await?)),
+        BackendConfig::Ftp(c) => Ok(Arc::new(
+            ftp::FtpBackend::connect_via(c, secrets, proxy).await?,
+        )),
         #[allow(unreachable_patterns)]
         other => {
             let _ = secrets;
