@@ -313,7 +313,7 @@ fn pinned_verifier_checks_leaf_digest() {
         .map(|b| format!("{b:02X}:"))
         .collect();
     let pin = tls::parse_fingerprint(&hex).unwrap();
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = rustls::crypto::ring::default_provider();
     let v = tls::PinnedVerifier::new(pin, &provider);
     let name = ServerName::try_from("dav.example.com").unwrap();
     let cert = CertificateDer::from(der);

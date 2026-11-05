@@ -14,6 +14,16 @@ pub mod sftp;
 #[cfg(feature = "webdav")]
 pub mod webdav;
 
+/// reqwest가 쓸 프로세스 기본 rustls 프로바이더로 ring을 설치합니다. HTTP 클라이언트를 만들기 전에 호출합니다.
+#[cfg(any(feature = "webdav", feature = "s3"))]
+pub(crate) fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // 다른 곳에서 이미 설치했다면 그 설정을 그대로 씁니다.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// 설정으로 백엔드를 만들고 연결과 인증을 확인합니다.
 pub async fn connect(
     cfg: &BackendConfig,

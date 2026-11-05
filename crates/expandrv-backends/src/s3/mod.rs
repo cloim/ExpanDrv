@@ -78,6 +78,7 @@ impl S3Backend {
         };
         let bucket = Bucket::new(endpoint, style, cfg.bucket.trim().to_owned(), region)
             .map_err(|e| Error::Config(format!("S3 엔드포인트가 올바르지 않습니다: {e:?}")))?;
+        crate::install_crypto_provider();
         let http = reqwest::Client::builder()
             .user_agent(concat!("ExpanDrv/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))

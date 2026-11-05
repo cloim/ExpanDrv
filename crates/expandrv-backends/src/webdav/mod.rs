@@ -120,6 +120,7 @@ impl WebDavBackend {
             tracing::warn!("WebDAV 기본 인증 정보를 평문 HTTP로 보냅니다. https 사용을 권장합니다");
         }
 
+        crate::install_crypto_provider();
         let mut builder = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(90))

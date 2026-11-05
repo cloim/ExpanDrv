@@ -29,6 +29,7 @@ sftp = [
 s3 = [
     "dep:rusty-s3",
     "dep:reqwest",
+    "dep:rustls",
     "dep:quick-xml",
     "dep:serde",
     "dep:jiff",
@@ -52,14 +53,15 @@ tokio.workspace = true
 tracing.workspace = true
 
 # HTTP 공용(WebDAV, S3): rustls만 사용
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "stream"], optional = true }
+# 암호 프로바이더는 ring 하나로 통일합니다(SFTP, FTP와 공유, 바이너리 크기와 라이선스 단순화).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "stream"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 quick-xml = { version = "0.41", features = ["serialize", "overlapped-lists"], optional = true }
 percent-encoding = { version = "2.3", optional = true }
 tokio-util = { version = "0.7.20", features = ["io"], optional = true }
 futures = { workspace = true, optional = true }
 
 # WebDAV
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
 httpdate = { version = "1.0", optional = true }
 time = { version = "0.3", features = ["parsing"], optional = true }
 sha2 = { version = "0.10", optional = true }
