@@ -1,0 +1,42 @@
+[package]
+name = "expandrv-gui"
+description = "ExpanDrv 데스크톱 GUI(Tauri 2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "expandrv-gui"
+path = "src/main.rs"
+
+[features]
+# 빌드한 화면(`gui/dist`)을 실행 파일에 넣습니다. 끄면 Vite 개발 서버(devUrl)를 엽니다.
+# 개발 서버로 띄우기: `npm run tauri -- dev -- --no-default-features`
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+expandrv-core.workspace = true
+expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp"] }
+expandrv-ipc.workspace = true
+expandrv-secrets.workspace = true
+expandrv-autostart.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+tokio.workspace = true
+# 셸, 파일 시스템, HTTP 등 플러그인은 쓰지 않습니다. 화면은 등록한 명령만 호출합니다.
+tauri = { version = "2.11.6", default-features = false, features = ["wry", "compression", "common-controls-v6"] }
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
