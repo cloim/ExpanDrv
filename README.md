@@ -2,7 +2,7 @@
 
 원격 스토리지를 Windows 드라이브 문자 또는 폴더로 마운트하는 Rust 네이티브 앱입니다. 탐색기와 일반 프로그램에서 로컬 디스크처럼 읽고 쓸 수 있습니다.
 
-> 개발 초기 단계입니다. 현재 CLI와 상주 에이전트로 마운트할 수 있고, GUI(Tauri 2)와 OAuth 클라우드는 개발 중입니다.
+> 개발 초기 단계입니다. CLI, 상주 에이전트와 데스크톱 GUI(Tauri 2)로 마운트할 수 있고, 트레이 아이콘과 OAuth 클라우드는 개발 중입니다.
 
 ## 지원 스토리지
 
@@ -47,6 +47,17 @@
 cargo build --release -p expandrv-agent
 # 결과: target\release\expandrv.exe
 ```
+
+GUI는 Node.js 24 이상이 더 필요합니다. 화면을 빌드한 뒤 실행 파일을 만들고, `expandrv.exe`와 같은 폴더에 둡니다(GUI가 에이전트를 시작할 때 이 CLI를 씁니다).
+
+```powershell
+cd gui
+npm ci
+npm run tauri -- build --no-bundle
+# 결과: target\release\expandrv-gui.exe
+```
+
+`npm run build` 전에 `cargo build --workspace`를 하면 `gui/dist`에 안내 페이지만 들어갑니다.
 
 ## 사용법
 
@@ -111,6 +122,7 @@ password = { from = "env", var = "NAS_PASSWORD" }
 pwsh -File scripts/check.ps1   # fmt, clippy -D warnings, test
 ```
 
+- GUI 화면은 `gui`에서 `npm run lint`(ESLint, 형식 검사)와 `npm run build`로 확인합니다. `npm run tauri -- dev -- --no-default-features`로 Vite 개발 서버와 함께 띄웁니다.
 - `cargo test`의 마운트 통합 테스트는 WinFsp 런타임이 있을 때만 실제 드라이브 문자로 실행됩니다.
 - 네트워크 백엔드 통합 테스트는 `EXPANDRV_TEST_*` 환경 변수가 있을 때만 실행됩니다. 각 테스트 파일 머리 주석에 Docker로 서버를 띄우는 방법이 있습니다.
 
@@ -123,7 +135,9 @@ pwsh -File scripts/check.ps1   # fmt, clippy -D warnings, test
 | `expandrv-secrets` | DPAPI와 Windows 자격 증명 관리자 비밀 값 저장소 |
 | `expandrv-ipc` | 소유자 전용 이름 있는 파이프 IPC(GUI와 CLI가 에이전트를 제어) |
 | `expandrv-log` | 로그 비밀 값과 개인정보 마스킹 |
+| `expandrv-autostart` | 로그인 자동 실행 등록(현재 사용자 Run 키) |
 | `expandrv-agent` | `expandrv` CLI와 상주 에이전트 |
+| `gui` | 데스크톱 GUI(Tauri 2, React). `gui/src-tauri`가 `expandrv-gui` 크레이트 |
 
 ## 라이선스
 

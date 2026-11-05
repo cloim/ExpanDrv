@@ -1,11 +1,11 @@
 //! `expandrv` CLI: 드라이브 설정 관리와 상주 에이전트 제어
 
 mod agent;
-mod autostart;
 mod control;
 
 use clap::{Args, Parser, Subcommand};
 use control::{AgentLink, expect_ok};
+use expandrv_autostart as autostart;
 use expandrv_core::config::{
     BackendConfig, CacheConfig, Config, DriveConfig, FtpConfig, FtpTls, ProxyConfig, S3Config,
     SecretSource, SftpConfig, TransferConfig, WebDavConfig,

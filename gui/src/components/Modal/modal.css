@@ -1,0 +1,144 @@
+/* 오버레이가 중앙 정렬을 담당한다. 패널의 transform은 이 중앙 위치에 이동량만 얹는 방식이라
+   창 크기가 바뀌어도 기준점이 함께 움직인다. z-index는 modalStack이 인라인으로 넣는다. */
+.modal-overlay {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--overlay);
+  /* 스택이 인라인 z-index를 넣기 전 첫 프레임을 위한 기본값. 실제 순서는 인라인 값이 정한다. */
+  z-index: 1000;
+}
+
+.modal-panel {
+  display: flex;
+  position: relative;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  flex-direction: column;
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 24px 60px var(--shadow-color);
+  outline: none;
+  /* 드래그로 옮긴 뒤에도 오버레이 안에서 크기가 다시 계산되지 않도록 축소를 막는다. */
+  flex: none;
+}
+
+.modal-panel-sm { width: 420px; }
+.modal-panel-md { width: 560px; }
+.modal-panel-lg { width: 760px; }
+.modal-panel-xl { width: 1040px; }
+
+/* 헤더가 드래그 손잡이다. 제목 텍스트가 선택되면 드래그가 텍스트 선택으로 바뀌므로 헤더
+   안에서는 선택을 끈다(본문 텍스트 선택은 그대로 살려둔다). */
+.modal-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 14px 20px;
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+}
+
+.modal-header.is-draggable {
+  cursor: grab;
+  touch-action: none;
+}
+
+.modal-header.is-draggable:active {
+  cursor: grabbing;
+}
+
+.modal-header.is-draggable:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.modal-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-1);
+  font-size: 15px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-close {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+/* 본문만 스크롤한다. 헤더와 푸터는 항상 보여야 손잡이와 액션을 잃지 않는다. */
+.modal-body {
+  flex: 1;
+  min-height: 0;
+  padding: 18px 20px;
+  overflow-y: auto;
+  color: var(--text-1);
+  font-size: 13px;
+}
+
+.modal-footer {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--line);
+}
+
+/* 드래그와 리사이즈가 진행되는 동안 문서 전체의 텍스트 선택과 커서를 고정한다. */
+body.modal-gesture-active {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* 리사이즈 핸들. 눈에 보이지 않지만 잡을 수 있을 만큼의 두께를 준다. */
+.modal-resize-handle {
+  position: absolute;
+  touch-action: none;
+}
+
+.modal-resize-n { top: -3px; right: 12px; left: 12px; height: 8px; cursor: ns-resize; }
+.modal-resize-s { right: 12px; bottom: -3px; left: 12px; height: 8px; cursor: ns-resize; }
+.modal-resize-e { top: 12px; right: -3px; bottom: 12px; width: 8px; cursor: ew-resize; }
+.modal-resize-w { top: 12px; bottom: 12px; left: -3px; width: 8px; cursor: ew-resize; }
+.modal-resize-ne { top: -3px; right: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
+.modal-resize-nw { top: -3px; left: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
+.modal-resize-se { right: -3px; bottom: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
+.modal-resize-sw { bottom: -3px; left: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
+
+/* 좁은 화면에서는 드래그와 리사이즈가 꺼지고, 모달이 화면을 거의 채운다. */
+@media (max-width: 767px) {
+  .modal-overlay {
+    padding: 12px;
+  }
+
+  /* 좁은 화면에서는 저장된 위치와 크기가 남아 있어도 전체 폭 배치를 유지한다. 훅이 넣는
+     인라인 style을 덮어야 하므로 !important가 필요하다. */
+  .modal-panel {
+    width: 100% !important;
+    max-width: 100%;
+    height: auto !important;
+    transform: none !important;
+  }
+}

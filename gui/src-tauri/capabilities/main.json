@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "메인 창은 ExpanDrv 명령만 호출합니다. 코어 플러그인 권한은 주지 않습니다.",
+  "windows": ["main"],
+  "permissions": [
+    "allow-agent-status",
+    "allow-mount-drive",
+    "allow-mount-all",
+    "allow-unmount-drive",
+    "allow-get-drive",
+    "allow-add-drive",
+    "allow-update-drive",
+    "allow-set-drive-secret",
+    "allow-delete-drive",
+    "allow-test-connection",
+    "allow-check-drive",
+    "allow-free-drive-letters",
+    "allow-get-settings",
+    "allow-set-autostart",
+    "allow-stop-agent"
+  ]
+}

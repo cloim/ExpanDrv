@@ -1,0 +1,542 @@
+.data-grid {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  position: relative;
+}
+
+/* AG Grid 컨테이너 자체는 남은 영역을 모두 채움 */
+.data-grid .ag-root-wrapper {
+  /* 구분선은 AG Grid가 한 번만 그린다. 36부터는 일반 행의 내부 셀 영역에,
+     전체 폭 행은 행 자체에 테두리가 생기므로 .ag-row에 별도 선을 더하지 않는다. */
+  --ag-row-border-style: solid;
+  --ag-row-border-width: 1px;
+  --ag-row-border-color: var(--line);
+  flex: 1;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+}
+
+/* 헤더 영역 */
+.data-grid .ag-header {
+  min-height: 44px !important;
+  height: 44px !important;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.data-grid .ag-header-row {
+  height: 44px !important;
+}
+
+.data-grid .ag-header-cell {
+  padding: 0 10px;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.data-grid .ag-header-cell-label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.data-grid .ag-header-cell:first-child,
+.data-grid .ag-cell:first-of-type {
+  padding-left: 14px;
+}
+
+.data-grid .ag-header-cell:last-child,
+.data-grid .ag-cell:last-of-type {
+  padding-right: 14px;
+}
+
+/* 본문 스크롤 영역 */
+.data-grid .ag-body-viewport {
+  overflow-y: auto;
+}
+
+/* 행: 높이는 DataGrid rowHeight prop이 실제 값을 정하므로 여기서 고정 height를 강제하지
+   않는다. height를 !important로 고정하면 rowHeight를 다르게 준 화면에서 AG Grid의 실제
+   배치와 CSS 높이가 어긋나 행 사이에 틈이 생긴다. */
+.data-grid .ag-row {
+  background: var(--surface);
+  color: var(--text-1);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.data-grid .ag-row:hover {
+  background: var(--row-hover);
+}
+
+/* 포커스 시 outline만 표시한다. position: relative를 주면 AG Grid가 각 행에 지정한
+   position(가상 스크롤 배치용, top 값으로 절대 위치를 잡는 방식)을 덮어써서, 포커스된
+   행이 문서 흐름에 끼어들어가며 그 아래에 빈 공간이 생긴다. z-index만으로 다른 행 위에
+   outline이 보이게 하면 충분하다. */
+.data-grid .ag-row:focus-within {
+  z-index: 1;
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.data-grid .ag-cell {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  padding: 0 10px;
+  text-align: left;
+  line-height: normal;
+}
+
+.data-grid .ag-cell-value,
+.data-grid .ag-cell-wrapper,
+.data-grid .ag-react-container,
+.data-grid .data-grid-cell-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.data-grid .ag-react-container {
+  display: block;
+  width: 100%;
+}
+
+.data-grid .ag-react-container > span:not(.data-grid-badge) {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* 반복값 억제(suppressRepeat) 컬럼에서 스크롤 상단에 되살린 값.
+   그룹이 실제로 시작된 행이 아니라 이어지는 중임을 옅은 톤으로 알린다 */
+.data-grid .data-grid-carried {
+  overflow: hidden;
+  color: var(--text-3);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 포커스 링 등 AG Grid 기본 장식 제거하여 기존 모양 유지 */
+.data-grid .ag-cell:focus,
+.data-grid .ag-cell:focus-within,
+.data-grid .ag-cell-focus {
+  border: none !important;
+  outline: none !important;
+}
+
+.data-grid .ag-row-focus {
+  outline: none !important;
+}
+
+.data-grid .ag-overlay-loading-wrapper,
+.data-grid .ag-overlay-no-rows-wrapper {
+  background: transparent;
+}
+
+/* 정렬 아이콘 톤을 헤더 텍스트와 맞춤 */
+.data-grid .ag-header-icon,
+.data-grid .ag-sort-indicator-icon {
+  color: var(--text-2);
+}
+
+.data-grid .ag-header-cell:hover {
+  background: var(--row-hover);
+}
+
+.data-grid-status {
+  display: flex;
+  position: absolute;
+  inset: 44px 0 0 0;
+  min-height: 210px;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 850;
+  z-index: 2;
+}
+
+.data-grid-skeleton-list {
+  display: flex;
+  position: absolute;
+  inset: 44px 0 0 0;
+  flex-direction: column;
+  background: var(--surface);
+  z-index: 2;
+  overflow: hidden;
+}
+
+.data-grid-skeleton-row {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  gap: 16px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.data-grid-skeleton-row > .skeleton-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.column-filter-header {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.column-filter-header-label {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.column-filter-header-label:disabled {
+  cursor: default;
+}
+
+.column-filter-header-label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.column-filter-sort-icon {
+  flex: none;
+  color: var(--text-2);
+}
+
+.column-filter-trigger {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-3);
+}
+
+.column-filter-trigger:hover {
+  background: var(--row-hover);
+  color: var(--text-2);
+}
+
+/* 필터가 걸린 컬럼은 한눈에 보이도록 강조한다 */
+.column-filter-trigger.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.column-filter-popover {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 12px 28px var(--shadow-color);
+  font-size: 12.5px;
+  z-index: 40;
+}
+
+.column-filter-tabs {
+  display: flex;
+  flex: none;
+  border-bottom: 1px solid var(--line);
+}
+
+.column-filter-tabs button {
+  flex: 1;
+  height: 32px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.column-filter-tabs button.is-active {
+  border-bottom: 2px solid var(--text-1);
+  color: var(--text-1);
+}
+
+.column-filter-condition-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 10px;
+}
+
+.column-filter-condition-op,
+.column-filter-condition-value {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+
+.column-filter-popover-search {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 32px 8px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+}
+
+.column-filter-popover-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.column-filter-option {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  color: var(--text-1);
+  cursor: pointer;
+}
+
+.column-filter-option:hover {
+  background: var(--surface-2);
+}
+
+.column-filter-option input[type='checkbox'] {
+  flex: none;
+}
+
+.column-filter-option-all {
+  border-bottom: 1px solid var(--line);
+  font-weight: 800;
+}
+
+.column-filter-option-list {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.column-filter-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.column-filter-option-count {
+  flex: none;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.column-filter-empty {
+  padding: 16px 10px;
+  color: var(--text-3);
+  text-align: center;
+}
+
+.column-filter-popover-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.column-filter-reset,
+.column-filter-apply {
+  flex: 1;
+  height: 30px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.column-filter-reset {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.column-filter-reset:hover {
+  background: var(--row-hover);
+}
+
+.column-filter-apply {
+  background: var(--text-1);
+  color: var(--surface);
+}
+
+.column-filter-apply:hover {
+  background: var(--text-2);
+}
+
+.column-filter-popover-close {
+  display: flex;
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--text-3);
+}
+
+.column-filter-popover-close:hover {
+  background: var(--row-hover);
+  color: var(--text-2);
+}
+
+/* 헤더: 전부 가운데 */
+.data-grid .ag-header-cell[col-id] .ag-header-cell-label {
+  flex-direction: row;
+  justify-content: center;
+  text-align: center;
+}
+
+/* 필터 버튼이 있는 헤더는 라벨을 가운데 두고 버튼만 오른쪽 끝에 띄운다. */
+.data-grid .ag-header-cell[col-id] .column-filter-header {
+  position: relative;
+  justify-content: center;
+}
+
+.data-grid .ag-header-cell[col-id] .column-filter-header-label {
+  flex: 0 1 auto;
+  justify-content: center;
+  text-align: center;
+}
+
+.data-grid .ag-header-cell[col-id] .column-filter-trigger {
+  position: absolute;
+  right: 0;
+}
+
+/* 값: 텍스트 컬럼을 뺀 전부 가운데 */
+.data-grid .ag-cell[col-id]:not([col-id='label']) {
+  justify-content: center;
+  text-align: center;
+}
+
+.data-grid .ag-cell[col-id]:not([col-id='label']) .ag-cell-wrapper {
+  justify-content: center;
+}
+
+.data-grid .ag-cell[col-id]:not([col-id='label']) .ag-cell-value {
+  text-align: center;
+}
+
+/* 텍스트 컬럼 값만 왼쪽 */
+.data-grid .ag-cell[col-id='label'] {
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.data-grid .ag-cell[col-id='label'] .ag-cell-wrapper {
+  justify-content: flex-start;
+}
+
+.data-grid .ag-cell[col-id='label'] .ag-cell-value {
+  text-align: left;
+}
+
+.ag-tooltip-custom {
+  z-index: 30;
+}
+
+/* 바깥 래퍼의 가로 스크롤은 Tailwind 없이도 동작하도록 여기서 직접 정의한다. */
+.data-grid-scroll-wrapper {
+  flex: 1 1 0%;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.data-grid-scroll-wrapper > .data-grid {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 가로 스크롤은 바깥 래퍼가 맡는다. 안쪽 뷰포트가 반올림 오차로 몇 픽셀 넘쳐도 터치 스와이프를 먼저 가로채지 않게 한다.
+   AG Grid 35 이하는 .ag-viewport 계열, 36은 .ag-grid-viewport가 가로 스크롤 영역이다. */
+.data-grid-scroll-wrapper[data-outer-scroll] .ag-grid-viewport,
+.data-grid-scroll-wrapper[data-outer-scroll] .ag-viewport,
+.data-grid-scroll-wrapper[data-outer-scroll] .ag-header-viewport,
+.data-grid-scroll-wrapper[data-outer-scroll] .ag-body-horizontal-scroll-viewport {
+  overflow-x: hidden !important;
+}
+
+/* 바깥 래퍼를 감싸는 층. 가로로 움직이지 않으므로 터치 기기의 세로 스크롤 위치 표시를 화면 오른쪽 끝에 고정할 수 있다. */
+.data-grid-frame {
+  position: relative;
+  display: flex;
+  flex: 1 1 0%;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 터치 기기에서 AG Grid는 보이지 않는 세로 스크롤 막대를 넓은 본문의 맨 오른쪽 끝에 겹쳐 둔다. 바깥 래퍼로 가로 스크롤하면
+   이 막대가 행과 버튼을 덮고 터치를 가로채므로 숨기고, 스크롤 위치는 .data-grid-scroll-thumb가 대신 보여 준다. */
+.data-grid .ag-body-vertical-scroll.ag-scrollbar-invisible {
+  display: none;
+}
+
+.data-grid-scroll-thumb {
+  position: absolute;
+  top: 0;
+  right: 3px;
+  z-index: 3;
+  width: 4px;
+  border-radius: 999px;
+  background: var(--text-3);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 300ms;
+}

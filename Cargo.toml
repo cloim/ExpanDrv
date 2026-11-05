@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "gui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,7 @@ expandrv-secrets = { path = "crates/expandrv-secrets" }
 expandrv-winfsp = { path = "crates/expandrv-winfsp" }
 expandrv-log = { path = "crates/expandrv-log" }
 expandrv-ipc = { path = "crates/expandrv-ipc" }
+expandrv-autostart = { path = "crates/expandrv-autostart" }
 
 async-trait = "0.1.92"
 bytes = "1.12"

@@ -1,0 +1,15 @@
+[package]
+name = "expandrv-autostart"
+description = "ExpanDrv 로그인 자동 실행 등록(현재 사용자 Run 키). CLI와 GUI가 함께 씁니다"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+expandrv-core.workspace = true
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[lints]
+workspace = true
