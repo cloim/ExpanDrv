@@ -5,6 +5,8 @@ use expandrv_core::{Backend, Error, Result};
 use std::sync::Arc;
 
 pub mod local;
+#[cfg(feature = "webdav")]
+pub mod webdav;
 
 /// 설정으로 백엔드를 만들고 연결과 인증을 확인합니다.
 pub async fn connect(
@@ -13,6 +15,8 @@ pub async fn connect(
 ) -> Result<Arc<dyn Backend>> {
     match cfg {
         BackendConfig::Local { root } => Ok(Arc::new(local::LocalBackend::new(root)?)),
+        #[cfg(feature = "webdav")]
+        BackendConfig::Webdav(c) => Ok(Arc::new(webdav::WebDavBackend::connect(c, secrets).await?)),
         #[allow(unreachable_patterns)]
         other => {
             let _ = secrets;
