@@ -15,6 +15,7 @@ expandrv-backends = { path = "crates/expandrv-backends" }
 expandrv-vfs = { path = "crates/expandrv-vfs" }
 expandrv-secrets = { path = "crates/expandrv-secrets" }
 expandrv-winfsp = { path = "crates/expandrv-winfsp" }
+expandrv-ipc = { path = "crates/expandrv-ipc" }
 
 async-trait = "0.1.92"
 bytes = "1.12"

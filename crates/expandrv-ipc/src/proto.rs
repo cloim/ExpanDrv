@@ -1,0 +1,80 @@
+//! 요청과 응답 형식. 호환되지 않게 바꾸면 [`PROTOCOL_VERSION`]을 올립니다.
+
+use serde::{Deserialize, Serialize};
+
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    /// 연결 직후 버전을 맞춥니다.
+    Hello {
+        version: u32,
+    },
+    Status,
+    Mount {
+        id: String,
+    },
+    Unmount {
+        id: String,
+    },
+    /// 설정 파일을 다시 읽습니다. 마운트된 드라이브는 그대로 둡니다.
+    Reload,
+    /// 모든 드라이브를 해제(업로드 마무리 포함)하고 에이전트를 끝냅니다.
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Response {
+    Hello { version: u32, agent_version: String },
+    Status(AgentStatus),
+    Ok,
+    Error { code: ErrorCode, message: String },
+}
+
+impl Response {
+    pub fn error(code: ErrorCode, message: impl Into<String>) -> Self {
+        Response::Error {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorCode {
+    BadRequest,
+    UnknownDrive,
+    AlreadyMounted,
+    NotMounted,
+    /// 같은 드라이브에 다른 작업이 진행 중입니다.
+    Busy,
+    MountFailed,
+    /// 해제는 했지만 남은 업로드를 마치지 못했습니다.
+    UnmountFailed,
+    Config,
+    ShuttingDown,
+    Internal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub drives: Vec<DriveStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveStatus {
+    pub id: String,
+    pub label: String,
+    pub mount_point: String,
+    pub backend: String,
+    pub state: DriveState,
+    pub pending_uploads: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriveState {
+    Mounted,
+    Unmounted,
+    /// 마지막 마운트 또는 해제 실패 사유
+    Failed(String),
+}
