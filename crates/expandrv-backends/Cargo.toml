@@ -1,0 +1,28 @@
+[package]
+name = "expandrv-backends"
+description = "ExpanDrv 스토리지 백엔드(Local, WebDAV, SFTP, S3 호환, FTP)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+webdav = []
+sftp = []
+s3 = []
+ftp = []
+
+[dependencies]
+expandrv-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
