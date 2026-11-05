@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["webdav", "sftp", "s3"]
+default = ["webdav", "sftp", "s3", "ftp"]
 webdav = [
     "dep:reqwest",
     "dep:rustls",
@@ -36,7 +36,12 @@ s3 = [
     "dep:tokio-util",
     "dep:futures",
 ]
-ftp = []
+ftp = [
+    "dep:suppaftp",
+    "dep:rustls-platform-verifier",
+    "dep:encoding_rs",
+    "dep:chrono",
+]
 
 [dependencies]
 expandrv-core.workspace = true
@@ -70,6 +75,12 @@ data-encoding = { version = "2", optional = true }
 rusty-s3 = { version = "0.10.2", default-features = false, features = ["rustcrypto"], optional = true }
 serde = { workspace = true, optional = true }
 jiff = { version = "0.2.39", default-features = false, features = ["std"], optional = true }
+
+# FTP/FTPS(ftp 기능)
+suppaftp = { version = "12.2", default-features = false, features = ["tokio-rustls-ring", "deprecated"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+encoding_rs = { version = "0.8.35", optional = true }
+chrono = { version = "0.4.41", default-features = false, features = ["std", "clock"], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

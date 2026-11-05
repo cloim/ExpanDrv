@@ -4,6 +4,8 @@ use expandrv_core::config::{BackendConfig, SecretResolver};
 use expandrv_core::{Backend, Error, Result};
 use std::sync::Arc;
 
+#[cfg(feature = "ftp")]
+pub mod ftp;
 pub mod local;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -25,6 +27,8 @@ pub async fn connect(
         BackendConfig::Sftp(c) => Ok(Arc::new(sftp::SftpBackend::connect(c, secrets).await?)),
         #[cfg(feature = "s3")]
         BackendConfig::S3(c) => Ok(Arc::new(s3::S3Backend::connect(c, secrets).await?)),
+        #[cfg(feature = "ftp")]
+        BackendConfig::Ftp(c) => Ok(Arc::new(ftp::FtpBackend::connect(c, secrets).await?)),
         #[allow(unreachable_patterns)]
         other => {
             let _ = secrets;
