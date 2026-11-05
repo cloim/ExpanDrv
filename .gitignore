@@ -1,0 +1,51 @@
+# 운영체제 아티팩트
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# IDE와 에디터 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# 빌드와 런타임 캐시
+/target/
+**/target/
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+*.ilk
+*.obj
+*.log
+*.tmp
+.cache/
+
+# 패키지 의존성
+node_modules/
+vendor/
+
+# 환경변수 파일과 비밀정보
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+secrets/
+
+# 로컬 실행 데이터
+/data/
+*.sqlite
+*.sqlite-journal
+*.db
+
+# 개발과 설계 문서
+docs/
