@@ -69,6 +69,9 @@ pub struct DriveStatus {
     pub backend: String,
     pub state: DriveState,
     pub pending_uploads: u64,
+    /// 원격에서 받고 있는 블록 수. 이전 에이전트 응답에는 없을 수 있습니다.
+    #[serde(default)]
+    pub active_downloads: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

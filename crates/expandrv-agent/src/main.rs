@@ -469,12 +469,12 @@ fn list(cfg: &Config, pipe: &str) -> Result<()> {
         println!("설정된 드라이브가 없습니다.");
         return Ok(());
     }
-    let states: HashMap<String, (DriveState, u64)> = match AgentLink::connect(pipe)? {
+    let states: HashMap<String, (DriveState, u64, u64)> = match AgentLink::connect(pipe)? {
         Some(mut link) => link
             .status()?
             .drives
             .into_iter()
-            .map(|d| (d.id, (d.state, d.pending_uploads)))
+            .map(|d| (d.id, (d.state, d.pending_uploads, d.active_downloads)))
             .collect(),
         None => HashMap::new(),
     };
@@ -484,10 +484,20 @@ fn list(cfg: &Config, pipe: &str) -> Result<()> {
     );
     for d in &cfg.drives {
         let state = match states.get(&d.id) {
-            Some((DriveState::Mounted, 0)) => "마운트됨".to_owned(),
-            Some((DriveState::Mounted, n)) => format!("마운트됨(업로드 {n})"),
-            Some((DriveState::Failed(_), _)) => "실패".to_owned(),
-            Some((DriveState::Unmounted, n)) if *n > 0 => format!("해제 중(업로드 {n})"),
+            Some((DriveState::Mounted, up, down)) => {
+                let busy: Vec<String> = [(*up, "업로드"), (*down, "다운로드")]
+                    .iter()
+                    .filter(|(n, _)| *n > 0)
+                    .map(|(n, what)| format!("{what} {n}"))
+                    .collect();
+                if busy.is_empty() {
+                    "마운트됨".to_owned()
+                } else {
+                    format!("마운트됨({})", busy.join(", "))
+                }
+            }
+            Some((DriveState::Failed(_), _, _)) => "실패".to_owned(),
+            Some((DriveState::Unmounted, n, _)) if *n > 0 => format!("해제 중(업로드 {n})"),
             _ => "-".to_owned(),
         };
         println!(
@@ -500,7 +510,7 @@ fn list(cfg: &Config, pipe: &str) -> Result<()> {
         );
     }
     for d in &cfg.drives {
-        if let Some((DriveState::Failed(msg), _)) = states.get(&d.id) {
+        if let Some((DriveState::Failed(msg), _, _)) = states.get(&d.id) {
             println!("{}: {msg}", d.id);
         }
     }
@@ -629,7 +639,11 @@ fn run(cli: Cli) -> Result<()> {
             cfg.save(&cfg_path)?;
             notify_reload(&pipe);
             println!("삭제했습니다: {id}");
-            // 이 드라이브용으로 저장한 비밀 값도 지웁니다.
+            // 다시 만들 수 없는 암호화 블록 캐시는 지웁니다(업로드 대기 파일은 남김).
+            if let Ok(dir) = cache_dir(&id) {
+                let _ = std::fs::remove_dir_all(dir.join("blocks"));
+            }
+            // 이 드라이브용으로 저장한 비밀 값(캐시 키 포함)도 지웁니다.
             let store = CredentialStore;
             for t in store.list(&format!("ExpanDrv/{id}/"))? {
                 store.delete(&t)?;

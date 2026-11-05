@@ -12,6 +12,30 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitFo
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 마운트하면 드라이브별 캐시 키가 자격 증명 관리자에 생깁니다.
+/// 테스트 전에 없던 키만 끝날 때 지워 사용자의 기존 키는 건드리지 않습니다.
+struct CacheKeys(Vec<String>);
+
+impl CacheKeys {
+    fn new(ids: &[&str]) -> Self {
+        let store = expandrv_secrets::CredentialStore;
+        Self(
+            ids.iter()
+                .map(|id| expandrv_secrets::target_for(id, "cache_key"))
+                .filter(|t| store.get(t).is_err())
+                .collect(),
+        )
+    }
+}
+
+impl Drop for CacheKeys {
+    fn drop(&mut self) {
+        for t in &self.0 {
+            let _ = expandrv_secrets::CredentialStore.delete(t);
+        }
+    }
+}
+
 /// 마운트 테스트끼리 같은 드라이브 문자를 고르지 않도록 순서대로 실행합니다.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -180,6 +204,7 @@ fn agent_mount_list_unmount_stop() {
     }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let env = Env::new("main");
+    let _keys = CacheKeys::new(&["t1", "bad"]);
     let letters = free_drives(2);
     let (mp, bad_mp) = (letters[0].as_str(), letters[1].as_str());
     let root = env.path("remote");
@@ -354,6 +379,7 @@ fn autostart_agent_mounts_only_auto_mount_drives() {
     }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let env = Env::new("auto");
+    let _keys = CacheKeys::new(&["auto", "manual"]);
     let letters = free_drives(2);
     let (auto_mp, manual_mp) = (letters[0].as_str(), letters[1].as_str());
     let root = env.path("remote");

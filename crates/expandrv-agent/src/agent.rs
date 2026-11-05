@@ -8,8 +8,8 @@ use expandrv_core::{Error, Result};
 use expandrv_ipc::{
     AgentStatus, DriveState, DriveStatus, ErrorCode, Handler, IpcServer, Request, Response,
 };
-use expandrv_secrets::Secrets;
-use expandrv_vfs::{Vfs, VfsOptions};
+use expandrv_secrets::{CredentialStore, Secrets, target_for};
+use expandrv_vfs::{DiskCacheOptions, Vfs, VfsOptions};
 use expandrv_winfsp::{MountOptions, MountedDrive};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,6 +55,24 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
         d.transfer.upload_kib_per_sec * 1024,
         d.transfer.download_kib_per_sec * 1024,
     );
+    // 원격 파일 이름과 내용이 남는 폴더이므로 현재 사용자와 SYSTEM만 접근하게 합니다.
+    let dir = cache_dir(&d.id)?;
+    std::fs::create_dir_all(&dir)?;
+    expandrv_winfsp::security::protect_dir(&dir)?;
+    let disk_cache = match d.cache.disk_limit_mib {
+        0 => None,
+        mib => match cache_key(&d.id) {
+            Ok(key) => Some(DiskCacheOptions {
+                dir: dir.join("blocks"),
+                max_bytes: mib << 20,
+                key,
+            }),
+            Err(e) => {
+                tracing::warn!(id = %d.id, error = %e, "캐시 키를 준비하지 못해 디스크 캐시 없이 마운트합니다");
+                None
+            }
+        },
+    };
     let vfs = Vfs::new(
         backend,
         rt.clone(),
@@ -63,8 +81,9 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
             metadata_ttl: Duration::from_secs(d.cache.metadata_ttl_secs),
             block_size: u64::from(d.cache.block_size_mib) << 20,
             memory_cache_bytes: (d.cache.memory_limit_mib as usize) << 20,
-            meta_db: Some(cache_dir(&d.id)?.join("meta.db")),
-            ..VfsOptions::new(cache_dir(&d.id)?.join("staging"))
+            meta_db: Some(dir.join("meta.db")),
+            disk_cache,
+            ..VfsOptions::new(dir.join("staging"))
         },
     )?;
     let drive = MountedDrive::mount(
@@ -78,6 +97,34 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
     )?;
     vfs.start_watch(Duration::from_secs(d.cache.poll_interval_secs));
     Ok((drive, vfs))
+}
+
+/// 드라이브별 디스크 캐시 키. 자격 증명 관리자(`ExpanDrv/<id>/cache_key`)에 16진수로 두고 없으면 만듭니다.
+fn cache_key(id: &str) -> Result<[u8; 32]> {
+    use secrecy::{ExposeSecret, SecretString};
+    let store = CredentialStore;
+    let target = target_for(id, "cache_key");
+    match store.get(&target) {
+        Ok(hex) => {
+            let hex = hex.expose_secret();
+            let mut key = [0u8; 32];
+            if hex.len() != 64 {
+                return Err(Error::Config(format!("{target} 형식이 올바르지 않습니다")));
+            }
+            for (i, b) in key.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                    .map_err(|_| Error::Config(format!("{target} 형식이 올바르지 않습니다")))?;
+            }
+            Ok(key)
+        }
+        Err(Error::NotFound) => {
+            let key = expandrv_vfs::generate_cache_key()?;
+            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            store.set(&target, &SecretString::from(hex))?;
+            Ok(key)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// 새 쓰기를 막은 뒤(드라이브 먼저 해제) 남은 업로드를 마칩니다.
@@ -131,14 +178,20 @@ impl Agent {
             .chain(st.mounted.values().map(|m| &m.cfg))
             .filter(|d| seen.insert(d.id.as_str()))
             .map(|d| {
-                let (d, state, pending) = if let Some(m) = st.mounted.get(&d.id) {
-                    (&m.cfg, DriveState::Mounted, m.vfs.pending_uploads())
+                let (d, state, pending, downloads) = if let Some(m) = st.mounted.get(&d.id) {
+                    let v = &m.vfs;
+                    (
+                        &m.cfg,
+                        DriveState::Mounted,
+                        v.pending_uploads(),
+                        v.active_downloads(),
+                    )
                 } else if let Some(Some(vfs)) = st.busy.get(&d.id) {
-                    (d, DriveState::Unmounted, vfs.pending_uploads())
+                    (d, DriveState::Unmounted, vfs.pending_uploads(), 0)
                 } else if let Some(msg) = st.failed.get(&d.id) {
-                    (d, DriveState::Failed(msg.clone()), 0)
+                    (d, DriveState::Failed(msg.clone()), 0, 0)
                 } else {
-                    (d, DriveState::Unmounted, 0)
+                    (d, DriveState::Unmounted, 0, 0)
                 };
                 DriveStatus {
                     id: d.id.clone(),
@@ -147,6 +200,7 @@ impl Agent {
                     backend: d.backend.kind().into(),
                     state,
                     pending_uploads: pending as u64,
+                    active_downloads: downloads as u64,
                 }
             })
             .collect();

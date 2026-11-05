@@ -319,6 +319,7 @@ mod tests {
                         backend: "local".into(),
                         state: DriveState::Unmounted,
                         pending_uploads: 0,
+                        active_downloads: 0,
                     }],
                 }),
                 Request::Mount { id } => Response::error(ErrorCode::UnknownDrive, id),

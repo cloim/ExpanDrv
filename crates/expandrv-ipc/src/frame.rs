@@ -81,6 +81,7 @@ mod tests {
                 backend: "webdav".into(),
                 state: DriveState::Failed("연결 실패".into()),
                 pending_uploads: 3,
+                active_downloads: 0,
             }],
         });
         let sent = reqs.clone();
