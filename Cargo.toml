@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/expandrv-core", "crates/expandrv-backends", "crates/expandrv-vfs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+expandrv-core = { path = "crates/expandrv-core" }
+expandrv-backends = { path = "crates/expandrv-backends" }
+expandrv-vfs = { path = "crates/expandrv-vfs" }
+expandrv-winfsp = { path = "crates/expandrv-winfsp" }
+
+async-trait = "0.1.92"
+bytes = "1.12"
+clap = { version = "4.6", features = ["derive"] }
+futures = "0.3.34"
+parking_lot = "0.13"
+secrecy = "0.10.3"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+toml = "1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
