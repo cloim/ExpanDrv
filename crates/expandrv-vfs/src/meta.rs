@@ -97,6 +97,43 @@ impl MetaCache {
         inner.dirs.insert(path.clone(), (list, now));
     }
 
+    /// TTL과 무관하게 마지막으로 받은 목록. 원격 변경 비교 기준으로 씁니다.
+    pub fn snapshot(&self, path: &RemotePath) -> Option<Arc<Vec<Entry>>> {
+        self.inner.lock().dirs.get(path).map(|(d, _)| d.clone())
+    }
+
+    /// 목록이 `expected` 그대로일 때만 새 목록으로 바꿉니다.
+    /// 폴링 도중 로컬 변경으로 무효화된 목록을 오래된 원격 결과로 덮지 않기 위함입니다.
+    pub fn replace_dir_if(
+        &self,
+        path: &RemotePath,
+        expected: &Arc<Vec<Entry>>,
+        list: Arc<Vec<Entry>>,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner
+            .dirs
+            .get(path)
+            .is_some_and(|(d, _)| Arc::ptr_eq(d, expected))
+        {
+            return false;
+        }
+        // 사라진 항목의 속성 캐시도 함께 지웁니다.
+        for e in expected.iter() {
+            if let Ok(child) = path.join(&e.name) {
+                inner.entries.remove(&child);
+            }
+        }
+        let now = Instant::now();
+        for e in list.iter() {
+            if let Ok(child) = path.join(&e.name) {
+                inner.entries.insert(child, (e.clone(), now));
+            }
+        }
+        inner.dirs.insert(path.clone(), (list, now));
+        true
+    }
+
     /// 항목과 부모 목록을 무효화합니다. 생성, 삭제, 크기 변경 후 호출합니다.
     pub fn invalidate(&self, path: &RemotePath) {
         let mut inner = self.inner.lock();

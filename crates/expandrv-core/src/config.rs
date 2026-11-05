@@ -25,6 +25,8 @@ pub struct DriveConfig {
     pub read_only: bool,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub transfer: TransferConfig,
     pub backend: BackendConfig,
 }
 
@@ -37,6 +39,8 @@ pub struct CacheConfig {
     pub block_size_mib: u32,
     /// 블록 캐시 메모리 상한(MiB)
     pub memory_limit_mib: u32,
+    /// 원격 변경 확인 주기(초). 0이면 확인하지 않습니다.
+    pub poll_interval_secs: u64,
 }
 
 impl Default for CacheConfig {
@@ -45,8 +49,17 @@ impl Default for CacheConfig {
             metadata_ttl_secs: 30,
             block_size_mib: 4,
             memory_limit_mib: 64,
+            poll_interval_secs: 60,
         }
     }
+}
+
+/// 드라이브별 전송 속도 제한(KiB/s). 0이면 제한하지 않습니다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransferConfig {
+    pub upload_kib_per_sec: u64,
+    pub download_kib_per_sec: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

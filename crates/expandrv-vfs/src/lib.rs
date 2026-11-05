@@ -11,6 +11,9 @@
 mod block;
 mod meta;
 mod persist;
+mod throttle;
+
+pub use throttle::throttle;
 
 use block::BlockCache;
 use bytes::Bytes;
@@ -35,6 +38,26 @@ const DOWNLOAD_CHUNK: u64 = 8 << 20;
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 /// 자동 재시도 횟수. 넘으면 다음 정리나 `sync` 때 다시 시도합니다.
 const MAX_UPLOAD_RETRIES: u32 = 5;
+/// 이 시간 안에 열거한 디렉터리만 원격 변경을 확인합니다.
+const WATCH_WINDOW: Duration = Duration::from_secs(600);
+const MAX_WATCHED_DIRS: usize = 64;
+/// 소비자가 없을 때 쌓아 둘 변경 알림 상한
+const MAX_PENDING_CHANGES: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Modified,
+}
+
+/// 폴링으로 감지한 원격 변경
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub path: RemotePath,
+    pub kind: ChangeKind,
+    pub is_dir: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct VfsOptions {
@@ -84,6 +107,9 @@ struct Shared {
     nodes: Mutex<HashMap<RemotePath, Arc<Node>>>,
     quota: Mutex<Option<(Quota, Instant)>>,
     uploads: Semaphore,
+    /// 최근 열거한 디렉터리와 그 시각
+    watched: Mutex<HashMap<RemotePath, Instant>>,
+    changes: Mutex<Vec<Change>>,
 }
 
 /// 열린 파일 또는 디렉터리 핸들. 같은 경로의 핸들은 하나의 노드를 공유합니다.
@@ -336,6 +362,92 @@ impl Shared {
     }
 }
 
+/// 이전 목록과 새 목록의 차이
+fn diff_listing(dir: &RemotePath, old: &[Entry], new: &[Entry]) -> Vec<Change> {
+    let before: HashMap<&str, &Entry> = old.iter().map(|e| (e.name.as_str(), e)).collect();
+    let after: HashMap<&str, &Entry> = new.iter().map(|e| (e.name.as_str(), e)).collect();
+    let mut out = Vec::new();
+    let mut push = |name: &str, kind, is_dir| {
+        if let Ok(path) = dir.join(name) {
+            out.push(Change { path, kind, is_dir });
+        }
+    };
+    for (name, e) in &after {
+        match before.get(name) {
+            None => push(name, ChangeKind::Added, e.is_dir()),
+            Some(o) if o.kind != e.kind => {
+                push(name, ChangeKind::Removed, o.is_dir());
+                push(name, ChangeKind::Added, e.is_dir());
+            }
+            Some(o)
+                if !e.is_dir()
+                    && (o.size, &o.etag, o.modified) != (e.size, &e.etag, e.modified) =>
+            {
+                push(name, ChangeKind::Modified, false)
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, o) in &before {
+        if !after.contains_key(name) {
+            push(name, ChangeKind::Removed, o.is_dir());
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+impl Shared {
+    /// 최근 열거한 디렉터리를 다시 읽어 마지막 목록과 비교합니다.
+    async fn poll_changes(&self) -> Vec<Change> {
+        let dirs: Vec<RemotePath> = {
+            let mut watched = self.watched.lock();
+            watched.retain(|_, at| at.elapsed() < WATCH_WINDOW);
+            let mut v: Vec<_> = watched.iter().map(|(p, at)| (p.clone(), *at)).collect();
+            v.sort_by_key(|e| std::cmp::Reverse(e.1));
+            v.into_iter()
+                .take(MAX_WATCHED_DIRS)
+                .map(|(p, _)| p)
+                .collect()
+        };
+        let mut out = Vec::new();
+        for dir in dirs {
+            let Some(old) = self.meta.snapshot(&dir) else {
+                continue;
+            };
+            let new = match self.backend.list(&dir).await {
+                Ok(l) => l,
+                Err(Error::NotFound | Error::NotADirectory) => {
+                    self.watched.lock().remove(&dir);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(%dir, error = %e, "변경 확인 실패");
+                    continue;
+                }
+            };
+            let diff = diff_listing(&dir, &old, &new);
+            if !self.meta.replace_dir_if(&dir, &old, Arc::new(new.clone())) || diff.is_empty() {
+                continue;
+            }
+            if let Some(store) = &self.store {
+                if let Err(e) = store.save_dir(&dir, &new) {
+                    tracing::warn!(%dir, error = %e, "메타 저장 실패");
+                }
+            }
+            for c in diff.iter().filter(|c| c.kind != ChangeKind::Added) {
+                self.blocks.invalidate(&c.path);
+                if c.is_dir {
+                    self.meta.invalidate_tree(&c.path);
+                }
+            }
+            tracing::debug!(%dir, count = diff.len(), "원격 변경 감지");
+            out.extend(diff);
+        }
+        out
+    }
+}
+
 impl Vfs {
     pub fn new(
         backend: Arc<dyn Backend>,
@@ -354,6 +466,8 @@ impl Vfs {
                 nodes: Mutex::new(HashMap::new()),
                 quota: Mutex::new(None),
                 uploads: Semaphore::new(opts.max_parallel_uploads.max(1)),
+                watched: Mutex::new(HashMap::new()),
+                changes: Mutex::new(Vec::new()),
                 opts,
             }),
         })
@@ -443,6 +557,7 @@ impl Vfs {
     /// 디렉터리 목록. 열린 노드의 스테이징 크기와 시각을 반영합니다.
     pub fn list(&self, path: &RemotePath) -> Result<Arc<Vec<Entry>>> {
         let s = &self.s;
+        s.watched.lock().insert(path.clone(), Instant::now());
         let list = match s.meta.dir(path) {
             Some(l) => l,
             None => match s.run(s.backend.list(path)) {
@@ -874,6 +989,37 @@ impl Vfs {
         let v = self.s.run(self.s.backend.quota()).unwrap_or_default();
         *q = Some((v, Instant::now()));
         v
+    }
+
+    /// 주기적으로 원격 변경을 확인하는 백그라운드 작업을 시작합니다. VFS가 사라지면 멈춥니다.
+    pub fn start_watch(&self, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.s);
+        self.s.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(s) = weak.upgrade() else { break };
+                let found = s.poll_changes().await;
+                if !found.is_empty() {
+                    let mut q = s.changes.lock();
+                    q.extend(found);
+                    let excess = q.len().saturating_sub(MAX_PENDING_CHANGES);
+                    q.drain(..excess);
+                }
+            }
+        });
+    }
+
+    /// 지금 한 번 원격 변경을 확인합니다.
+    pub fn poll_changes(&self) -> Vec<Change> {
+        self.s.rt.block_on(self.s.poll_changes())
+    }
+
+    /// 백그라운드 확인으로 쌓인 변경을 꺼냅니다.
+    pub fn take_changes(&self) -> Vec<Change> {
+        std::mem::take(&mut *self.s.changes.lock())
     }
 
     /// 원격 변경을 다시 읽도록 메타 캐시를 비웁니다.

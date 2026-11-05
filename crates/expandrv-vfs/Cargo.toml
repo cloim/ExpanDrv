@@ -15,9 +15,9 @@ tokio.workspace = true
 tracing.workspace = true
 lru = "0.19"
 rusqlite = { version = "0.41", features = ["bundled"] }
+async-trait = "0.1"
 
 [dev-dependencies]
-async-trait = "0.1"
 expandrv-backends.workspace = true
 
 [lints]

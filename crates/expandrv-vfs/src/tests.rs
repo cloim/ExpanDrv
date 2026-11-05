@@ -383,3 +383,58 @@ fn create_existing_fails() {
         Err(Error::NotADirectory)
     ));
 }
+
+#[test]
+fn poll_detects_remote_changes_in_watched_dirs() {
+    let f = fixture(false);
+    std::fs::write(f.root.path().join("keep.txt"), b"1").unwrap();
+    std::fs::write(f.root.path().join("edit.txt"), b"1").unwrap();
+    std::fs::write(f.root.path().join("gone.txt"), b"1").unwrap();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    assert!(f.vfs.poll_changes().is_empty());
+
+    std::fs::write(f.root.path().join("new.txt"), b"1").unwrap();
+    std::fs::write(f.root.path().join("edit.txt"), b"12345").unwrap();
+    std::fs::remove_file(f.root.path().join("gone.txt")).unwrap();
+    std::fs::create_dir(f.root.path().join("dir")).unwrap();
+    let got: Vec<(String, ChangeKind)> = f
+        .vfs
+        .poll_changes()
+        .into_iter()
+        .map(|c| (c.path.to_string(), c.kind))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("/dir".to_owned(), ChangeKind::Added),
+            ("/edit.txt".to_owned(), ChangeKind::Modified),
+            ("/gone.txt".to_owned(), ChangeKind::Removed),
+            ("/new.txt".to_owned(), ChangeKind::Added),
+        ]
+    );
+    // 캐시가 새 목록으로 바뀌어 바로 보입니다.
+    assert_eq!(f.vfs.stat(&p("/edit.txt")).unwrap().1.size, 5);
+    assert!(matches!(f.vfs.stat(&p("/gone.txt")), Err(Error::NotFound)));
+    assert!(f.vfs.poll_changes().is_empty());
+}
+
+#[test]
+fn local_changes_are_not_reported_as_remote() {
+    let f = fixture(false);
+    f.vfs.list(&RemotePath::root()).unwrap();
+    let h = f.vfs.create(&p("/mine.txt"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"abc", false, false).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    sync(&f);
+    assert!(f.vfs.poll_changes().is_empty());
+}
+
+#[test]
+fn throttle_wraps_only_when_limited() {
+    let f = fixture(false);
+    let be: Arc<dyn Backend> = f.backend.clone();
+    assert!(Arc::ptr_eq(&throttle(be.clone(), 0, 0), &be));
+    let t = throttle(be.clone(), 1 << 20, 0);
+    assert!(!Arc::ptr_eq(&t, &be));
+    assert_eq!(t.kind(), "test");
+}
