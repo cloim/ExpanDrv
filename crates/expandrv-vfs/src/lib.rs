@@ -9,14 +9,17 @@
 //! - 메타: 메모리 TTL 캐시와 SQLite 저장소. 원격이 응답하지 않으면 저장된 목록으로 탐색을 이어갑니다.
 
 mod block;
+mod diskcache;
 mod meta;
 mod persist;
 mod throttle;
 
+pub use diskcache::{DiskCacheOptions, generate_key as generate_cache_key};
 pub use throttle::throttle;
 
 use block::BlockCache;
 use bytes::Bytes;
+use diskcache::DiskCache;
 use expandrv_core::{Backend, Entry, EntryKind, Error, Quota, RemotePath, Result, WriteSource};
 use meta::{Lookup, MetaCache};
 use parking_lot::Mutex;
@@ -33,8 +36,9 @@ use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 
-/// 스테이징을 채울 때 한 번에 내려받는 크기
-const DOWNLOAD_CHUNK: u64 = 8 << 20;
+/// 일시 오류로 실패한 원격 읽기를 다시 시도하는 횟수와 첫 대기 시간(이후 두 배씩)
+const READ_RETRIES: u32 = 3;
+const READ_RETRY_BASE: Duration = Duration::from_millis(200);
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 /// 자동 재시도 횟수. 넘으면 다음 정리나 `sync` 때 다시 시도합니다.
 const MAX_UPLOAD_RETRIES: u32 = 5;
@@ -77,6 +81,8 @@ pub struct VfsOptions {
     /// SQLite 메타 저장소 경로. `None`이면 오프라인 폴백을 쓰지 않습니다.
     pub meta_db: Option<PathBuf>,
     pub max_parallel_uploads: usize,
+    /// 암호화 디스크 블록 캐시. `None`이면 메모리 캐시만 씁니다.
+    pub disk_cache: Option<DiskCacheOptions>,
 }
 
 impl VfsOptions {
@@ -91,6 +97,7 @@ impl VfsOptions {
             readahead_blocks: 2,
             meta_db: None,
             max_parallel_uploads: 4,
+            disk_cache: None,
         }
     }
 }
@@ -115,6 +122,9 @@ struct Shared {
     changes: Mutex<Vec<Change>>,
     /// `shutdown` 이후에는 새 업로드를 시작하지 않습니다(남은 분량은 저널로 넘김).
     closed: AtomicBool,
+    disk: Option<DiskCache>,
+    /// 원격에서 받고 있는 블록 수
+    downloads: AtomicUsize,
 }
 
 /// 열린 파일 또는 디렉터리 핸들. 같은 경로의 핸들은 하나의 노드를 공유합니다.
@@ -150,6 +160,8 @@ struct NodeState {
     base_etag: Option<String>,
     /// 이전 실행의 저널에서 되살린 노드
     recovered: bool,
+    /// 끊긴 스테이징 다운로드(파일, 받은 바이트, 원격 버전). 같은 버전이면 이어받습니다.
+    partial: Option<(NamedTempFile, u64, String)>,
 }
 
 impl Drop for NodeState {
@@ -211,9 +223,68 @@ impl Shared {
         })
     }
 
+    /// 메모리와 디스크 캐시에서 경로와 하위 경로의 블록을 지웁니다.
+    fn drop_blocks(&self, path: &RemotePath) {
+        self.blocks.invalidate(path);
+        if let Some(d) = &self.disk {
+            d.invalidate(path);
+        }
+    }
+
+    /// 일시 오류(네트워크, 시간 초과, 서버 프로토콜 오류)면 지수 백오프로 다시 읽습니다.
+    async fn read_retry(&self, path: &RemotePath, offset: u64, len: u64) -> Result<Bytes> {
+        let mut delay = READ_RETRY_BASE;
+        let mut attempt = 0;
+        loop {
+            match self.backend.read_range(path, offset, len).await {
+                Err(e @ (Error::Network(_) | Error::Timeout | Error::Protocol(_)))
+                    if attempt < READ_RETRIES =>
+                {
+                    attempt += 1;
+                    tracing::debug!(%path, offset, attempt, error = %e, "읽기 재시도");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// 디스크 캐시, 원격 순서로 블록을 찾고 메모리 캐시에 넣습니다. 원격에서 받은 블록은 디스크에도 둡니다.
+    async fn load_block(
+        self: &Arc<Self>,
+        path: &RemotePath,
+        ver: &str,
+        idx: u64,
+        size: u64,
+    ) -> Result<Bytes> {
+        if let Some(b) = self.disk.as_ref().and_then(|d| d.get(path, ver, idx)) {
+            self.blocks.put(path, ver, idx, b.clone());
+            return Ok(b);
+        }
+        let bs = self.blocks.block_size();
+        let off = idx * bs;
+        self.downloads.fetch_add(1, Ordering::SeqCst);
+        let r = self.read_retry(path, off, bs.min(size - off)).await;
+        self.downloads.fetch_sub(1, Ordering::SeqCst);
+        let b = r?;
+        self.blocks.put(path, ver, idx, b.clone());
+        if self.disk.is_some() {
+            let (s, path, ver, data) = (self.clone(), path.clone(), ver.to_owned(), b.clone());
+            self.rt.spawn_blocking(move || {
+                if let Some(d) = &s.disk
+                    && let Err(e) = d.put(&path, &ver, idx, &data)
+                {
+                    tracing::debug!(%path, idx, error = %e, "디스크 캐시 저장 실패");
+                }
+            });
+        }
+        Ok(b)
+    }
+
     fn forget(&self, path: &RemotePath) {
         self.meta.invalidate_tree(path);
-        self.blocks.invalidate(path);
+        self.drop_blocks(path);
         if let Some(store) = &self.store
             && let Err(e) = store.forget_tree(path)
         {
@@ -331,7 +402,7 @@ impl Shared {
                 }
                 self.meta.invalidate(&path);
                 self.meta.put_entry(&path, entry);
-                self.blocks.invalidate(&path);
+                self.drop_blocks(&path);
             }
             Some((path, Err(e))) => {
                 st.failures += 1;
@@ -349,33 +420,28 @@ impl Shared {
         self.release(node);
     }
 
-    fn fetch_block(&self, path: &RemotePath, ver: &str, idx: u64, size: u64) -> Result<Bytes> {
+    fn fetch_block(
+        self: &Arc<Self>,
+        path: &RemotePath,
+        ver: &str,
+        idx: u64,
+        size: u64,
+    ) -> Result<Bytes> {
         if let Some(b) = self.blocks.get(path, ver, idx) {
             return Ok(b);
         }
-        let bs = self.blocks.block_size();
         let (cell, _) = self.blocks.inflight(path, idx);
         let got = self.run(async {
             Ok(cell
-                .get_or_init(|| async {
-                    let off = idx * bs;
-                    let r = self.backend.read_range(path, off, bs.min(size - off)).await;
-                    r.ok()
-                })
+                .get_or_init(|| async { self.load_block(path, ver, idx, size).await.ok() })
                 .await
                 .clone())
         });
         self.blocks.finish_inflight(path, idx);
         match got? {
-            Some(b) => {
-                self.blocks.put(path, ver, idx, b.clone());
-                Ok(b)
-            }
+            Some(b) => Ok(b),
             // 공유 셀에는 오류를 담지 않으므로 직접 다시 요청해 원래 오류를 돌려줍니다.
-            None => {
-                let off = idx * bs;
-                self.run(self.backend.read_range(path, off, bs.min(size - off)))
-            }
+            None => self.run(self.load_block(path, ver, idx, size)),
         }
     }
 
@@ -391,19 +457,8 @@ impl Shared {
             }
             let (s, path, ver) = (self.clone(), path.clone(), ver.to_owned());
             self.rt.spawn(async move {
-                let off = idx * bs;
-                let data = cell
-                    .get_or_init(|| async {
-                        s.backend
-                            .read_range(&path, off, bs.min(size - off))
-                            .await
-                            .ok()
-                    })
-                    .await
-                    .clone();
-                if let Some(b) = data {
-                    s.blocks.put(&path, &ver, idx, b);
-                }
+                cell.get_or_init(|| async { s.load_block(&path, &ver, idx, size).await.ok() })
+                    .await;
                 s.blocks.finish_inflight(&path, idx);
             });
         }
@@ -501,6 +556,7 @@ impl Shared {
                     journaled: Some(staging),
                     base_etag,
                     recovered: true,
+                    partial: None,
                 }),
             });
             self.nodes.lock().insert(path, node.clone());
@@ -548,7 +604,7 @@ impl Shared {
                 tracing::warn!(%dir, error = %e, "메타 저장 실패");
             }
             for c in diff.iter().filter(|c| c.kind != ChangeKind::Added) {
-                self.blocks.invalidate(&c.path);
+                self.drop_blocks(&c.path);
                 if c.is_dir {
                     self.meta.invalidate_tree(&c.path);
                 }
@@ -568,6 +624,7 @@ impl Vfs {
     ) -> Result<Self> {
         std::fs::create_dir_all(&opts.staging_dir)?;
         let store = opts.meta_db.as_deref().map(MetaStore::open).transpose()?;
+        let disk = opts.disk_cache.as_ref().map(DiskCache::open).transpose()?;
         let s = Arc::new(Shared {
             backend,
             rt,
@@ -580,6 +637,8 @@ impl Vfs {
             watched: Mutex::new(HashMap::new()),
             changes: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            disk,
+            downloads: AtomicUsize::new(0),
             opts,
         });
         // 유휴 블록 정리 작업. VFS가 사라지면 멈춥니다.
@@ -771,6 +830,7 @@ impl Vfs {
                         journaled: None,
                         base_etag: None,
                         recovered: false,
+                        partial: None,
                     }),
                 })
             })
@@ -875,21 +935,37 @@ impl Vfs {
             return Ok(());
         }
         let s = &self.s;
-        let mut tmp = NamedTempFile::new_in(&s.opts.staging_dir)?;
         let size = st.entry.size;
-        let mut off = 0;
-        while off < size {
-            let chunk = s.run(
-                s.backend
-                    .read_range(path, off, DOWNLOAD_CHUNK.min(size - off)),
-            )?;
-            if chunk.is_empty() {
+        let ver = version(&st.entry);
+        let bs = s.blocks.block_size();
+        let (mut tmp, mut done) = match st.partial.take() {
+            Some((f, done, v)) if v == ver => {
+                tracing::info!(%path, done, size, "끊긴 내려받기를 이어받습니다");
+                (f, done)
+            }
+            _ => (NamedTempFile::new_in(&s.opts.staging_dir)?, 0),
+        };
+        while done < size {
+            let idx = done / bs;
+            let block = match s.fetch_block(path, &ver, idx, size) {
+                Ok(b) => b,
+                Err(e) => {
+                    st.partial = Some((tmp, done, ver));
+                    return Err(e);
+                }
+            };
+            let in_off = (done - idx * bs) as usize;
+            if in_off >= block.len() {
                 break;
             }
-            tmp.write_all(&chunk)?;
-            off += chunk.len() as u64;
+            tmp.write_all(&block[in_off..])?;
+            done += (block.len() - in_off) as u64;
+            // 원격이 줄어들어 블록이 짧으면 여기서 끝냅니다.
+            if (block.len() as u64) < bs.min(size - idx * bs) {
+                break;
+            }
         }
-        st.entry.size = off;
+        st.entry.size = done;
         st.staged = Some(tmp);
         Ok(())
     }
@@ -1091,6 +1167,11 @@ impl Vfs {
         drop(st);
         s.forget(&path);
         Ok(())
+    }
+
+    /// 원격에서 받고 있는 블록 수
+    pub fn active_downloads(&self) -> usize {
+        self.s.downloads.load(Ordering::SeqCst)
     }
 
     /// 업로드 대기 중이거나 진행 중인 파일 수

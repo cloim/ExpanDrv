@@ -8,6 +8,10 @@ struct TestBackend {
     write_delay: Mutex<Duration>,
     offline: AtomicBool,
     fail_writes: AtomicU32,
+    /// 다음 읽기 몇 번을 일시 오류로 실패시킵니다.
+    fail_reads: AtomicU32,
+    /// 성공한 읽기가 이 횟수에 이르면 이후 읽기를 모두 일시 오류로 실패시킵니다.
+    fail_reads_after: AtomicUsize,
     reads: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -40,6 +44,14 @@ impl Backend for TestBackend {
     }
     async fn read_range(&self, path: &RemotePath, offset: u64, len: u64) -> Result<Bytes> {
         self.check()?;
+        if self
+            .fail_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+            || self.reads.load(Ordering::SeqCst) >= self.fail_reads_after.load(Ordering::SeqCst)
+        {
+            return Err(Error::Network("injected read".into()));
+        }
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_range(path, offset, len).await
     }
@@ -91,6 +103,8 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
         offline: AtomicBool::new(false),
         fail_writes: AtomicU32::new(0),
         reads: AtomicUsize::new(0),
+        fail_reads: AtomicU32::new(0),
+        fail_reads_after: AtomicUsize::new(usize::MAX),
         writes: AtomicUsize::new(0),
     });
     let mut opts = VfsOptions::new(staging.path().join("stage"));
@@ -580,4 +594,136 @@ fn conflict_name_format() {
         conflict_path(&p("/noext"), UNIX_EPOCH).unwrap().as_str(),
         "/noext (ExpanDrv 충돌 1970-01-01 000000)"
     );
+}
+
+#[test]
+fn transient_read_errors_are_retried() {
+    let f = fixture_with(|o| o.block_size = 64 * 1024);
+    std::fs::write(f.root.path().join("r.bin"), vec![5u8; 1000]).unwrap();
+    let h = f.vfs.open(&p("/r.bin")).unwrap();
+    f.backend.fail_reads.store(2, Ordering::SeqCst);
+    let mut buf = [0u8; 1000];
+    assert_eq!(f.vfs.read(&h, 0, &mut buf).unwrap(), 1000);
+    assert_eq!(buf[999], 5);
+
+    // 재시도 횟수를 넘는 일시 오류는 그대로 돌려줍니다.
+    let h2 = {
+        std::fs::write(f.root.path().join("r2.bin"), vec![1u8; 10]).unwrap();
+        f.vfs.open(&p("/r2.bin")).unwrap()
+    };
+    f.backend.fail_reads.store(10, Ordering::SeqCst);
+    assert!(matches!(
+        f.vfs.read(&h2, 0, &mut buf),
+        Err(Error::Network(_))
+    ));
+    f.backend.fail_reads.store(0, Ordering::SeqCst);
+}
+
+#[test]
+fn interrupted_staging_download_resumes_without_refetch() {
+    let f = fixture_with(|o| {
+        o.block_size = 64 * 1024;
+        o.readahead_blocks = 0;
+    });
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 249) as u8).collect();
+    std::fs::write(f.root.path().join("big.bin"), &data).unwrap();
+    let h = f.vfs.open(&p("/big.bin")).unwrap();
+
+    // 블록 2개를 받은 뒤 끊깁니다.
+    f.backend.fail_reads_after.store(2, Ordering::SeqCst);
+    assert!(f.vfs.write(&h, 0, b"X", false, false).is_err());
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), 2);
+
+    // 연결이 돌아오면 나머지 3블록만 받아 마칩니다.
+    f.backend
+        .fail_reads_after
+        .store(usize::MAX, Ordering::SeqCst);
+    f.vfs.write(&h, 0, b"X", false, false).unwrap();
+    assert_eq!(
+        f.backend.reads.load(Ordering::SeqCst),
+        5,
+        "이미 받은 블록을 다시 받았습니다"
+    );
+    f.vfs.cleanup(&h, false).unwrap();
+    sync(&f);
+    let mut want = data.clone();
+    want[0] = b'X';
+    assert_eq!(std::fs::read(f.root.path().join("big.bin")).unwrap(), want);
+}
+
+fn with_disk_cache(o: &mut VfsOptions, key: [u8; 32]) {
+    o.block_size = 64 * 1024;
+    o.readahead_blocks = 0;
+    o.meta_db = Some(o.staging_dir.with_file_name("meta.db"));
+    o.disk_cache = Some(DiskCacheOptions {
+        dir: o.staging_dir.with_file_name("blocks"),
+        max_bytes: 16 << 20,
+        key,
+    });
+}
+
+/// 디스크 캐시 저장은 백그라운드로 진행되므로 블록 파일이 생길 때까지 기다립니다.
+fn wait_disk_blocks(f: &Fixture, n: usize) {
+    let dir = f.staging.path().join("blocks");
+    for _ in 0..100 {
+        let count: usize = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| std::fs::read_dir(e.path()).map_or(0, |r| r.count()))
+                    .sum()
+            })
+            .unwrap_or(0);
+        if count >= n {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("디스크 캐시 블록이 {n}개 생기지 않았습니다");
+}
+
+#[test]
+fn disk_cache_serves_reads_after_restart_and_offline() {
+    let key = generate_cache_key().unwrap();
+    let f = fixture_with(|o| with_disk_cache(o, key));
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::create_dir(f.root.path().join("docs")).unwrap();
+    std::fs::write(f.root.path().join("docs/report.bin"), &data).unwrap();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    f.vfs.list(&p("/docs")).unwrap();
+    let h = f.vfs.open(&p("/docs/report.bin")).unwrap();
+    let mut buf = vec![0u8; data.len()];
+    assert_eq!(f.vfs.read(&h, 0, &mut buf).unwrap(), data.len());
+    f.vfs.cleanup(&h, false).unwrap();
+    wait_disk_blocks(&f, 4);
+
+    // 다시 시작했고 원격은 응답하지 않습니다.
+    f.backend.offline.store(true, Ordering::SeqCst);
+    let reads_before = f.backend.reads.load(Ordering::SeqCst);
+    let vfs = Vfs::new(f.backend.clone(), f._rt.handle().clone(), f.opts.clone()).unwrap();
+    let h = vfs.open(&p("/docs/report.bin")).unwrap();
+    let mut again = vec![0u8; data.len()];
+    assert_eq!(vfs.read(&h, 0, &mut again).unwrap(), data.len());
+    assert_eq!(again, data);
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), reads_before);
+    assert_eq!(vfs.active_downloads(), 0);
+}
+
+#[test]
+fn disk_cache_is_invalidated_by_upload() {
+    let key = generate_cache_key().unwrap();
+    let f = fixture_with(|o| with_disk_cache(o, key));
+    std::fs::write(f.root.path().join("v.txt"), b"version-1").unwrap();
+    let h = f.vfs.open(&p("/v.txt")).unwrap();
+    let mut buf = [0u8; 9];
+    f.vfs.read(&h, 0, &mut buf).unwrap();
+    wait_disk_blocks(&f, 1);
+    f.vfs.write(&h, 8, b"2", false, false).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    sync(&f);
+
+    let vfs = Vfs::new(f.backend.clone(), f._rt.handle().clone(), f.opts.clone()).unwrap();
+    let h = vfs.open(&p("/v.txt")).unwrap();
+    vfs.read(&h, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"version-2");
 }

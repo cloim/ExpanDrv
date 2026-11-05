@@ -17,6 +17,7 @@ tracing.workspace = true
 lru = "0.19"
 rusqlite = { version = "0.41", features = ["bundled"] }
 async-trait = "0.1"
+ring = "0.17"
 
 [dev-dependencies]
 expandrv-backends.workspace = true

@@ -99,6 +99,8 @@ pub struct CacheConfig {
     pub memory_limit_mib: u32,
     /// 원격 변경 확인 주기(초). 0이면 확인하지 않습니다.
     pub poll_interval_secs: u64,
+    /// 암호화한 디스크 블록 캐시 상한(MiB). 0이면 디스크 캐시를 쓰지 않습니다.
+    pub disk_limit_mib: u64,
 }
 
 impl Default for CacheConfig {
@@ -108,6 +110,7 @@ impl Default for CacheConfig {
             block_size_mib: 4,
             memory_limit_mib: 64,
             poll_interval_secs: 60,
+            disk_limit_mib: 1024,
         }
     }
 }

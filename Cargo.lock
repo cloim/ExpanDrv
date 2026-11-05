@@ -938,6 +938,7 @@ dependencies = [
  "expandrv-core",
  "lru",
  "parking_lot 0.13.0",
+ "ring",
  "rusqlite",
  "tempfile",
  "tokio",
