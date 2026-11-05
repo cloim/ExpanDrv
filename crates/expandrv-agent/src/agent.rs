@@ -18,8 +18,8 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
-/// 마운트 해제 때 남은 업로드를 기다리는 최대 시간
-const UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
+/// 마운트 해제 때 남은 업로드를 기다리는 최대 시간. 넘기면 저널로 다음 마운트에 넘깁니다.
+const UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct Mounted {
     /// 마운트할 때의 설정. 다시 읽은 설정과 달라도 실제 상태를 보여 줍니다.
@@ -81,13 +81,19 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
 }
 
 /// 새 쓰기를 막은 뒤(드라이브 먼저 해제) 남은 업로드를 마칩니다.
+/// 끝내지 못한 업로드는 멈추고 저널에 남겨 다음 마운트 때 이어 올립니다.
 fn release(id: &str, m: Mounted) -> Result<()> {
     drop(m.drive);
     let pending = m.vfs.pending_uploads();
     if pending > 0 {
         tracing::info!(id, pending, "남은 업로드를 마치는 중");
     }
-    m.vfs.sync(UPLOAD_DRAIN_TIMEOUT)
+    let drained = m.vfs.sync(UPLOAD_DRAIN_TIMEOUT);
+    m.vfs.shutdown();
+    if let Err(e) = &drained {
+        tracing::warn!(id, error = %e, "업로드를 마치지 못해 다음 마운트 때 이어 올립니다");
+    }
+    drained
 }
 
 fn joined<T>(r: std::result::Result<Result<T>, tokio::task::JoinError>) -> Result<T> {
