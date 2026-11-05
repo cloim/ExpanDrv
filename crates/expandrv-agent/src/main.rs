@@ -1,22 +1,22 @@
-//! `expandrv` CLI: 드라이브 설정 관리와 포그라운드 마운트
+//! `expandrv` CLI: 드라이브 설정 관리와 상주 에이전트 제어
 
-mod signal;
+mod agent;
+mod control;
 
 use clap::{Args, Parser, Subcommand};
+use control::{AgentLink, expect_ok};
 use expandrv_core::config::{
     BackendConfig, CacheConfig, Config, DriveConfig, EnvSecrets, FtpConfig, FtpTls, S3Config,
     SecretSource, SftpConfig, TransferConfig, WebDavConfig,
 };
 use expandrv_core::{Error, Result};
-use expandrv_vfs::{Vfs, VfsOptions};
-use expandrv_winfsp::{MountOptions, MountedDrive};
-use signal::UnmountSignal;
+use expandrv_ipc::{DriveState, ErrorCode, Request, Response};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-/// 마운트 해제 때 남은 업로드를 기다리는 최대 시간
-const UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
+/// 파이프 이름 재지정(테스트용). `--pipe`가 우선합니다.
+const PIPE_ENV: &str = "EXPANDRV_PIPE";
 
 #[derive(Parser)]
 #[command(
@@ -28,6 +28,9 @@ struct Cli {
     /// 설정 파일 경로(기본: %APPDATA%\ExpanDrv\config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// 에이전트 파이프 이름(테스트용)
+    #[arg(long, global = true, hide = true)]
+    pipe: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -42,13 +45,21 @@ enum Command {
     List,
     /// 연결과 인증만 확인합니다
     Check { id: String },
-    /// 드라이브를 마운트하고 Ctrl+C 또는 unmount 요청까지 유지합니다
+    /// 드라이브를 마운트합니다. 에이전트가 없으면 백그라운드로 시작합니다
     Mount {
         /// 마운트할 드라이브 id(생략하면 전체)
         ids: Vec<String>,
     },
-    /// 실행 중인 마운트를 해제합니다
+    /// 마운트를 해제합니다(남은 업로드를 마칠 때까지 기다림)
     Unmount { id: String },
+    /// 상주 에이전트를 포그라운드로 실행합니다
+    Agent {
+        /// 분리 실행용: 로그를 파일로 남깁니다
+        #[arg(long, hide = true)]
+        background: bool,
+    },
+    /// 모든 드라이브를 해제하고 에이전트를 종료합니다
+    Stop,
 }
 
 #[derive(Args)]
@@ -217,11 +228,41 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(appdata).join("ExpanDrv").join("config.toml"))
 }
 
-/// 드라이브별 캐시 폴더(`%LOCALAPPDATA%\ExpanDrv\cache\<id>`). 스테이징과 메타 DB를 둡니다.
-fn cache_dir(id: &str) -> Result<PathBuf> {
+/// `%LOCALAPPDATA%\ExpanDrv`
+fn data_dir() -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| Error::Config("LOCALAPPDATA 환경 변수가 없습니다".into()))?;
-    Ok(PathBuf::from(base).join("ExpanDrv").join("cache").join(id))
+    Ok(PathBuf::from(base).join("ExpanDrv"))
+}
+
+/// 드라이브별 캐시 폴더(`%LOCALAPPDATA%\ExpanDrv\cache\<id>`). 스테이징과 메타 DB를 둡니다.
+fn cache_dir(id: &str) -> Result<PathBuf> {
+    Ok(data_dir()?.join("cache").join(id))
+}
+
+/// 백그라운드 에이전트 로그 폴더(`%LOCALAPPDATA%\ExpanDrv\logs`)
+fn log_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("logs"))
+}
+
+fn ipc_err(e: expandrv_ipc::Error) -> Error {
+    match e {
+        expandrv_ipc::Error::Io(e) => Error::Io(e),
+        expandrv_ipc::Error::Timeout => Error::Timeout,
+        e => message(e.to_string()),
+    }
+}
+
+/// 분류 접두어 없이 그대로 보일 오류(에이전트 응답 등)
+fn message(msg: impl Into<String>) -> Error {
+    Error::Io(std::io::Error::other(msg.into()))
+}
+
+fn pipe_name(flag: Option<String>) -> Result<String> {
+    match flag.or_else(|| std::env::var(PIPE_ENV).ok()) {
+        Some(p) => Ok(p),
+        None => expandrv_ipc::default_pipe_name().map_err(ipc_err),
+    }
 }
 
 /// 드라이브 id로 고정된 볼륨 일련번호(FNV-1a)
@@ -268,20 +309,31 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
     Ok(())
 }
 
-fn list(cfg: &Config) {
+fn list(cfg: &Config, pipe: &str) -> Result<()> {
     if cfg.drives.is_empty() {
         println!("설정된 드라이브가 없습니다.");
-        return;
+        return Ok(());
     }
+    let states: HashMap<String, (DriveState, u64)> = match AgentLink::connect(pipe)? {
+        Some(mut link) => link
+            .status()?
+            .drives
+            .into_iter()
+            .map(|d| (d.id, (d.state, d.pending_uploads)))
+            .collect(),
+        None => HashMap::new(),
+    };
     println!(
         "{:<16} {:<8} {:<8} {:<10} 레이블",
         "ID", "지점", "종류", "상태"
     );
     for d in &cfg.drives {
-        let state = if signal::is_mounted(&d.id) {
-            "마운트됨"
-        } else {
-            "-"
+        let state = match states.get(&d.id) {
+            Some((DriveState::Mounted, 0)) => "마운트됨".to_owned(),
+            Some((DriveState::Mounted, n)) => format!("마운트됨(업로드 {n})"),
+            Some((DriveState::Failed(_), _)) => "실패".to_owned(),
+            Some((DriveState::Unmounted, n)) if *n > 0 => format!("해제 중(업로드 {n})"),
+            _ => "-".to_owned(),
         };
         println!(
             "{:<16} {:<8} {:<8} {:<10} {}",
@@ -292,9 +344,16 @@ fn list(cfg: &Config) {
             d.label
         );
     }
+    for d in &cfg.drives {
+        if let Some((DriveState::Failed(msg), _)) = states.get(&d.id) {
+            println!("{}: {msg}", d.id);
+        }
+    }
+    Ok(())
 }
 
-fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
+fn mount(cfg_path: &Path, pipe: &str, ids: &[String]) -> Result<()> {
+    let cfg = Config::load(cfg_path)?;
     let drives: Vec<&DriveConfig> = if ids.is_empty() {
         cfg.drives.iter().collect()
     } else {
@@ -309,83 +368,77 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
         return Err(Error::Config("마운트할 드라이브가 없습니다".into()));
     }
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let mut mounted = Vec::new();
+    let mut link = AgentLink::start(pipe, cfg_path)?;
+    // 이미 떠 있던 에이전트도 최신 설정을 쓰게 합니다.
+    expect_ok(link.call(&Request::Reload)?)?;
+    let mut failed = 0;
     for d in drives {
-        let signal = Arc::new(UnmountSignal::create(&d.id)?);
-        let backend = expandrv_vfs::throttle(
-            rt.block_on(expandrv_backends::connect(
-                &d.backend,
-                d.proxy.as_ref(),
-                &EnvSecrets,
-            ))?,
-            d.transfer.upload_kib_per_sec * 1024,
-            d.transfer.download_kib_per_sec * 1024,
-        );
-        let vfs = Vfs::new(
-            backend,
-            rt.handle().clone(),
-            VfsOptions {
-                read_only: d.read_only,
-                metadata_ttl: Duration::from_secs(d.cache.metadata_ttl_secs),
-                block_size: u64::from(d.cache.block_size_mib) << 20,
-                memory_cache_bytes: (d.cache.memory_limit_mib as usize) << 20,
-                meta_db: Some(cache_dir(&d.id)?.join("meta.db")),
-                ..VfsOptions::new(cache_dir(&d.id)?.join("staging"))
-            },
-        )?;
-        let drive = MountedDrive::mount(
-            Arc::new(vfs.clone()),
-            &MountOptions {
-                mount_point: d.mount_point.clone(),
-                label: d.label.clone(),
-                file_info_timeout_ms: 1000,
-                serial: serial(&d.id),
-            },
-        )?;
-        vfs.start_watch(Duration::from_secs(d.cache.poll_interval_secs));
-        println!("{} -> {} ({})", d.id, d.mount_point, d.backend.kind());
-        let (waiter, tx, id) = (signal.clone(), tx.clone(), d.id.clone());
-        std::thread::spawn(move || {
-            if waiter.wait() {
-                let _ = tx.send(id);
+        match link.call(&Request::Mount { id: d.id.clone() })? {
+            Response::Ok => println!("{} -> {} ({})", d.id, d.mount_point, d.backend.kind()),
+            Response::Error {
+                code: ErrorCode::AlreadyMounted,
+                ..
+            } => println!("{}: 이미 마운트되어 있습니다", d.id),
+            Response::Error { message, .. } => {
+                eprintln!("{}: {message}", d.id);
+                failed += 1;
             }
-        });
-        mounted.push((d.id.clone(), signal, drive, vfs));
-    }
-    println!("Ctrl+C 또는 `expandrv unmount <id>`로 해제합니다.");
-
-    while !mounted.is_empty() {
-        let next = rt.block_on(async {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => None,
-                id = rx.recv() => id,
-            }
-        });
-        let leaving: Vec<_> = match next {
-            Some(id) => {
-                let (out, keep) = mounted.into_iter().partition(|m| m.0 == id);
-                mounted = keep;
-                out
-            }
-            None => std::mem::take(&mut mounted),
-        };
-        for (id, signal, drive, vfs) in leaving {
-            signal.set();
-            // 새 쓰기를 막은 뒤 남은 업로드를 마칩니다.
-            drop(drive);
-            let pending = vfs.pending_uploads();
-            if pending > 0 {
-                println!("{id}: 남은 업로드 {pending}개를 마치는 중입니다");
-            }
-            match vfs.sync(UPLOAD_DRAIN_TIMEOUT) {
-                Ok(()) => println!("해제했습니다: {id}"),
-                Err(e) => eprintln!("{id}: {e}"),
-            }
+            other => return Err(Error::Protocol(format!("예상하지 못한 응답: {other:?}"))),
         }
     }
+    if failed > 0 {
+        return Err(message(format!(
+            "드라이브 {failed}개를 마운트하지 못했습니다"
+        )));
+    }
+    println!("`expandrv unmount <id>` 또는 `expandrv stop`으로 해제합니다.");
     Ok(())
+}
+
+fn require_agent(pipe: &str) -> Result<AgentLink> {
+    AgentLink::connect(pipe)?.ok_or_else(|| message("에이전트가 실행 중이 아닙니다"))
+}
+
+fn unmount(pipe: &str, id: &str) -> Result<()> {
+    let mut link = require_agent(pipe)?;
+    if let Some(d) = link.status()?.drives.iter().find(|d| d.id == id)
+        && d.pending_uploads > 0
+    {
+        println!(
+            "{id}: 남은 업로드 {}개를 마치는 중입니다",
+            d.pending_uploads
+        );
+    }
+    expect_ok(link.call(&Request::Unmount { id: id.to_owned() })?)?;
+    println!("해제했습니다: {id}");
+    Ok(())
+}
+
+fn stop(pipe: &str) -> Result<()> {
+    let Some(mut link) = AgentLink::connect(pipe)? else {
+        println!("에이전트가 실행 중이 아닙니다.");
+        return Ok(());
+    };
+    let pid = link.pid();
+    let r = expect_ok(link.call(&Request::Shutdown)?);
+    drop(link);
+    if !control::wait_process_exit(pid, Duration::from_secs(30)) {
+        return Err(message(format!(
+            "에이전트(pid {pid})가 아직 종료되지 않았습니다"
+        )));
+    }
+    r?;
+    println!("에이전트를 종료했습니다.");
+    Ok(())
+}
+
+/// 설정을 바꾼 뒤 실행 중인 에이전트가 있으면 다시 읽게 합니다.
+fn notify_reload(pipe: &str) {
+    if let Ok(Some(mut link)) = AgentLink::connect(pipe)
+        && let Err(e) = link.call(&Request::Reload).and_then(expect_ok)
+    {
+        eprintln!("에이전트 설정 갱신 실패: {e}");
+    }
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -393,11 +446,22 @@ fn run(cli: Cli) -> Result<()> {
         Some(p) => p,
         None => default_config_path()?,
     };
+    let pipe = pipe_name(cli.pipe)?;
     match cli.command {
-        Command::Add(a) => add(&cfg_path, *a),
+        Command::Add(a) => {
+            add(&cfg_path, *a)?;
+            notify_reload(&pipe);
+            Ok(())
+        }
         Command::Remove { id } => {
             let mut cfg = Config::load(&cfg_path)?;
-            if signal::is_mounted(&id) {
+            if let Some(mut link) = AgentLink::connect(&pipe)?
+                && link
+                    .status()?
+                    .drives
+                    .iter()
+                    .any(|d| d.id == id && d.state == DriveState::Mounted)
+            {
                 return Err(Error::Config(format!(
                     "{id}가 마운트되어 있습니다. 먼저 해제하세요"
                 )));
@@ -408,13 +472,11 @@ fn run(cli: Cli) -> Result<()> {
                 return Err(Error::Config(format!("드라이브 {id}가 없습니다")));
             }
             cfg.save(&cfg_path)?;
+            notify_reload(&pipe);
             println!("삭제했습니다: {id}");
             Ok(())
         }
-        Command::List => {
-            list(&Config::load(&cfg_path)?);
-            Ok(())
-        }
+        Command::List => list(&Config::load(&cfg_path)?, &pipe),
         Command::Check { id } => {
             let cfg = Config::load(&cfg_path)?;
             let d = cfg
@@ -429,24 +491,64 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             })
         }
-        Command::Mount { ids } => mount(&Config::load(&cfg_path)?, &ids),
-        Command::Unmount { id } => {
-            signal::request_unmount(&id)?;
-            println!("해제를 요청했습니다: {id}");
-            Ok(())
-        }
+        Command::Mount { ids } => mount(&cfg_path, &pipe, &ids),
+        Command::Unmount { id } => unmount(&pipe, &id),
+        Command::Agent { .. } => agent::run(cfg_path, &pipe),
+        Command::Stop => stop(&pipe),
+    }
+}
+
+/// 로그 출력 설정. 분리 실행한 에이전트는 파일로, 나머지는 stderr로 남깁니다.
+fn init_logging(background: bool) {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    use tracing_subscriber::prelude::*;
+
+    let file = if background {
+        log_dir().ok().and_then(|dir| {
+            tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("agent")
+                .filename_suffix("log")
+                .max_log_files(7)
+                .build(dir)
+                .ok()
+        })
+    } else {
+        None
+    };
+    let to_file = file.is_some();
+    let (writer, default_level) = match file {
+        Some(f) => (BoxMakeWriter::new(f), "info"),
+        None => (BoxMakeWriter::new(std::io::stderr), "warn"),
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("EXPANDRV_LOG")
+        .unwrap_or_else(|_| default_level.into());
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(!to_file),
+        )
+        .with(filter)
+        .init();
+    if to_file {
+        // 콘솔이 없으므로 패닉도 로그에 남깁니다.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!("패닉: {info}");
+            prev(info);
+        }));
     }
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("EXPANDRV_LOG")
-                .unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    if let Err(e) = run(Cli::parse()) {
+    let cli = Cli::parse();
+    let background = matches!(cli.command, Command::Agent { background: true });
+    init_logging(background);
+    if let Err(e) = run(cli) {
+        if background {
+            tracing::error!("{e}");
+        }
         eprintln!("오류: {e}");
         std::process::exit(1);
     }
@@ -508,8 +610,16 @@ mod tests {
     fn add_list_remove_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
+        // 실제 에이전트와 섞이지 않도록 없는 파이프 이름을 씁니다.
+        let pipe = format!(r"\\.\pipe\expandrv-unit-{}", std::process::id());
         let run_cli = |args: &[&str]| {
-            let mut v = vec!["expandrv", "--config", cfg_path.to_str().unwrap()];
+            let mut v = vec![
+                "expandrv",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "--pipe",
+                &pipe,
+            ];
             v.extend_from_slice(args);
             run(Cli::try_parse_from(v).unwrap())
         };
