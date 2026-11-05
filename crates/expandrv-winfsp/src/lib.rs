@@ -9,7 +9,7 @@ use expandrv_vfs::Vfs;
 use fs::ExpanFs;
 use std::sync::Arc;
 use std::time::SystemTime;
-use winfsp::host::{FileSystemHost, VolumeParams};
+use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
 pub use fs::{filetime, from_filetime};
 
@@ -50,7 +50,12 @@ impl MountedDrive {
             .flush_and_purge_on_cleanup(true);
 
         let ctx = ExpanFs::new(vfs, opts.label.clone(), security);
-        let mut host = FileSystemHost::new(vp, ctx).map_err(|e| fsp_err("파일 시스템 생성", e))?;
+        // 1초마다 VFS가 감지한 원격 변경을 탐색기에 알립니다.
+        let mut host = FileSystemHost::new_with_timer::<Vec<expandrv_vfs::Change>, 1000>(
+            FileSystemParams::default_params(vp),
+            ctx,
+        )
+        .map_err(|e| fsp_err("파일 시스템 생성", e))?;
         host.mount(&opts.mount_point)
             .map_err(|e| fsp_err(&format!("{} 마운트", opts.mount_point), e))?;
         if let Err(e) = FileSystemHost::<ExpanFs>::start(&mut host) {

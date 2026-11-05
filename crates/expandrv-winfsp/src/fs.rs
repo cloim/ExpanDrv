@@ -1,7 +1,7 @@
 //! WinFsp `FileSystemContext` 구현. 모든 동작을 [`Vfs`]로 넘깁니다.
 
 use expandrv_core::{Entry, EntryKind, Error, RemotePath};
-use expandrv_vfs::{FileHandle, Vfs};
+use expandrv_vfs::{Change, ChangeKind, FileHandle, Vfs};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,7 @@ use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
     ModificationDescriptor, OpenFileInfo, VolumeInfo, WideNameInfo,
 };
+use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp::{FspError, U16CStr};
 
 const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
@@ -24,6 +25,13 @@ const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 /// 백엔드가 용량을 알려 주지 않을 때 보고할 크기
 const UNKNOWN_CAPACITY: u64 = 1 << 40;
 const ALLOCATION_UNIT: u64 = 4096;
+const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
+const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x2;
+const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x8;
+const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x10;
+const FILE_ACTION_ADDED: u32 = 1;
+const FILE_ACTION_REMOVED: u32 = 2;
+const FILE_ACTION_MODIFIED: u32 = 3;
 
 pub struct ExpanFs {
     vfs: Arc<Vfs>,
@@ -389,6 +397,37 @@ impl FileSystemContext for ExpanFs {
         out_volume_info.free_size = free.min(total);
         out_volume_info.set_volume_label(&self.label);
         Ok(())
+    }
+}
+
+/// 원격 변경을 탐색기에 알립니다. WinFsp 스레드 풀 타이머가 주기적으로 호출합니다.
+impl NotifyingFileSystemContext<Vec<Change>> for ExpanFs {
+    fn should_notify(&self) -> Option<Vec<Change>> {
+        let changes = self.vfs.take_changes();
+        (!changes.is_empty()).then_some(changes)
+    }
+
+    fn notify(&self, changes: Vec<Change>, notifier: &Notifier) {
+        for c in changes {
+            let name_filter = if c.is_dir {
+                FILE_NOTIFY_CHANGE_DIR_NAME
+            } else {
+                FILE_NOTIFY_CHANGE_FILE_NAME
+            };
+            let mut info: NotifyInfo<512> = NotifyInfo::new();
+            (info.filter, info.action) = match c.kind {
+                ChangeKind::Added => (name_filter, FILE_ACTION_ADDED),
+                ChangeKind::Removed => (name_filter, FILE_ACTION_REMOVED),
+                ChangeKind::Modified => (
+                    FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    FILE_ACTION_MODIFIED,
+                ),
+            };
+            let name = c.path.as_str().replace('/', "\\");
+            if info.set_name(name.as_str()).is_ok() {
+                notifier.notify(&info);
+            }
+        }
     }
 }
 

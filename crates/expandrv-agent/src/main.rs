@@ -5,7 +5,7 @@ mod signal;
 use clap::{Args, Parser, Subcommand};
 use expandrv_core::config::{
     BackendConfig, CacheConfig, Config, DriveConfig, EnvSecrets, FtpConfig, FtpTls, S3Config,
-    SecretSource, SftpConfig, WebDavConfig,
+    SecretSource, SftpConfig, TransferConfig, WebDavConfig,
 };
 use expandrv_core::{Error, Result};
 use expandrv_vfs::{Vfs, VfsOptions};
@@ -258,6 +258,7 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
         mount_point,
         read_only: a.read_only,
         cache: CacheConfig::default(),
+        transfer: TransferConfig::default(),
         backend: backend_config(a.backend)?,
     });
     cfg.save(cfg_path)?;
@@ -311,7 +312,11 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
     let mut mounted = Vec::new();
     for d in drives {
         let signal = Arc::new(UnmountSignal::create(&d.id)?);
-        let backend = rt.block_on(expandrv_backends::connect(&d.backend, &EnvSecrets))?;
+        let backend = expandrv_vfs::throttle(
+            rt.block_on(expandrv_backends::connect(&d.backend, &EnvSecrets))?,
+            d.transfer.upload_kib_per_sec * 1024,
+            d.transfer.download_kib_per_sec * 1024,
+        );
         let vfs = Vfs::new(
             backend,
             rt.handle().clone(),
@@ -333,6 +338,7 @@ fn mount(cfg: &Config, ids: &[String]) -> Result<()> {
                 serial: serial(&d.id),
             },
         )?;
+        vfs.start_watch(Duration::from_secs(d.cache.poll_interval_secs));
         println!("{} -> {} ({})", d.id, d.mount_point, d.backend.kind());
         let (waiter, tx, id) = (signal.clone(), tx.clone(), d.id.clone());
         std::thread::spawn(move || {
