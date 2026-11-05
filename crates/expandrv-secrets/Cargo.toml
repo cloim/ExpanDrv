@@ -1,0 +1,21 @@
+[package]
+name = "expandrv-secrets"
+description = "ExpanDrv 비밀 값 저장소: Windows 자격 증명 관리자와 DPAPI(현재 사용자) 암호화"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+expandrv-core.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+] }
+
+[lints]
+workspace = true

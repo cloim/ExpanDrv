@@ -890,6 +890,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "expandrv-secrets"
+version = "0.1.0"
+dependencies = [
+ "expandrv-core",
+ "secrecy",
+ "windows 0.62.2",
+ "zeroize",
+]
+
+[[package]]
 name = "expandrv-vfs"
 version = "0.1.0"
 dependencies = [
