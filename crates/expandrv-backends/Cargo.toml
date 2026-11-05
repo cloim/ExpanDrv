@@ -7,9 +7,16 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["s3"]
+default = ["sftp", "s3"]
 webdav = []
-sftp = []
+sftp = [
+    "dep:russh",
+    "dep:russh-sftp",
+    "dep:futures",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:data-encoding",
+]
 s3 = [
     "dep:rusty-s3",
     "dep:reqwest",
@@ -29,6 +36,12 @@ bytes.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# SFTP 백엔드
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"], optional = true }
+russh-sftp = { version = "3.0.1", optional = true }
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", optional = true }
+data-encoding = { version = "2", optional = true }
 
 # S3 호환 백엔드
 rusty-s3 = { version = "0.10.2", default-features = false, features = ["rustcrypto"], optional = true }
@@ -38,6 +51,8 @@ serde = { workspace = true, optional = true }
 jiff = { version = "0.2.39", default-features = false, features = ["std"], optional = true }
 percent-encoding = { version = "2.3", optional = true }
 tokio-util = { version = "0.7.20", features = ["io"], optional = true }
+
+# 공용
 futures = { workspace = true, optional = true }
 
 [dev-dependencies]
