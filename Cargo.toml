@@ -13,6 +13,7 @@ license = "GPL-3.0-only"
 expandrv-core = { path = "crates/expandrv-core" }
 expandrv-backends = { path = "crates/expandrv-backends" }
 expandrv-vfs = { path = "crates/expandrv-vfs" }
+expandrv-secrets = { path = "crates/expandrv-secrets" }
 expandrv-winfsp = { path = "crates/expandrv-winfsp" }
 
 async-trait = "0.1.92"
@@ -28,6 +29,7 @@ tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "fs", "io-u
 toml = "1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = "1.9"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
