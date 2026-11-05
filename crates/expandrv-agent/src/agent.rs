@@ -3,11 +3,12 @@
 //! 드라이브마다 독립적으로 마운트와 해제를 처리하므로 한 드라이브의 실패가 다른 드라이브에 번지지 않습니다.
 
 use crate::{cache_dir, ipc_err, serial};
-use expandrv_core::config::{Config, DriveConfig, EnvSecrets};
+use expandrv_core::config::{Config, DriveConfig};
 use expandrv_core::{Error, Result};
 use expandrv_ipc::{
     AgentStatus, DriveState, DriveStatus, ErrorCode, Handler, IpcServer, Request, Response,
 };
+use expandrv_secrets::Secrets;
 use expandrv_vfs::{Vfs, VfsOptions};
 use expandrv_winfsp::{MountOptions, MountedDrive};
 use std::collections::{HashMap, HashSet};
@@ -49,7 +50,7 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
         rt.block_on(expandrv_backends::connect(
             &d.backend,
             d.proxy.as_ref(),
-            &EnvSecrets,
+            &Secrets,
         ))?,
         d.transfer.upload_kib_per_sec * 1024,
         d.transfer.download_kib_per_sec * 1024,
@@ -318,14 +319,30 @@ impl Handler for Agent {
 }
 
 /// `expandrv agent`: 사용자당 하나만 실행합니다. Shutdown 요청이나 Ctrl+C로 끝납니다.
-pub fn run(cfg_path: PathBuf, pipe: &str) -> Result<()> {
+/// `autostart`면 시작 직후 `auto_mount` 드라이브를 마운트합니다(로그인 자동 실행용).
+pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         // 단일 인스턴스를 먼저 확인합니다.
         let server = IpcServer::bind(pipe).map_err(ipc_err)?;
         let config = Config::load(&cfg_path)?;
+        let auto: Vec<String> = config
+            .drives
+            .iter()
+            .filter(|d| autostart && d.auto_mount)
+            .map(|d| d.id.clone())
+            .collect();
         let agent = Arc::new(Agent::new(cfg_path, config, Handle::current()));
-        tracing::info!(pid = std::process::id(), "에이전트 시작");
+        tracing::info!(pid = std::process::id(), autostart, "에이전트 시작");
+        for id in auto {
+            let a = agent.clone();
+            tokio::spawn(async move {
+                match a.mount(&id).await {
+                    Response::Ok => tracing::info!(%id, "자동 마운트"),
+                    other => tracing::warn!(%id, ?other, "자동 마운트 실패"),
+                }
+            });
+        }
         println!("에이전트를 시작했습니다. Ctrl+C 또는 `expandrv stop`으로 끝냅니다.");
         let a = agent.clone();
         let shutdown = async move {

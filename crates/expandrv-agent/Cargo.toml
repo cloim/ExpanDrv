@@ -17,13 +17,17 @@ expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp
 expandrv-vfs.workspace = true
 expandrv-winfsp.workspace = true
 expandrv-ipc.workspace = true
+expandrv-log.workspace = true
+expandrv-secrets.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-appender = "0.2.5"
 tracing-subscriber.workspace = true
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading"] }
+rpassword = "7.5"
+secrecy.workspace = true
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile.workspace = true

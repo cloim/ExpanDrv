@@ -2,6 +2,7 @@
 //! WinFsp 런타임이 없으면 건너뜁니다.
 
 use expandrv_ipc::IpcClient;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -10,6 +11,9 @@ use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 마운트 테스트끼리 같은 드라이브 문자를 고르지 않도록 순서대로 실행합니다.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Z부터 내려가며 쓰지 않는 드라이브 문자를 고릅니다.
 fn free_drives(n: usize) -> Vec<String> {
@@ -33,11 +37,12 @@ struct Run {
 }
 
 impl Env {
-    fn new() -> Self {
+    /// 테스트마다 다른 파이프 이름을 써서 병렬 실행 때 서로의 에이전트에 붙지 않게 합니다.
+    fn new(tag: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("localappdata")).unwrap();
         Self {
-            pipe: format!(r"\\.\pipe\expandrv-itest-{}", std::process::id()),
+            pipe: format!(r"\\.\pipe\expandrv-itest-{tag}-{}", std::process::id()),
             dir,
         }
     }
@@ -88,6 +93,29 @@ impl Env {
             out.status, r.stdout, r.stderr
         );
         r
+    }
+
+    /// 표준 입력 한 줄을 넘겨 실행합니다(비밀 값 입력 확인용).
+    fn run_with_input(&self, args: &[&str], input: &str) -> Run {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{input}\n").as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        Run {
+            ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
     }
 
     fn agent_pid(&self) -> Option<u32> {
@@ -150,7 +178,8 @@ fn agent_mount_list_unmount_stop() {
         eprintln!("WinFsp 런타임 미설치: 건너뜀");
         return;
     }
-    let env = Env::new();
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let env = Env::new("main");
     let letters = free_drives(2);
     let (mp, bad_mp) = (letters[0].as_str(), letters[1].as_str());
     let root = env.path("remote");
@@ -235,4 +264,136 @@ fn agent_mount_list_unmount_stop() {
             .any(|n| n.starts_with("agent.") && n.ends_with(".log")),
         "{logs:?}"
     );
+}
+
+#[test]
+fn ask_password_stores_credential_and_remove_cleans_up() {
+    use expandrv_secrets::CredentialStore;
+    let env = Env::new("secret");
+    let id = format!("itest{}", std::process::id());
+    let target = format!("ExpanDrv/{id}/password");
+    let secret = format!("pw-{}-한글", std::process::id());
+
+    let r = env.run_with_input(
+        &[
+            "add",
+            &id,
+            "Q:",
+            "webdav",
+            "https://dav.example.com/",
+            "--user",
+            "u",
+            "--ask-password",
+        ],
+        &secret,
+    );
+    assert!(r.ok, "{}{}", r.stdout, r.stderr);
+    let store = CredentialStore;
+    let cleanup = scopeguard(&target);
+    let cfg = std::fs::read_to_string(env.path("config.toml")).unwrap();
+    assert!(
+        cfg.contains(r#"from = "credential""#) && cfg.contains(&target),
+        "{cfg}"
+    );
+    assert!(!cfg.contains(&secret));
+    {
+        use secrecy::ExposeSecret;
+        assert_eq!(store.get(&target).unwrap().expose_secret(), secret);
+    }
+
+    let r = env.run(&["secret", "list", &id]);
+    assert!(r.ok && r.stdout.contains(&target), "{}", r.stdout);
+    assert!(!r.stdout.contains(&secret));
+
+    // 빈 입력은 저장하지 않고 설정도 바꾸지 않습니다.
+    let r = env.run_with_input(
+        &[
+            "add",
+            "empty",
+            "R:",
+            "webdav",
+            "https://dav.example.com/",
+            "--user",
+            "u",
+            "--ask-password",
+        ],
+        "",
+    );
+    assert!(!r.ok);
+    assert!(
+        !std::fs::read_to_string(env.path("config.toml"))
+            .unwrap()
+            .contains("empty")
+    );
+
+    let r = env.run(&["remove", &id]);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(matches!(
+        store.get(&target),
+        Err(expandrv_core::Error::NotFound)
+    ));
+    drop(cleanup);
+}
+
+/// 테스트가 실패해도 저장한 자격 증명을 지웁니다.
+fn scopeguard(target: &str) -> impl Drop + '_ {
+    struct G<'a>(&'a str);
+    impl Drop for G<'_> {
+        fn drop(&mut self) {
+            let _ = expandrv_secrets::CredentialStore.delete(self.0);
+        }
+    }
+    G(target)
+}
+
+#[test]
+fn autostart_agent_mounts_only_auto_mount_drives() {
+    if expandrv_winfsp::runtime::runtime_dll().is_none() {
+        eprintln!("WinFsp 런타임 미설치: 건너뜀");
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let env = Env::new("auto");
+    let letters = free_drives(2);
+    let (auto_mp, manual_mp) = (letters[0].as_str(), letters[1].as_str());
+    let root = env.path("remote");
+    std::fs::create_dir(&root).unwrap();
+    let root_s = root.to_str().unwrap();
+    assert!(
+        env.run(&["add", "auto", auto_mp, "--auto-mount", "local", root_s])
+            .ok
+    );
+    assert!(env.run(&["add", "manual", manual_mp, "local", root_s]).ok);
+
+    let mut child = env
+        .command(&["agent", "--autostart"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let guard_pid = child.id();
+    let _guard = AgentGuard {
+        env: &env,
+        pid: guard_pid,
+    };
+    let drive = PathBuf::from(format!("{auto_mp}\\"));
+    for _ in 0..100 {
+        if drive.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(drive.exists(), "자동 마운트 드라이브가 나타나지 않았습니다");
+    assert!(!Path::new(&format!("{manual_mp}\\")).exists());
+    let r = env.run(&["list"]);
+    assert!(
+        line_of(&r.stdout, "auto").contains("마운트됨"),
+        "{}",
+        r.stdout
+    );
+    assert!(line_of(&r.stdout, "manual").contains(" - "), "{}", r.stdout);
+
+    assert!(env.run(&["stop"]).ok);
+    assert!(child.wait().unwrap().success());
+    assert!(!drive.exists());
 }

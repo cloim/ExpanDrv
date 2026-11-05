@@ -1,16 +1,19 @@
 //! `expandrv` CLI: 드라이브 설정 관리와 상주 에이전트 제어
 
 mod agent;
+mod autostart;
 mod control;
 
 use clap::{Args, Parser, Subcommand};
 use control::{AgentLink, expect_ok};
 use expandrv_core::config::{
-    BackendConfig, CacheConfig, Config, DriveConfig, EnvSecrets, FtpConfig, FtpTls, S3Config,
+    BackendConfig, CacheConfig, Config, DriveConfig, FtpConfig, FtpTls, ProxyConfig, S3Config,
     SecretSource, SftpConfig, TransferConfig, WebDavConfig,
 };
 use expandrv_core::{Error, Result};
 use expandrv_ipc::{DriveState, ErrorCode, Request, Response};
+use expandrv_secrets::{CredentialStore, Secrets, target_for};
+use secrecy::SecretString;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,9 +60,39 @@ enum Command {
         /// 분리 실행용: 로그를 파일로 남깁니다
         #[arg(long, hide = true)]
         background: bool,
+        /// 시작하자마자 auto_mount 드라이브를 마운트합니다
+        #[arg(long)]
+        autostart: bool,
     },
     /// 모든 드라이브를 해제하고 에이전트를 종료합니다
     Stop,
+    /// 자격 증명 관리자에 저장한 비밀 값을 관리합니다
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+    /// Windows 로그인 시 에이전트 자동 실행을 설정합니다
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// 비밀 값을 입력받아 저장합니다(터미널이 아니면 표준 입력 한 줄)
+    Set { id: String, field: String },
+    /// 저장한 비밀 값을 지웁니다
+    Delete { id: String, field: String },
+    /// 저장한 비밀 값 대상 이름을 보여 줍니다(값은 보이지 않음)
+    List { id: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum AutostartAction {
+    Enable,
+    Disable,
+    Status,
 }
 
 #[derive(Args)]
@@ -71,6 +104,19 @@ struct AddArgs {
     label: Option<String>,
     #[arg(long)]
     read_only: bool,
+    /// 에이전트 자동 실행 때 함께 마운트
+    #[arg(long)]
+    auto_mount: bool,
+    /// socks5://, socks5h:// 또는 http:// 프록시
+    #[arg(long)]
+    proxy: Option<String>,
+    #[arg(long, requires = "proxy")]
+    proxy_user: Option<String>,
+    #[arg(long, requires = "proxy_user", conflicts_with = "ask_proxy_password")]
+    proxy_password_env: Option<String>,
+    /// 프록시 암호를 입력받아 자격 증명 관리자에 저장
+    #[arg(long, requires = "proxy_user")]
+    ask_proxy_password: bool,
     #[command(subcommand)]
     backend: AddBackend,
 }
@@ -85,8 +131,11 @@ enum AddBackend {
         #[arg(long)]
         user: Option<String>,
         /// 암호를 담은 환경 변수 이름
-        #[arg(long)]
+        #[arg(long, conflicts_with = "ask_password")]
         password_env: Option<String>,
+        /// 암호를 입력받아 자격 증명 관리자에 저장
+        #[arg(long)]
+        ask_password: bool,
         /// 고정할 서버 인증서 SHA-256 지문
         #[arg(long)]
         pin_sha256: Option<String>,
@@ -97,12 +146,16 @@ enum AddBackend {
         user: String,
         #[arg(long, default_value_t = 22)]
         port: u16,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "ask_password")]
         password_env: Option<String>,
         #[arg(long)]
-        key: Option<PathBuf>,
+        ask_password: bool,
         #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, conflicts_with = "ask_key_passphrase")]
         key_passphrase_env: Option<String>,
+        #[arg(long, requires = "key")]
+        ask_key_passphrase: bool,
         #[arg(long, default_value = "/")]
         root: String,
         #[arg(long)]
@@ -117,8 +170,15 @@ enum AddBackend {
         prefix: String,
         #[arg(long)]
         access_key_id: String,
+        #[arg(
+            long,
+            required_unless_present = "ask_secret",
+            conflicts_with = "ask_secret"
+        )]
+        secret_env: Option<String>,
+        /// 비밀 키를 입력받아 자격 증명 관리자에 저장
         #[arg(long)]
-        secret_env: String,
+        ask_secret: bool,
         /// 가상 호스트 방식 주소 사용
         #[arg(long)]
         virtual_host: bool,
@@ -129,8 +189,10 @@ enum AddBackend {
         port: u16,
         #[arg(long, default_value = "anonymous")]
         user: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "ask_password")]
         password_env: Option<String>,
+        #[arg(long)]
+        ask_password: bool,
         /// none, explicit, implicit
         #[arg(long, default_value = "explicit")]
         tls: String,
@@ -141,11 +203,53 @@ enum AddBackend {
     },
 }
 
-fn env_secret(var: Option<String>) -> Option<SecretSource> {
-    var.map(|var| SecretSource::Env { var })
+/// 입력받아 저장할 비밀 값(대상 이름, 안내 문구)
+struct Ask {
+    target: String,
+    prompt: String,
 }
 
-fn backend_config(b: AddBackend) -> Result<BackendConfig> {
+/// `--*-env`나 `--ask-*`로 비밀 값 참조를 만듭니다. `ask`면 저장할 목록에 넣습니다.
+fn secret_ref(
+    id: &str,
+    field: &str,
+    env: Option<String>,
+    ask: bool,
+    asks: &mut Vec<Ask>,
+) -> Option<SecretSource> {
+    if ask {
+        let target = target_for(id, field);
+        asks.push(Ask {
+            target: target.clone(),
+            prompt: format!("{id} {field}"),
+        });
+        Some(SecretSource::Credential { target })
+    } else {
+        env.map(|var| SecretSource::Env { var })
+    }
+}
+
+/// 터미널이면 화면에 보이지 않게 입력받고, 아니면 표준 입력 한 줄을 읽습니다.
+fn read_secret(prompt: &str) -> Result<SecretString> {
+    use std::io::IsTerminal;
+    let value = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(format!("{prompt}: "))?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let len = line.trim_end_matches(['\r', '\n']).len();
+        line.truncate(len);
+        line
+    };
+    if value.is_empty() {
+        return Err(Error::Config(format!(
+            "{prompt}: 빈 값은 저장하지 않습니다"
+        )));
+    }
+    Ok(SecretString::from(value))
+}
+
+fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<BackendConfig> {
     Ok(match b {
         AddBackend::Local { root } => BackendConfig::Local {
             root: std::path::absolute(&root)?,
@@ -154,11 +258,12 @@ fn backend_config(b: AddBackend) -> Result<BackendConfig> {
             url,
             user,
             password_env,
+            ask_password,
             pin_sha256,
         } => BackendConfig::Webdav(WebDavConfig {
             url,
             username: user,
-            password: env_secret(password_env),
+            password: secret_ref(id, "password", password_env, ask_password, asks),
             pinned_cert_sha256: pin_sha256,
         }),
         AddBackend::Sftp {
@@ -166,17 +271,25 @@ fn backend_config(b: AddBackend) -> Result<BackendConfig> {
             user,
             port,
             password_env,
+            ask_password,
             key,
             key_passphrase_env,
+            ask_key_passphrase,
             root,
             known_hosts,
         } => BackendConfig::Sftp(SftpConfig {
             host,
             port,
             username: user,
-            password: env_secret(password_env),
+            password: secret_ref(id, "password", password_env, ask_password, asks),
             private_key: key,
-            key_passphrase: env_secret(key_passphrase_env),
+            key_passphrase: secret_ref(
+                id,
+                "key_passphrase",
+                key_passphrase_env,
+                ask_key_passphrase,
+                asks,
+            ),
             root,
             known_hosts,
         }),
@@ -187,6 +300,7 @@ fn backend_config(b: AddBackend) -> Result<BackendConfig> {
             prefix,
             access_key_id,
             secret_env,
+            ask_secret,
             virtual_host,
         } => BackendConfig::S3(S3Config {
             endpoint,
@@ -194,7 +308,10 @@ fn backend_config(b: AddBackend) -> Result<BackendConfig> {
             bucket,
             prefix,
             access_key_id,
-            secret_access_key: SecretSource::Env { var: secret_env },
+            secret_access_key: secret_ref(id, "secret_access_key", secret_env, ask_secret, asks)
+                .ok_or_else(|| {
+                    Error::Config("--secret-env 또는 --ask-secret이 필요합니다".into())
+                })?,
             path_style: !virtual_host,
         }),
         AddBackend::Ftp {
@@ -202,6 +319,7 @@ fn backend_config(b: AddBackend) -> Result<BackendConfig> {
             port,
             user,
             password_env,
+            ask_password,
             tls,
             encoding,
             root,
@@ -209,7 +327,7 @@ fn backend_config(b: AddBackend) -> Result<BackendConfig> {
             host,
             port,
             username: user,
-            password: env_secret(password_env),
+            password: secret_ref(id, "password", password_env, ask_password, asks),
             tls: match tls.as_str() {
                 "none" => FtpTls::None,
                 "explicit" => FtpTls::Explicit,
@@ -293,6 +411,23 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
     } else {
         a.mount_point
     };
+    let mut asks = Vec::new();
+    let backend = backend_config(&a.id, a.backend, &mut asks)?;
+    let proxy = match a.proxy {
+        Some(url) => Some(ProxyConfig {
+            url,
+            password: secret_ref(
+                &a.id,
+                "proxy_password",
+                a.proxy_password_env,
+                a.ask_proxy_password,
+                &mut asks,
+            ),
+            username: a.proxy_user,
+        }),
+        None => None,
+    };
+    let id = a.id.clone();
     cfg.drives.push(DriveConfig {
         label: a.label.unwrap_or_else(|| a.id.clone()),
         id: a.id,
@@ -300,12 +435,32 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
         read_only: a.read_only,
         cache: CacheConfig::default(),
         transfer: TransferConfig::default(),
-        auto_mount: false,
-        proxy: None,
-        backend: backend_config(a.backend)?,
+        auto_mount: a.auto_mount,
+        proxy,
+        backend,
     });
-    cfg.save(cfg_path)?;
-    println!("추가했습니다: {}", cfg_path.display());
+    cfg.validate()?;
+
+    // 비밀 값을 먼저 저장하고, 설정 저장이 실패하면 되돌립니다.
+    let store = CredentialStore;
+    let mut stored = Vec::new();
+    let saved = (|| {
+        for ask in &asks {
+            store.set(&ask.target, &read_secret(&ask.prompt)?)?;
+            stored.push(ask.target.clone());
+        }
+        cfg.save(cfg_path)
+    })();
+    if let Err(e) = saved {
+        for t in &stored {
+            let _ = store.delete(t);
+        }
+        return Err(e);
+    }
+    println!("추가했습니다: {} ({id})", cfg_path.display());
+    for t in &stored {
+        println!("비밀 값을 자격 증명 관리자에 저장했습니다: {t}");
+    }
     Ok(())
 }
 
@@ -474,6 +629,12 @@ fn run(cli: Cli) -> Result<()> {
             cfg.save(&cfg_path)?;
             notify_reload(&pipe);
             println!("삭제했습니다: {id}");
+            // 이 드라이브용으로 저장한 비밀 값도 지웁니다.
+            let store = CredentialStore;
+            for t in store.list(&format!("ExpanDrv/{id}/"))? {
+                store.delete(&t)?;
+                println!("비밀 값을 지웠습니다: {t}");
+            }
             Ok(())
         }
         Command::List => list(&Config::load(&cfg_path)?, &pipe),
@@ -484,8 +645,7 @@ fn run(cli: Cli) -> Result<()> {
                 .ok_or_else(|| Error::Config(format!("드라이브 {id}가 없습니다")))?;
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                let be =
-                    expandrv_backends::connect(&d.backend, d.proxy.as_ref(), &EnvSecrets).await?;
+                let be = expandrv_backends::connect(&d.backend, d.proxy.as_ref(), &Secrets).await?;
                 let n = be.list(&expandrv_core::RemotePath::root()).await?.len();
                 println!("연결 성공: {} 루트 항목 {n}개", be.kind());
                 Ok(())
@@ -493,13 +653,71 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Mount { ids } => mount(&cfg_path, &pipe, &ids),
         Command::Unmount { id } => unmount(&pipe, &id),
-        Command::Agent { .. } => agent::run(cfg_path, &pipe),
+        Command::Agent { autostart, .. } => agent::run(cfg_path, &pipe, autostart),
         Command::Stop => stop(&pipe),
+        Command::Secret { action } => secret(action),
+        Command::Autostart { action } => autostart_cmd(action, &cfg_path),
     }
+}
+
+fn secret(action: SecretAction) -> Result<()> {
+    let store = CredentialStore;
+    match action {
+        SecretAction::Set { id, field } => {
+            let target = target_for(&id, &field);
+            store.set(&target, &read_secret(&format!("{id} {field}"))?)?;
+            println!("저장했습니다: {target}");
+            println!("설정에서는 {{ from = \"credential\", target = \"{target}\" }}로 참조합니다.");
+        }
+        SecretAction::Delete { id, field } => {
+            let target = target_for(&id, &field);
+            store.delete(&target).map_err(|e| match e {
+                Error::NotFound => Error::Config(format!("{target}가 없습니다")),
+                e => e,
+            })?;
+            println!("지웠습니다: {target}");
+        }
+        SecretAction::List { id } => {
+            let prefix = match id {
+                Some(id) => format!("ExpanDrv/{id}/"),
+                None => "ExpanDrv/".to_owned(),
+            };
+            for t in store.list(&prefix)? {
+                println!("{t}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn autostart_cmd(action: AutostartAction, cfg_path: &Path) -> Result<()> {
+    use autostart::RUN_KEY;
+    match action {
+        AutostartAction::Enable => {
+            let exe = std::env::current_exe()?;
+            let cfg_abs = std::path::absolute(cfg_path)?;
+            autostart::enable(RUN_KEY, &autostart::command_line(&exe, &cfg_abs))?;
+            println!("로그인할 때 에이전트를 자동으로 시작합니다.");
+            let cfg = Config::load(cfg_path)?;
+            if !cfg.drives.iter().any(|d| d.auto_mount) {
+                println!("auto_mount가 켜진 드라이브가 없어 시작만 하고 마운트하지 않습니다.");
+            }
+        }
+        AutostartAction::Disable => {
+            autostart::disable(RUN_KEY)?;
+            println!("자동 시작을 껐습니다.");
+        }
+        AutostartAction::Status => match autostart::status(RUN_KEY)? {
+            Some(cmd) => println!("켜짐: {cmd}"),
+            None => println!("꺼짐"),
+        },
+    }
+    Ok(())
 }
 
 /// 로그 출력 설정. 분리 실행한 에이전트는 파일로, 나머지는 stderr로 남깁니다.
 fn init_logging(background: bool) {
+    use expandrv_log::Redacting;
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
     use tracing_subscriber::prelude::*;
 
@@ -517,9 +735,10 @@ fn init_logging(background: bool) {
         None
     };
     let to_file = file.is_some();
+    // 출력 직전에 비밀 값과 사용자 계정명을 가립니다.
     let (writer, default_level) = match file {
-        Some(f) => (BoxMakeWriter::new(f), "info"),
-        None => (BoxMakeWriter::new(std::io::stderr), "warn"),
+        Some(f) => (BoxMakeWriter::new(Redacting(f)), "info"),
+        None => (BoxMakeWriter::new(Redacting(std::io::stderr)), "warn"),
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("EXPANDRV_LOG")
         .unwrap_or_else(|_| default_level.into());
@@ -543,7 +762,13 @@ fn init_logging(background: bool) {
 
 fn main() {
     let cli = Cli::parse();
-    let background = matches!(cli.command, Command::Agent { background: true });
+    let background = matches!(
+        cli.command,
+        Command::Agent {
+            background: true,
+            ..
+        }
+    );
     init_logging(background);
     if let Err(e) = run(cli) {
         if background {
@@ -576,7 +801,8 @@ mod tests {
         let Command::Add(a) = cli.command else {
             panic!()
         };
-        let BackendConfig::Webdav(w) = backend_config(a.backend).unwrap() else {
+        let BackendConfig::Webdav(w) = backend_config(&a.id, a.backend, &mut Vec::new()).unwrap()
+        else {
             panic!()
         };
         assert_eq!(
@@ -603,7 +829,67 @@ mod tests {
         let Command::Add(a) = cli.command else {
             panic!()
         };
-        assert!(matches!(backend_config(a.backend).unwrap(), BackendConfig::S3(s) if s.path_style));
+        assert!(matches!(
+            backend_config(&a.id, a.backend, &mut Vec::new()).unwrap(),
+            BackendConfig::S3(s) if s.path_style
+        ));
+
+        // --ask-* 는 자격 증명 참조를 만들고 입력 목록에 대상을 올립니다.
+        let cli = Cli::try_parse_from([
+            "expandrv",
+            "add",
+            "b",
+            "S:",
+            "s3",
+            "https://s3.example.com",
+            "bkt",
+            "--access-key-id",
+            "AK",
+            "--ask-secret",
+        ])
+        .unwrap();
+        let Command::Add(a) = cli.command else {
+            panic!()
+        };
+        let mut asks = Vec::new();
+        let BackendConfig::S3(s3) = backend_config(&a.id, a.backend, &mut asks).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            s3.secret_access_key,
+            SecretSource::Credential {
+                target: "ExpanDrv/b/secret_access_key".into()
+            }
+        );
+        assert_eq!(asks.len(), 1);
+        assert!(
+            Cli::try_parse_from([
+                "expandrv",
+                "add",
+                "b",
+                "S:",
+                "s3",
+                "https://s3.example.com",
+                "bkt",
+                "--access-key-id",
+                "AK",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "expandrv",
+                "add",
+                "n",
+                "W:",
+                "webdav",
+                "https://dav.example.com/",
+                "--password-env",
+                "X",
+                "--ask-password",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
