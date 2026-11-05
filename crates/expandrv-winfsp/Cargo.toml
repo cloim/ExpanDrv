@@ -1,0 +1,30 @@
+[package]
+name = "expandrv-winfsp"
+description = "ExpanDrv WinFsp 바인딩: 런타임 로드, 파일 시스템 콜백, 드라이브 마운트"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+expandrv-core.workspace = true
+expandrv-vfs.workspace = true
+tracing.workspace = true
+# SDK 없이 빌드: 크레이트 내장 헤더와 import lib을 쓰고, 런타임 DLL은 설치 경로에서 지연 로드합니다.
+winfsp = { version = "0.13.2", default-features = false, features = ["notify"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+expandrv-backends.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

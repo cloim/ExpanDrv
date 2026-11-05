@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/expandrv-core", "crates/expandrv-backends", "crates/expandrv-vfs"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"

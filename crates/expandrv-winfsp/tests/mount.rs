@@ -1,0 +1,128 @@
+//! Local 백엔드를 실제 드라이브 문자로 마운트해 Win32 파일 API로 검증합니다.
+//! WinFsp 런타임이 없으면 건너뜁니다.
+
+use expandrv_backends::local::LocalBackend;
+use expandrv_vfs::{Vfs, VfsOptions};
+use expandrv_winfsp::{MountOptions, MountedDrive, runtime};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+fn free_drive() -> String {
+    ('H'..='Z')
+        .rev()
+        .map(|c| format!("{c}:"))
+        .find(|d| !Path::new(&format!("{d}\\")).exists())
+        .expect("빈 드라이브 문자 없음")
+}
+
+#[test]
+fn local_backend_mount_end_to_end() {
+    if runtime::runtime_dll().is_none() {
+        eprintln!("WinFsp 런타임 미설치: 건너뜀");
+        return;
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("existing.txt"), b"0123456789").unwrap();
+    fs::create_dir(root.path().join("sub")).unwrap();
+
+    let vfs = Arc::new(
+        Vfs::new(
+            Arc::new(LocalBackend::new(root.path()).unwrap()),
+            rt.handle().clone(),
+            VfsOptions {
+                read_only: false,
+                metadata_ttl: Duration::from_secs(5),
+                staging_dir: staging.path().to_owned(),
+                op_timeout: Duration::from_secs(30),
+            },
+        )
+        .unwrap(),
+    );
+    let mount_point = free_drive();
+    let drive = MountedDrive::mount(
+        vfs,
+        &MountOptions {
+            mount_point: mount_point.clone(),
+            label: "ExpanDrvTest".into(),
+            file_info_timeout_ms: 1000,
+            serial: 0x4558_5044,
+        },
+    )
+    .unwrap();
+    let m = |rel: &str| PathBuf::from(format!("{mount_point}\\{rel}"));
+    let local = |rel: &str| root.path().join(rel);
+
+    // 열거와 읽기(대소문자 무시)
+    let mut names: Vec<_> = fs::read_dir(m(""))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["existing.txt", "sub"]);
+    assert_eq!(fs::read(m("EXISTING.TXT")).unwrap(), b"0123456789");
+
+    // 새 파일 쓰기(1 MiB 넘게)와 업로드
+    let big: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(m("sub\\big.bin"), &big).unwrap();
+    assert_eq!(fs::read(local("sub/big.bin")).unwrap(), big);
+
+    // 기존 파일 부분 수정
+    {
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(m("existing.txt"))
+            .unwrap();
+        f.seek(SeekFrom::Start(3)).unwrap();
+        f.write_all(b"XY").unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(b"!").unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "012XY56789!");
+    }
+    assert_eq!(fs::read(local("existing.txt")).unwrap(), b"012XY56789!");
+
+    // 디렉터리 생성, 이름 변경, 덮어쓰기 이동
+    fs::create_dir(m("newdir")).unwrap();
+    assert!(local("newdir").is_dir());
+    fs::rename(m("sub\\big.bin"), m("newdir\\moved.bin")).unwrap();
+    assert!(local("newdir/moved.bin").is_file() && !local("sub/big.bin").exists());
+    fs::write(m("a.txt"), b"A").unwrap();
+    fs::write(m("b.txt"), b"B").unwrap();
+    fs::rename(m("a.txt"), m("b.txt")).unwrap();
+    assert_eq!(fs::read(local("b.txt")).unwrap(), b"A");
+    fs::rename(m("newdir"), m("renamed")).unwrap();
+    assert_eq!(
+        fs::metadata(m("renamed\\moved.bin")).unwrap().len(),
+        1_500_000
+    );
+
+    // 삭제 규칙
+    assert!(
+        fs::remove_dir(m("renamed")).is_err(),
+        "비어 있지 않은 디렉터리"
+    );
+    fs::remove_file(m("renamed\\moved.bin")).unwrap();
+    fs::remove_dir(m("renamed")).unwrap();
+    fs::remove_file(m("b.txt")).unwrap();
+    assert!(!local("renamed").exists() && !local("b.txt").exists());
+
+    // 잘라내기
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .open(m("existing.txt"))
+        .unwrap();
+    f.set_len(4).unwrap();
+    drop(f);
+    assert_eq!(fs::read(local("existing.txt")).unwrap(), b"012X");
+
+    drop(drive);
+    assert!(!Path::new(&format!("{mount_point}\\")).exists());
+}
