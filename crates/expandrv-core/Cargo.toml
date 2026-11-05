@@ -1,0 +1,21 @@
+[package]
+name = "expandrv-core"
+description = "ExpanDrv 공통 형식, 오류 모델, 경로 정규화, Backend 트레이트, 설정 모델"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
