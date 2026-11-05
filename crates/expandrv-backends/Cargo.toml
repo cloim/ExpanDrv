@@ -7,11 +7,16 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["ftp"]
 webdav = []
 sftp = []
 s3 = []
-ftp = []
+ftp = [
+    "dep:suppaftp",
+    "dep:rustls-platform-verifier",
+    "dep:encoding_rs",
+    "dep:chrono",
+]
 
 [dependencies]
 expandrv-core.workspace = true
@@ -20,6 +25,12 @@ bytes.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# FTP/FTPS(ftp 기능)
+suppaftp = { version = "12.2", default-features = false, features = ["tokio-rustls-ring", "deprecated"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+encoding_rs = { version = "0.8.35", optional = true }
+chrono = { version = "0.4.41", default-features = false, features = ["std", "clock"], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
