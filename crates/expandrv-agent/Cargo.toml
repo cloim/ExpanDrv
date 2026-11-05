@@ -1,0 +1,28 @@
+[package]
+name = "expandrv-agent"
+description = "ExpanDrv 사용자 세션 에이전트와 CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "expandrv"
+path = "src/main.rs"
+
+[dependencies]
+expandrv-core.workspace = true
+expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp"] }
+expandrv-vfs.workspace = true
+expandrv-winfsp.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
