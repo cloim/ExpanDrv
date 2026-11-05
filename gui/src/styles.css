@@ -1,0 +1,451 @@
+@import 'tailwindcss';
+
+/* 테마는 <html data-theme>로 고릅니다(시스템 설정을 따를 때도 해석한 값을 넣음). */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+:root {
+  color-scheme: light;
+  --bg: #e9e7e2;
+  --surface: #fbfaf8;
+  --surface-2: #f2f0eb;
+  --row-hover: #f0ece6;
+  --line: #e0dbd3;
+  --line-strong: #c9c2b7;
+  --text-1: #1b1d21;
+  --text-2: #464a52;
+  --text-3: #6a6d74;
+  --accent: #d9530b;
+  --accent-hover: #b94505;
+  --accent-soft: #fbe3d3;
+  --accent-ink: #8f3504;
+  --ok: #17924b;
+  --ok-soft: #dcf2e4;
+  --warn: #b97d00;
+  --warn-soft: #f8ecd0;
+  --danger: #c8372b;
+  --danger-soft: #f8dfdc;
+  --focus: #d9530b;
+  --focus-ring: rgb(217 83 11 / 40%);
+  --overlay: rgb(20 18 15 / 42%);
+  --shadow-color: rgb(20 18 15 / 18%);
+  --rail: #17181b;
+  --rail-2: #232529;
+  --rail-text: #a9adb5;
+  --rail-text-strong: #f3f1ed;
+  --dot: rgb(27 29 33 / 7%);
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #111215;
+  --surface: #181a1e;
+  --surface-2: #1f2226;
+  --row-hover: #23272c;
+  --line: #2b2f35;
+  --line-strong: #3a3f47;
+  --text-1: #eceef1;
+  --text-2: #b9bec6;
+  --text-3: #8f959e;
+  --accent: #ff7a33;
+  --accent-hover: #ff9156;
+  --accent-soft: #3b2417;
+  --accent-ink: #ffb68c;
+  --ok: #3ddc84;
+  --ok-soft: #173325;
+  --warn: #f5b83d;
+  --warn-soft: #3a2f16;
+  --danger: #ff6257;
+  --danger-soft: #3d1c1a;
+  --focus: #ff7a33;
+  --focus-ring: rgb(255 122 51 / 45%);
+  --overlay: rgb(0 0 0 / 58%);
+  --shadow-color: rgb(0 0 0 / 45%);
+  --rail: #0b0c0e;
+  --rail-2: #1a1c20;
+  --rail-text: #9aa0a9;
+  --rail-text-strong: #f3f1ed;
+  --dot: rgb(255 255 255 / 4%);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-row-hover: var(--row-hover);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--text-1);
+  --color-ink-2: var(--text-2);
+  --color-ink-3: var(--text-3);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-ink: var(--accent-ink);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-rail: var(--rail);
+  --color-rail-2: var(--rail-2);
+  --color-rail-text: var(--rail-text);
+  --color-rail-text-strong: var(--rail-text-strong);
+  --font-sans: 'Archivo Variable', 'Pretendard Variable', 'Pretendard', 'Malgun Gothic', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'Cascadia Mono', Consolas, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text-1);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    word-break: keep-all;
+    overflow: hidden;
+  }
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+  /* 스크롤바는 평소 얇게, 가리키면 진하게 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+  }
+  *:hover,
+  *:focus-within {
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
+}
+
+/* ---- 공용 컨트롤 ---- */
+@layer components {
+  .control {
+    height: 36px;
+    width: 100%;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    padding: 0 12px;
+    color: var(--text-1);
+    font-size: 13px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .control::placeholder {
+    color: var(--text-3);
+  }
+  .control:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+  .control[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+  .control:disabled,
+  .control[readonly] {
+    background: var(--surface-2);
+    color: var(--text-2);
+  }
+  .control.mono {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+
+  .btn {
+    display: inline-flex;
+    height: 36px;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    border-radius: 8px;
+    padding: 0 14px;
+    font-size: 13px;
+    font-weight: 650;
+    white-space: nowrap;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    cursor: pointer;
+  }
+  .btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:not(:disabled):hover {
+    background: var(--accent-hover);
+  }
+  .btn-ghost {
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--text-1);
+  }
+  .btn-ghost:not(:disabled):hover {
+    background: var(--surface-2);
+  }
+  .btn-danger {
+    background: var(--danger);
+    color: #fff;
+  }
+  .btn-danger:not(:disabled):hover {
+    filter: brightness(0.92);
+  }
+
+  .icon-btn {
+    display: inline-grid;
+    width: 34px;
+    height: 34px;
+    place-items: center;
+    border-radius: 8px;
+    color: var(--text-2);
+    transition: background 0.15s, color 0.15s;
+    cursor: pointer;
+  }
+  .icon-btn:not(:disabled):hover {
+    background: var(--surface-2);
+    color: var(--text-1);
+  }
+  .icon-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.4;
+  }
+  .icon-btn.is-accent {
+    background: var(--accent);
+    color: #fff;
+  }
+  .icon-btn.is-accent:not(:disabled):hover {
+    background: var(--accent-hover);
+    color: #fff;
+  }
+  .icon-btn.is-danger {
+    color: var(--danger);
+  }
+  .icon-btn.is-danger:not(:disabled):hover {
+    background: transparent;
+    color: var(--danger);
+  }
+  .icon-btn.sm {
+    width: 30px;
+    height: 30px;
+  }
+
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--surface);
+  }
+
+  .kbd-mono {
+    font-family: var(--font-mono);
+    font-feature-settings: 'zero' 1;
+  }
+
+  .skeleton-text {
+    display: block;
+    height: 12px;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--surface-2) 25%, var(--row-hover) 50%, var(--surface-2) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.3s linear infinite;
+  }
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* ---- 상태 표시등 ---- */
+.led {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--line-strong);
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 12%);
+}
+.led.is-on {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent);
+}
+.led.is-busy {
+  background: var(--warn);
+  animation: led-pulse 1.2s ease-in-out infinite;
+}
+.led.is-fail {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent);
+}
+@keyframes led-pulse {
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--warn) 18%, transparent);
+    opacity: 0.65;
+  }
+}
+
+/* 드라이브 문자 칸: 랙의 베이처럼 보이게 */
+.bay {
+  display: inline-flex;
+  min-width: 40px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  box-shadow: inset 0 -2px 0 var(--line);
+}
+.bay.is-on {
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--line-strong));
+  box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--ok) 45%, transparent);
+}
+
+/* 본문 배경의 점 격자 */
+.dot-grid {
+  background-image: radial-gradient(var(--dot) 1px, transparent 1px);
+  background-size: 14px 14px;
+}
+
+/* 페이지 등장 */
+.rise {
+  animation: rise 0.36s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise,
+  .spin,
+  .led.is-busy,
+  .skeleton-text {
+    animation: none;
+  }
+}
+
+/* ---- 툴팁, 토스트, 필드 오류(포털) ---- */
+.tooltip {
+  position: fixed;
+  z-index: 3000;
+  max-width: 320px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--text-1);
+  padding: 5px 9px;
+  color: var(--surface);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  pointer-events: none;
+  box-shadow: 0 6px 18px var(--shadow-color);
+  animation: fade-in 0.12s ease-out both;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.field-error {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  max-width: 100%;
+  border-radius: 6px;
+  background: var(--danger);
+  padding: 4px 8px;
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  box-shadow: 0 6px 16px var(--shadow-color);
+}
+
+/* ---- 공용 컴포넌트 테마 ---- */
+.select-control {
+  width: 100%;
+}
+.select-control-input {
+  height: 36px;
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-1);
+  font-size: 13px;
+}
+.select-control-input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.data-grid.ag-theme-quartz {
+  --ag-background-color: var(--surface);
+  --ag-foreground-color: var(--text-1);
+  --ag-header-background-color: var(--surface-2);
+  --ag-border-color: var(--line);
+  --ag-row-hover-color: var(--row-hover);
+  --ag-font-family: var(--font-sans);
+  --ag-font-size: 13px;
+  --ag-tooltip-background-color: var(--text-1);
+  --ag-data-color: var(--text-1);
+  --ag-secondary-foreground-color: var(--text-2);
+}
+.data-grid .ag-root-wrapper {
+  border-radius: 12px;
+}
+.data-grid .ag-row {
+  font-weight: 500;
+  font-size: 13px;
+}
+.data-grid .ag-header-cell,
+.data-grid .ag-header-cell-label {
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.ag-theme-quartz .ag-tooltip {
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--text-1);
+  color: var(--surface);
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 360px;
+  white-space: normal;
+}
