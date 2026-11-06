@@ -141,7 +141,7 @@ export function DrivesPage() {
       {
         field: 'state',
         headerName: '상태',
-        width: 112,
+        width: 108,
         filterable: true,
         filterValueGetter: (d: DriveRow) => stateText(d),
         cellRenderer: StateCell,
@@ -170,13 +170,13 @@ export function DrivesPage() {
       {
         field: 'id',
         headerName: 'ID',
-        width: 132,
+        width: 112,
         cellRenderer: ({ value }: { value: string }) => <span className="kbd-mono text-[12.5px]">{value}</span>,
       },
       {
         field: 'backend',
         headerName: '종류',
-        width: 100,
+        width: 92,
         filterable: true,
         valueFormatter: ({ value }: { value: string }) => BACKEND_LABEL[value] ?? value,
         filterValueGetter: (d: DriveRow) => BACKEND_LABEL[d.backend] ?? d.backend,
@@ -184,7 +184,7 @@ export function DrivesPage() {
       {
         field: 'pendingUploads',
         headerName: '업로드 대기',
-        width: 96,
+        width: 88,
         cellRenderer: ({ value }: { value: number }) => (
           <span className={`kbd-mono ${value > 0 ? 'font-bold text-warn' : 'text-ink-3'}`}>{value}</span>
         ),
