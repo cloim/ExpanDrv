@@ -4,6 +4,7 @@ mod agent;
 mod auto_lock;
 mod control;
 mod tray;
+mod updater;
 
 use clap::{Args, Parser, Subcommand};
 use control::{AgentLink, expect_ok};

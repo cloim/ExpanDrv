@@ -175,6 +175,7 @@ impl Agent {
         let lock_requested = Arc::new(Notify::new());
         let session_lock_requested = Arc::new(Notify::new());
         let tray = crate::tray::Tray::start(
+            rt.clone(),
             stop.clone(),
             lock_requested.clone(),
             session_lock_requested.clone(),
