@@ -17,7 +17,7 @@ use expandrv_core::{
 use secrecy::SecretString;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
@@ -30,6 +30,7 @@ use tokio::sync::{Notify, Semaphore};
 use wire::{Charset, Fail, PASS_PLACEHOLDER};
 
 type FtpStream = AsyncRustlsFtpStream;
+type Transfer = suppaftp::tokio::TransferStream<suppaftp::tokio::AsyncRustlsStream>;
 type OpFuture<'c, T> = Pin<Box<dyn Future<Output = std::result::Result<T, Fail>> + Send + 'c>>;
 
 /// 동시에 유지할 로그인 연결 수 상한
@@ -43,6 +44,18 @@ const MIN_RATE: u64 = 64 * 1024;
 /// 이보다 오래 쉰 연결은 NOOP으로 살아 있는지 확인한 뒤 씁니다.
 const IDLE_CHECK: Duration = Duration::from_secs(15);
 const COPY_BUF: usize = 256 * 1024;
+/// 내려받기 중 이 시간 동안 데이터가 한 바이트도 오지 않으면 연결을 버리고 다시 시도합니다.
+/// 연결을 자주 끊는 서버에서 가끔 데이터 연결이 멈추므로 짧게 잡고 VFS 재시도에 맡깁니다.
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// RETR 응답 대기 시간. NAS 디스크가 절전에서 깨어나는 시간을 고려합니다.
+const RETR_TIMEOUT: Duration = Duration::from_secs(15);
+/// 이 크기 이상의 읽기는 끝난 뒤 전송을 끊지 않고 다음 연속 읽기를 기다립니다.
+const PARK_MIN_READ: u64 = 1 << 20;
+/// 이어 받기를 기다리는 전송 수 상한과 유지 시간
+const MAX_PARKED: usize = 2;
+const PARK_TTL: Duration = Duration::from_secs(10);
+/// 부분 읽기 뒤 제어 연결 동기화를 기다리는 시간
+const RESYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 서버 FEAT 응답에서 쓰는 기능
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,6 +107,8 @@ struct LiveToken(Arc<PoolState>);
 struct PoolState {
     live: AtomicUsize,
     freed: Notify,
+    /// 예비 연결을 여는 중인지 여부. 한 번에 하나만 엽니다.
+    refilling: AtomicBool,
 }
 
 impl LiveToken {
@@ -110,14 +125,32 @@ impl Drop for LiveToken {
     }
 }
 
+/// 다음 연속 읽기를 기다리는 RETR 전송
+struct Parked {
+    id: u64,
+    remote: String,
+    /// 전송이 다음에 돌려줄 파일 위치
+    next: u64,
+    conn: Conn,
+    open: Open,
+}
+
+/// 끊지 않고 남겨 둔 전송과 끝 확인에 미리 읽은 1바이트
+struct Open {
+    stream: Transfer,
+    carry: u8,
+}
+
 pub struct FtpBackend {
-    params: Params,
+    params: Arc<Params>,
     feats: Feats,
     /// 해석된 원격 루트 절대 경로. 루트 자체면 `/`이고 그 외에는 후행 `/`가 없습니다.
     root: String,
-    idle: Mutex<Vec<Conn>>,
+    idle: Arc<Mutex<Vec<Conn>>>,
     permits: Semaphore,
     state: Arc<PoolState>,
+    parked: Arc<Mutex<Vec<Parked>>>,
+    park_seq: AtomicU64,
 }
 
 impl FtpBackend {
@@ -186,17 +219,19 @@ impl FtpBackend {
         );
         let state = Arc::new(PoolState::default());
         Ok(Self {
-            params,
+            params: Arc::new(params),
             feats,
             root,
-            idle: Mutex::new(vec![Conn {
+            idle: Arc::new(Mutex::new(vec![Conn {
                 s,
                 last_used: Instant::now(),
                 poisoned: false,
                 _live: LiveToken::new(&state),
-            }]),
+            }])),
             permits: Semaphore::new(POOL_SIZE),
             state,
+            parked: Arc::new(Mutex::new(Vec::new())),
+            park_seq: AtomicU64::new(0),
         })
     }
 
@@ -216,6 +251,188 @@ impl FtpBackend {
         c.last_used = Instant::now();
         self.idle.lock().unwrap_or_else(|e| e.into_inner()).push(c);
         self.state.freed.notify_one();
+    }
+
+    /// 작업을 마친 연결을 풀로 돌려줍니다. 상태를 장담할 수 없으면 버리고 예비 연결을 엽니다.
+    fn release(&self, c: Conn) {
+        if c.poisoned {
+            drop(c);
+            self.refill();
+        } else {
+            self.put_idle(c);
+        }
+    }
+
+    fn parked(&self) -> std::sync::MutexGuard<'_, Vec<Parked>> {
+        self.parked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `offset`에서 이어지는 대기 전송을 꺼냅니다.
+    fn take_parked(&self, remote: &str, offset: u64) -> Option<Parked> {
+        let mut parked = self.parked();
+        let i = parked
+            .iter()
+            .position(|p| p.remote == remote && p.next == offset)?;
+        Some(parked.remove(i))
+    }
+
+    /// 전송을 끊지 않고 남깁니다. 상한을 넘거나 [`PARK_TTL`] 안에 이어지지 않으면 정리합니다.
+    fn park(&self, remote: String, next: u64, conn: Conn, open: Open) {
+        let id = self.park_seq.fetch_add(1, Ordering::Relaxed);
+        let evicted = {
+            let mut parked = self.parked();
+            parked.push(Parked {
+                id,
+                remote,
+                next,
+                conn,
+                open,
+            });
+            let excess = parked.len().saturating_sub(MAX_PARKED);
+            parked.drain(..excess).collect::<Vec<_>>()
+        };
+        drop(evicted);
+        let list = Arc::clone(&self.parked);
+        tokio::spawn(async move {
+            tokio::time::sleep(PARK_TTL).await;
+            let expired = {
+                let mut parked = list.lock().unwrap_or_else(|e| e.into_inner());
+                parked
+                    .iter()
+                    .position(|p| p.id == id)
+                    .map(|i| parked.remove(i))
+            };
+            drop(expired);
+        });
+    }
+
+    /// 파일이 바뀌면 이전 내용을 보내던 대기 전송을 버립니다.
+    fn drop_parked(&self, remote: &str) {
+        let stale: Vec<_> = {
+            let mut parked = self.parked();
+            let (stale, keep) = std::mem::take(&mut *parked)
+                .into_iter()
+                .partition(|p| p.remote == remote);
+            *parked = keep;
+            stale
+        };
+        drop(stale);
+    }
+
+    /// 가장 오래된 대기 전송을 버려 서버 연결 자리를 만듭니다.
+    fn evict_parked(&self) -> bool {
+        let oldest = {
+            let mut parked = self.parked();
+            (!parked.is_empty()).then(|| parked.remove(0))
+        };
+        oldest.is_some()
+    }
+
+    /// 대기 전송에서 이어 받습니다. 실패하면 연결을 버리고 오류를 돌려줍니다.
+    async fn continue_parked(
+        &self,
+        p: Parked,
+        len: u64,
+        keep_open: bool,
+    ) -> std::result::Result<Bytes, Fail> {
+        let Parked {
+            remote,
+            next,
+            mut conn,
+            open,
+            ..
+        } = p;
+        let Open { mut stream, carry } = open;
+        let mut buf = Vec::with_capacity(len.min(16 << 20) as usize);
+        buf.push(carry);
+        let tail = read_until_stall(&mut stream, len, &mut buf).await;
+        match settle(&mut conn, stream, tail, keep_open).await? {
+            Some(open) => self.park(remote, next + buf.len() as u64, conn, open),
+            None => self.release(conn),
+        }
+        Ok(Bytes::from(buf))
+    }
+
+    /// 새 RETR로 읽습니다. 많이 읽은 전송은 끊지 않고 다음 연속 읽기를 위해 남깁니다.
+    async fn read_fresh(
+        &self,
+        remote: &str,
+        offset: u64,
+        len: u64,
+        keep_open: bool,
+    ) -> Result<Bytes> {
+        let _permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
+        let mut retried = false;
+        loop {
+            let (mut c, reused) = self.checkout().await.map_err(Fail::into_error)?;
+            let res = tokio::time::timeout(
+                transfer_budget(len),
+                read_on(&mut c, self.feats, remote, offset, len, keep_open),
+            )
+            .await
+            .unwrap_or(Err(Fail::Timeout));
+            match res {
+                Ok((b, Some(open))) => {
+                    self.park(remote.to_owned(), offset + b.len() as u64, c, open);
+                    return Ok(b);
+                }
+                Ok((b, None)) => {
+                    self.release(c);
+                    return Ok(b);
+                }
+                Err(f) if f.is_broken() => {
+                    drop(c);
+                    if reused && !retried && f.is_retryable() {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(f.into_error());
+                }
+                Err(f) => {
+                    if !c.poisoned {
+                        self.put_idle(c);
+                    }
+                    return Err(f.into_error());
+                }
+            }
+        }
+    }
+
+    /// 정상 작업 뒤 버린 연결 대신 예비 연결을 미리 엽니다.
+    /// 부분 읽기마다 제어 연결을 닫는 서버에서 다음 요청이 접속과 로그인을 기다리지 않게 합니다.
+    fn refill(&self) {
+        let state = &self.state;
+        if state.live.load(Ordering::Acquire) >= POOL_SIZE
+            || !self
+                .idle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            || state.refilling.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let (params, idle, state) = (
+            Arc::clone(&self.params),
+            Arc::clone(&self.idle),
+            Arc::clone(&self.state),
+        );
+        tokio::spawn(async move {
+            match open(&params).await {
+                Ok((s, _)) => {
+                    let c = Conn {
+                        s,
+                        last_used: Instant::now(),
+                        poisoned: false,
+                        _live: LiveToken::new(&state),
+                    };
+                    idle.lock().unwrap_or_else(|e| e.into_inner()).push(c);
+                    state.freed.notify_one();
+                }
+                Err(f) => tracing::debug!(error = %f.into_error(), "FTP 예비 연결 준비 실패"),
+            }
+            state.refilling.store(false, Ordering::Release);
+        });
     }
 
     /// 풀에서 연결을 꺼내거나 새로 만듭니다. 두 번째 값은 재사용 여부입니다.
@@ -242,6 +459,9 @@ impl FtpBackend {
                     return Ok((c, false));
                 }
                 // 서버의 동시 접속 제한에 걸리면 다른 작업이 연결을 돌려줄 때까지 기다립니다.
+                Err(f) if f.is_capacity_refusal() && self.evict_parked() => {
+                    tracing::debug!("FTP 서버 동시 접속 제한으로 이어 받기 대기 전송을 정리합니다");
+                }
                 Err(f)
                     if f.is_capacity_refusal() && self.state.live.load(Ordering::Acquire) > 0 =>
                 {
@@ -275,9 +495,7 @@ impl FtpBackend {
             };
             match res {
                 Ok(v) => {
-                    if !c.poisoned {
-                        self.put_idle(c);
-                    }
+                    self.release(c);
                     return Ok(v);
                 }
                 Err(f) if f.is_broken() => {
@@ -540,12 +758,6 @@ async fn list_on(
     }
 }
 
-/// 한 번 더 읽어 EOF인지 확인합니다. 데이터가 더 있으면 false입니다.
-async fn at_eof<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<bool> {
-    let mut probe = [0u8; 1];
-    Ok(r.read(&mut probe).await? == 0)
-}
-
 /// 전송을 중간에 끊은 뒤 남은 응답(426, 226, 225 등)을 소비하고 NOOP으로 동기화합니다.
 async fn resync(s: &mut FtpStream) -> suppaftp::FtpResult<()> {
     for _ in 0..3 {
@@ -565,17 +777,23 @@ async fn resync(s: &mut FtpStream) -> suppaftp::FtpResult<()> {
     Err(FtpError::BadResponse)
 }
 
+/// `offset`부터 `len` 바이트를 읽습니다. `keep_open`이면 데이터가 남은 전송을 끊지 않고 돌려줍니다.
 async fn read_on(
     c: &mut Conn,
     feats: Feats,
     remote: &str,
     offset: u64,
     len: u64,
-) -> std::result::Result<Bytes, Fail> {
+    keep_open: bool,
+) -> std::result::Result<(Bytes, Option<Open>), Fail> {
     if offset > 0 {
         c.s.resume_transfer(offset as usize).await?;
     }
-    let mut stream = match c.s.retr_as_stream(remote).await {
+    // 데이터 연결 준비가 멈추면 연결을 버리고 VFS 재시도로 새 연결에서 다시 받습니다.
+    let opened = tokio::time::timeout(RETR_TIMEOUT, c.s.retr_as_stream(remote))
+        .await
+        .map_err(|_| stalled(c, "RETR 응답", RETR_TIMEOUT))?;
+    let mut stream = match opened {
         Ok(s) => s,
         Err(e) => {
             let orig = Fail::from(e);
@@ -583,39 +801,120 @@ async fn read_on(
                 return Err(orig);
             }
             // REST가 EOF를 넘었거나 디렉터리를 RETR한 경우를 구분합니다.
-            return match stat_on(c, feats, remote).await {
+            let Ok(found) = tokio::time::timeout(RETR_TIMEOUT, stat_on(c, feats, remote)).await
+            else {
+                return Err(stalled(c, "RETR 실패 뒤 조회", RETR_TIMEOUT));
+            };
+            return match found {
                 Ok(e) if e.is_dir() => Err(Fail::Fs(Error::IsADirectory)),
-                Ok(e) if offset >= e.size => Ok(Bytes::new()),
+                Ok(e) if offset >= e.size => Ok((Bytes::new(), None)),
                 Ok(_) => Err(orig),
                 Err(f) => Err(f),
             };
         }
     };
     let mut buf = Vec::with_capacity(len.min(16 << 20) as usize);
-    let read = async {
-        (&mut stream).take(len).read_to_end(&mut buf).await?;
-        if (buf.len() as u64) < len {
-            return Ok::<_, std::io::Error>(true);
-        }
-        at_eof(&mut stream).await
-    }
-    .await;
-    match read {
-        Ok(true) => stream.finish().await?,
-        Ok(false) => {
-            // 남은 데이터를 버리고 데이터 연결을 닫습니다. 서버의 완료 응답은 resync가 소비합니다.
-            drop(stream);
-            if let Err(e) = resync(&mut c.s).await {
-                tracing::debug!(error = %e, "부분 읽기 뒤 FTP 연결 동기화 실패, 연결을 버립니다");
-                c.poisoned = true;
+    let tail = read_until_stall(&mut stream, len, &mut buf).await;
+    let open = settle(c, stream, tail, keep_open).await?;
+    Ok((Bytes::from(buf), open))
+}
+
+/// 읽기를 마친 뒤 전송 상태
+#[derive(Debug, PartialEq, Eq)]
+enum Tail {
+    /// 서버가 전송을 끝냈습니다.
+    Eof,
+    /// 데이터가 더 있습니다. 끝 확인에 읽은 1바이트가 있으면 함께 둡니다.
+    More(Option<u8>),
+    /// 제한 시간 동안 데이터가 오지 않았습니다.
+    Stalled,
+}
+
+/// 전송을 마무리하거나, 이어 받을 수 있으면 끊지 않고 돌려줍니다.
+async fn settle(
+    c: &mut Conn,
+    stream: Transfer,
+    tail: std::io::Result<Tail>,
+    keep_open: bool,
+) -> std::result::Result<Option<Open>, Fail> {
+    match tail {
+        Ok(Tail::Eof) => {
+            // 데이터는 모두 받았으므로 완료 응답이 늦으면 연결만 버립니다.
+            match tokio::time::timeout(STALL_TIMEOUT, stream.finish()).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    tracing::debug!("FTP 전송 완료 응답이 없어 연결을 버립니다");
+                    c.poisoned = true;
+                }
             }
+            Ok(None)
+        }
+        Ok(Tail::More(Some(carry))) if keep_open => Ok(Some(Open { stream, carry })),
+        Ok(Tail::More(_)) => {
+            // 남은 데이터를 버리고 데이터 연결을 닫습니다. 서버의 완료 응답은 resync가 소비합니다.
+            // 일부 서버(Synology 등)는 이때 제어 연결도 닫으므로 오래 기다리지 않습니다.
+            drop(stream);
+            match tokio::time::timeout(RESYNC_TIMEOUT, resync(&mut c.s)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "부분 읽기 뒤 FTP 연결 동기화 실패, 연결을 버립니다");
+                    c.poisoned = true;
+                }
+                Err(_) => {
+                    tracing::debug!("부분 읽기 뒤 FTP 응답이 없어 연결을 버립니다");
+                    c.poisoned = true;
+                }
+            }
+            Ok(None)
+        }
+        Ok(Tail::Stalled) => {
+            drop(stream);
+            Err(stalled(c, "데이터 전송", STALL_TIMEOUT))
         }
         Err(e) => {
             drop(stream);
-            return Err(Fail::Ftp(FtpError::ConnectionError(e)));
+            Err(Fail::Ftp(FtpError::ConnectionError(e)))
         }
     }
-    Ok(Bytes::from(buf))
+}
+
+/// `buf`가 `len` 바이트가 될 때까지 읽습니다. [`STALL_TIMEOUT`] 동안 데이터가 오지 않으면 멈춤으로,
+/// 다 읽은 뒤에는 1바이트를 더 읽어 전송이 끝났는지 확인합니다.
+async fn read_until_stall<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    len: u64,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Tail> {
+    let mut chunk = vec![0u8; (len.min(COPY_BUF as u64) as usize).max(1)];
+    while (buf.len() as u64) < len {
+        let want = chunk.len().min((len - buf.len() as u64) as usize);
+        let Ok(n) = tokio::time::timeout(STALL_TIMEOUT, r.read(&mut chunk[..want])).await else {
+            tracing::debug!(received = buf.len(), want = len, "FTP 데이터가 멈췄습니다");
+            return Ok(Tail::Stalled);
+        };
+        match n? {
+            0 => return Ok(Tail::Eof),
+            n => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let mut probe = [0u8; 1];
+    match tokio::time::timeout(STALL_TIMEOUT, r.read(&mut probe)).await {
+        Ok(Ok(0)) => Ok(Tail::Eof),
+        Ok(Ok(_)) => Ok(Tail::More(Some(probe[0]))),
+        Ok(Err(e)) => Err(e),
+        // 필요한 분량은 받았으므로 남은 데이터가 있다고 보고 연결을 정리합니다.
+        Err(_) => Ok(Tail::More(None)),
+    }
+}
+
+/// 응답 없는 연결을 버리고 VFS가 다시 시도할 수 있는 시간 초과로 알립니다.
+fn stalled(c: &mut Conn, what: &str, after: Duration) -> Fail {
+    tracing::warn!(
+        "FTP {what} 단계가 {}초 동안 멈춰 연결을 버립니다",
+        after.as_secs()
+    );
+    c.poisoned = true;
+    Fail::Timeout
 }
 
 async fn write_on(
@@ -743,6 +1042,7 @@ impl Backend for FtpBackend {
             set_mtime: self.feats.mfmt,
             rename_dir: true,
             case_sensitive: true,
+            sequential_transfer: true,
         }
     }
 
@@ -771,16 +1071,24 @@ impl Backend for FtpBackend {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        let (feats, remote) = (self.feats, self.remote(path));
-        self.run(transfer_budget(len), move |c| {
-            let remote = remote.clone();
-            Box::pin(async move { read_on(c, feats, &remote, offset, len).await })
-        })
-        .await
+        let remote = self.remote(path);
+        let keep_open = len >= PARK_MIN_READ;
+        if let Some(p) = self.take_parked(&remote, offset) {
+            let permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
+            match self.continue_parked(p, len, keep_open).await {
+                Ok(b) => return Ok(b),
+                Err(f) => {
+                    tracing::debug!(error = %f.into_error(), "FTP 이어 받기 실패, 새 전송으로 받습니다");
+                }
+            }
+            drop(permit);
+        }
+        self.read_fresh(&remote, offset, len, keep_open).await
     }
 
     async fn write(&self, path: &RemotePath, source: WriteSource) -> Result<Entry> {
         let (feats, remote) = (self.feats, self.remote(path));
+        self.drop_parked(&remote);
         let name = path.name().unwrap_or("").to_owned();
         let size = source.len();
         let source = Arc::new(source);
@@ -830,6 +1138,8 @@ impl Backend for FtpBackend {
             return Ok(());
         }
         let (feats, src, dst) = (self.feats, self.remote(from), self.remote(to));
+        self.drop_parked(&src);
+        self.drop_parked(&dst);
         self.run(OP_TIMEOUT, move |c| {
             let (src, dst) = (src.clone(), dst.clone());
             Box::pin(async move { rename_on(c, feats, &src, &dst, replace).await })
@@ -842,6 +1152,7 @@ impl Backend for FtpBackend {
             return Err(Error::PermissionDenied);
         }
         let (feats, remote) = (self.feats, self.remote(path));
+        self.drop_parked(&remote);
         self.run(OP_TIMEOUT, move |c| {
             let remote = remote.clone();
             Box::pin(async move { delete_on(c, feats, &remote, kind).await })

@@ -200,3 +200,39 @@ fn feats_from_feat_reply() {
         Feats::default()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn read_until_stall_reports_end_more_data_and_stall() {
+    use tokio::io::AsyncWriteExt;
+    let (mut tx, mut rx) = tokio::io::duplex(64);
+    tx.write_all(b"0123456789").await.unwrap();
+    drop(tx);
+    let mut buf = Vec::new();
+    assert_eq!(
+        read_until_stall(&mut rx, 20, &mut buf).await.unwrap(),
+        Tail::Eof
+    );
+    assert_eq!(buf, b"0123456789");
+
+    let (mut tx, mut rx) = tokio::io::duplex(64);
+    tx.write_all(b"0123456789").await.unwrap();
+    let mut buf = Vec::new();
+    assert_eq!(
+        read_until_stall(&mut rx, 4, &mut buf).await.unwrap(),
+        Tail::More(Some(b'4'))
+    );
+    assert_eq!(buf, b"0123");
+
+    // 서버가 연결을 연 채 데이터를 보내지 않으면 제한 시간 뒤 멈춤으로 알립니다.
+    let (mut tx, mut rx) = tokio::io::duplex(64);
+    tx.write_all(b"abc").await.unwrap();
+    let mut buf = Vec::new();
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        read_until_stall(&mut rx, 10, &mut buf).await.unwrap(),
+        Tail::Stalled
+    );
+    assert_eq!(started.elapsed(), STALL_TIMEOUT);
+    assert_eq!(buf, b"abc");
+    drop(tx);
+}

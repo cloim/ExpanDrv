@@ -151,6 +151,32 @@ async fn exercise(be: Arc<FtpBackend>, base: &str) {
     assert_eq!(&be.read_range(&a, 0, 11).await.unwrap()[..], b"hello world");
     assert_eq!(be.read_range(&big, 0, n).await.unwrap().len() as u64, n);
 
+    // 1MiB 이상 연속 읽기는 같은 전송을 이어 받습니다. 경계 바이트와 EOF 정리를 확인합니다.
+    let first = be.read_range(&big, 0, 1 << 20).await.unwrap();
+    assert_eq!(&first[..], &data[..1 << 20]);
+    let rest = be.read_range(&big, 1 << 20, 1 << 20).await.unwrap();
+    assert_eq!(&rest[..], &data[1 << 20..], "이어 받은 나머지와 EOF");
+    assert_eq!(be.stat(&a).await.unwrap().size, 11, "EOF 뒤 연결 재사용");
+    // 이어 받기를 기다리는 동안 파일이 바뀌면 이전 내용을 돌려주지 않습니다.
+    let first = be.read_range(&big, 0, 1 << 20).await.unwrap();
+    assert_eq!(&first[..], &data[..1 << 20]);
+    let changed: Vec<u8> = data.iter().map(|b| b.wrapping_add(1)).collect();
+    be.write(&big, WriteSource::Bytes(Bytes::from(changed.clone())))
+        .await
+        .unwrap();
+    let after = be.read_range(&big, 1 << 20, 4096).await.unwrap();
+    assert_eq!(&after[..], &changed[1 << 20..(1 << 20) + 4096]);
+    be.write(&big, WriteSource::Bytes(Bytes::from(data.clone())))
+        .await
+        .unwrap();
+    // 이어지지 않는 위치를 읽으면 대기 전송과 별개로 새 전송을 씁니다.
+    let first = be.read_range(&big, 0, 1 << 20).await.unwrap();
+    assert_eq!(&first[..], &data[..1 << 20]);
+    let other = be.read_range(&big, 1_100_000, 10_000).await.unwrap();
+    assert_eq!(&other[..], &data[1_100_000..1_110_000]);
+    let rest = be.read_range(&big, 1 << 20, 1 << 20).await.unwrap();
+    assert_eq!(&rest[..], &data[1 << 20..]);
+
     // 풀 동시 사용
     let mut tasks = Vec::new();
     for i in 0..8u64 {

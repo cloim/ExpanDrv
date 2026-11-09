@@ -90,6 +90,7 @@ chrono = { version = "0.4.41", default-features = false, features = ["std", "clo
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
