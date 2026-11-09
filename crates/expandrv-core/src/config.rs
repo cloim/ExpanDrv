@@ -427,10 +427,10 @@ pub fn home_dir() -> Option<PathBuf> {
 /// `~` 접두사로 시작하는 경로를 홈 디렉터리 경로로 확장합니다.
 pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
     let p = path.as_ref();
-    if let Ok(rest) = p.strip_prefix("~") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Ok(rest) = p.strip_prefix("~")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
     p.to_path_buf()
 }
@@ -445,8 +445,7 @@ pub fn default_config_dir() -> Result<PathBuf> {
 
 /// 이전 버전에서 쓰던 설정 파일 경로(`%APPDATA%\ExpanDrv\config.toml`).
 pub fn legacy_config_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(|a| PathBuf::from(a).join("ExpanDrv").join("config.toml"))
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("ExpanDrv").join("config.toml"))
 }
 
 /// 기본 설정 파일 경로(`~/.config/ExpanDrv/config.toml`).
@@ -454,15 +453,14 @@ pub fn legacy_config_path() -> Option<PathBuf> {
 /// 새 위치로 안전하게 복사(이관)합니다.
 pub fn default_config_path() -> Result<PathBuf> {
     let target = default_config_dir()?.join("config.toml");
-    if !target.exists() {
-        if let Some(legacy) = legacy_config_path() {
-            if legacy.exists() {
-                if let Some(parent) = target.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::copy(&legacy, &target);
-            }
+    if !target.exists()
+        && let Some(legacy) = legacy_config_path()
+        && legacy.exists()
+    {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        let _ = std::fs::copy(&legacy, &target);
     }
     Ok(target)
 }
