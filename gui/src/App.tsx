@@ -1,4 +1,5 @@
-import { createBrowserRouter, Navigate, RouterProvider } from 'react-router-dom';
+import { api } from './api';
+import { createBrowserRouter, Navigate, RouterProvider, useLoaderData } from 'react-router-dom';
 import { AppShell } from './shell/AppShell';
 import { ActivityPage } from './pages/ActivityPage';
 import { AddDriveWizard } from './pages/AddDriveWizard';
@@ -13,7 +14,7 @@ const router = createBrowserRouter([
   {
     element: <AppShell />,
     children: [
-      { index: true, element: <Navigate to="/drives" replace /> },
+      { index: true, loader: () => api.launchDrive(), element: <LaunchRoute /> },
       {
         path: 'drives',
         element: <DrivesPage />,
@@ -35,4 +36,9 @@ export function App() {
       </StatusProvider>
     </ToastProvider>
   );
+}
+
+function LaunchRoute() {
+  const drive = useLoaderData() as string | null;
+  return <Navigate to={drive ? `/drives/${encodeURIComponent(drive)}` : '/drives'} replace />;
 }

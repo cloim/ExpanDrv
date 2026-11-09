@@ -26,6 +26,7 @@ expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp
 expandrv-ipc.workspace = true
 expandrv-secrets.workspace = true
 expandrv-autostart.workspace = true
+expandrv-shell.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 tokio.workspace = true

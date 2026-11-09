@@ -10,6 +10,7 @@ import { PageFrame } from '../shell/AppShell';
 import { useStatus } from '../status';
 import { IconButton, Led, Skeleton } from '../ui/controls';
 import { useToast } from '../ui/Toast';
+import { RecoveryPanel } from '../ui/RecoveryPanel';
 
 type Busy = Record<string, 'mount' | 'unmount' | 'delete'>;
 
@@ -86,6 +87,7 @@ export function DrivesPage() {
   const navigate = useNavigate();
   const [busy, setBusy] = useState<Busy>({});
   const [mountingAll, setMountingAll] = useState(false);
+  const [failure, setFailure] = useState<{ id: string; message: string } | null>(null);
   const [confirm, setConfirm] = useState<DriveRow | null>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
 
@@ -95,7 +97,9 @@ export function DrivesPage() {
     setBusy((b) => ({ ...b, [id]: kind }));
     try {
       toast.ok(await work());
+      setFailure((f) => f?.id === id ? null : f);
     } catch (e) {
+      setFailure({ id, message: errorText(e) });
       toast.error(`${id}: ${errorText(e)}`);
     } finally {
       setBusy(({ [id]: _, ...rest }) => rest);
@@ -126,6 +130,7 @@ export function DrivesPage() {
     try {
       const results = await api.mountAll();
       const failed = results.filter((r) => r.error);
+      setFailure(failed[0]?.error ? { id: failed[0].id, message: failed[0].error } : null);
       if (failed.length === 0) toast.ok(`드라이브 ${results.length}개를 마운트했습니다`);
       for (const f of failed) toast.error(`${f.id}: ${f.error}`);
     } catch (e) {
@@ -264,6 +269,9 @@ export function DrivesPage() {
     [busy],
   );
 
+  const failedDrive = rows.find((d) => d.state === 'failed' && d.message);
+  const recovery = failure ?? (failedDrive ? { id: failedDrive.id, message: failedDrive.message ?? '' } : null);
+
   return (
     <PageFrame
       title="드라이브"
@@ -283,6 +291,7 @@ export function DrivesPage() {
     >
       <div className="rise flex min-h-0 flex-1 flex-col gap-3 p-5">
         <AgentStrip />
+          {recovery ? <RecoveryPanel message={recovery.message} onAction={() => navigate(`/drives/${encodeURIComponent(recovery.id)}`)} /> : null}
         <div className="relative min-h-[300px] flex-1">
           <div className="absolute inset-0 flex">
             <DataGrid

@@ -41,7 +41,7 @@ impl Paths {
                 .with_file_name("expandrv.exe"),
         };
         Ok(Self {
-            config: env_dir("APPDATA")?.join("ExpanDrv").join("config.toml"),
+            config: expandrv_core::config::default_config_path().map_err(|e| e.to_string())?,
             pipe,
             cli,
             log_dir: env_dir("LOCALAPPDATA")?.join("ExpanDrv").join("logs"),
@@ -106,6 +106,9 @@ pub struct DriveRow {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusView {
+    pub locked: bool,
+    pub locking: bool,
+    pub pin_configured: bool,
     pub running: bool,
     pub agent_version: Option<String>,
     pub config_error: Option<String>,
@@ -176,9 +179,25 @@ pub async fn status_view(state: &AppState) -> Result<StatusView> {
             let s = link.status().await?;
             (true, Some(link.version), s)
         }
-        None => (false, None, AgentStatus::default()),
+        None => {
+            let configured = expandrv_secrets::lock::PinStore::new(&state.paths.config)
+                .and_then(|p| p.configured())
+                .map_err(|e| e.to_string())?;
+            (
+                false,
+                None,
+                AgentStatus {
+                    locked: configured,
+                    pin_configured: configured,
+                    ..AgentStatus::default()
+                },
+            )
+        }
     };
     Ok(StatusView {
+        locked: status.locked,
+        locking: status.locking,
+        pin_configured: status.pin_configured,
         running,
         agent_version,
         config_error,
@@ -263,6 +282,48 @@ pub async fn update_drive(state: State<'_, AppState>, id: String, patch: DrivePa
     state.reload().await
 }
 
+/// 공개 연결 필드를 검증하고 접속에 성공한 경우에만 저장합니다.
+#[tauri::command]
+pub async fn update_connection(
+    state: State<'_, AppState>,
+    id: String,
+    fields: std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    require_unlocked(&state).await?;
+    let ensure_unmounted = || async {
+        if let Some(mut link) = agent::connect(&state.paths.pipe).await?
+            && link
+                .status()
+                .await?
+                .drives
+                .iter()
+                .any(|d| d.id == id && d.state == DriveState::Mounted)
+        {
+            return Err(format!("{id}를 먼저 해제한 뒤 연결 정보를 수정하세요"));
+        }
+        Ok(())
+    };
+    ensure_unmounted().await?;
+    let expected = state.load()?;
+    let d = expected
+        .drive(&id)
+        .ok_or_else(|| format!("드라이브 {id}가 없습니다"))?;
+    let backend = drives::edited_backend(&d.backend, &fields).map_err(|e| e.to_string())?;
+    let message = probe(&backend, d.proxy.as_ref(), &Secrets).await?;
+    require_unlocked(&state).await?;
+    ensure_unmounted().await?;
+    let cache = state
+        .paths
+        .log_dir
+        .parent()
+        .ok_or("캐시 위치를 확인하세요")?
+        .join("cache")
+        .join(&id);
+    state.edit(|p| drives::save_connection(p, &expected, &id, backend, &cache))?;
+    state.reload().await?;
+    Ok(message)
+}
+
 #[tauri::command]
 pub async fn set_drive_secret(
     state: State<'_, AppState>,
@@ -310,7 +371,12 @@ async fn probe(
 
 /// 저장하기 전에 입력한 연결 정보로 접속과 루트 목록 조회를 확인합니다. 비밀 값은 저장하지 않습니다.
 #[tauri::command]
-pub async fn test_connection(backend: BackendInput, proxy: Option<ProxyInput>) -> Result<String> {
+pub async fn test_connection(
+    state: State<'_, AppState>,
+    backend: BackendInput,
+    proxy: Option<ProxyInput>,
+) -> Result<String> {
+    require_unlocked(&state).await?;
     // 대상 이름은 메모리 안에서 참조를 잇는 데만 씁니다.
     const ID: &str = "connection-test";
     let mut pending = Vec::new();
@@ -327,6 +393,7 @@ pub async fn test_connection(backend: BackendInput, proxy: Option<ProxyInput>) -
 /// 저장한 설정과 비밀 값으로 연결을 확인합니다(CLI `expandrv check`와 같음).
 #[tauri::command]
 pub async fn check_drive(state: State<'_, AppState>, id: String) -> Result<String> {
+    require_unlocked(&state).await?;
     let cfg = state.load()?;
     let d = cfg
         .drive(&id)
@@ -358,6 +425,9 @@ pub fn free_letters(used_mask: u32, cfg: &Config) -> Vec<String> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
+    pub lock_on_session_lock: bool,
+    pub idle_lock_minutes: u32,
+    pub explorer_menu: bool,
     pub autostart: bool,
     pub autostart_command: Option<String>,
     pub config_path: String,
@@ -375,11 +445,15 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView> {
 }
 
 async fn settings_view(state: &AppState) -> Result<SettingsView> {
+    let config = state.load()?;
     let p = &state.paths;
     let command =
         expandrv_autostart::status(expandrv_autostart::RUN_KEY).map_err(|e| e.to_string())?;
     let link = agent::connect(&p.pipe).await?;
     Ok(SettingsView {
+        lock_on_session_lock: config.security.lock_on_session_lock,
+        idle_lock_minutes: config.security.idle_minutes,
+        explorer_menu: expandrv_shell::enabled().map_err(|e| e.to_string())?,
         autostart: command.is_some(),
         autostart_command: command,
         config_path: p.config.display().to_string(),
@@ -415,4 +489,96 @@ pub async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<
 #[tauri::command]
 pub async fn stop_agent(state: State<'_, AppState>) -> Result<bool> {
     agent::stop(&state.paths.pipe).await
+}
+
+#[tauri::command]
+pub async fn lock_drives(state: State<'_, AppState>) -> Result<()> {
+    state.start_agent().await?.call_ok(&Request::Lock).await
+}
+
+#[tauri::command]
+pub async fn unlock_drives(state: State<'_, AppState>, pin: expandrv_ipc::Pin) -> Result<()> {
+    state
+        .start_agent()
+        .await?
+        .call_ok(&Request::Unlock { pin })
+        .await
+}
+
+#[tauri::command]
+pub async fn set_lock_pin(
+    state: State<'_, AppState>,
+    current: expandrv_ipc::Pin,
+    new: expandrv_ipc::Pin,
+) -> Result<()> {
+    state
+        .start_agent()
+        .await?
+        .call_ok(&Request::SetPin { current, new })
+        .await
+}
+
+async fn require_unlocked(state: &AppState) -> Result<()> {
+    if status_view(state).await?.locked {
+        Err("드라이브가 잠겨 있습니다. 먼저 잠금을 해제하세요".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub async fn set_explorer_menu(state: State<'_, AppState>, enabled: bool) -> Result<SettingsView> {
+    let gui = std::env::current_exe().map_err(|e| e.to_string())?;
+    let config = state.paths.config.clone();
+    tokio::task::spawn_blocking(move || {
+        if enabled {
+            expandrv_shell::install(&gui, &config)
+        } else {
+            expandrv_shell::uninstall()
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    settings_view(&state).await
+}
+
+#[tauri::command]
+pub async fn launch_drive(
+    state: State<'_, AppState>,
+    launch: State<'_, crate::launch::Launch>,
+) -> Result<Option<String>> {
+    let Some(path) = &launch.manage_path else {
+        return Ok(None);
+    };
+    let config = match state.load() {
+        Ok(config) => config,
+        Err(_) => return Ok(None),
+    };
+    Ok(expandrv_shell::drive_for_path(path, &config).map(str::to_owned))
+}
+
+#[tauri::command]
+pub async fn set_auto_lock(
+    state: State<'_, AppState>,
+    session_lock: bool,
+    idle_minutes: u32,
+) -> Result<SettingsView> {
+    let live = status_view(&state).await?;
+    if live.locked {
+        return Err("자동 잠금 설정을 바꾸려면 먼저 PIN으로 잠금을 해제하세요".into());
+    }
+    if !live.pin_configured && (session_lock || idle_minutes > 0) {
+        return Err("자동 잠금을 사용하려면 PIN을 먼저 등록하세요".into());
+    }
+    state.edit(|path| {
+        let mut config = Config::load(path)?;
+        config.security = expandrv_core::config::SecurityConfig {
+            lock_on_session_lock: session_lock,
+            idle_minutes,
+        };
+        config.save(path)
+    })?;
+    state.reload().await?;
+    settings_view(&state).await
 }

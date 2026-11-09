@@ -65,6 +65,7 @@ fn merges_config_with_agent_status() {
             live("bkt", DriveState::Failed("인증 실패".into())),
             live("gone", DriveState::Mounted),
         ],
+        ..AgentStatus::default()
     };
     let rows = commands::merge_status(Some(&cfg), &status);
     assert_eq!(rows.len(), 3);
@@ -96,4 +97,13 @@ fn free_letters_skip_used_and_configured() {
     );
     // D~Z 23개 중 사용 중 D:, Z:와 설정의 W:를 뺍니다.
     assert_eq!(free.len(), 20);
+}
+
+#[test]
+fn paths_detect_uses_dot_config() {
+    let paths = commands::Paths::detect().unwrap();
+    assert!(
+        paths.config.ends_with(".config/ExpanDrv/config.toml")
+            || paths.config.ends_with(r".config\ExpanDrv\config.toml")
+    );
 }

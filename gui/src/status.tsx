@@ -37,6 +37,7 @@ function diff(prev: StatusView | null, next: StatusView, nextSeq: () => number):
   if (prev.running !== next.running) {
     add('', 'agent', next.running ? '에이전트 시작' : '에이전트 종료', next.agentVersion ?? '');
   }
+  if (prev.locked !== next.locked) add('', 'agent', next.locked ? '드라이브 잠금' : '잠금 해제');
   for (const d of next.drives) {
     const before = prev.drives.find((p) => p.id === d.id);
     if (!before) {

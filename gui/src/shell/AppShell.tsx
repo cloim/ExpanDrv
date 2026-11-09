@@ -1,8 +1,12 @@
-import { NavLink, Outlet, Link } from 'react-router-dom';
-import { Activity, HardDrive, Settings } from 'lucide-react';
+import { NavLink, Outlet, Link, useNavigate } from 'react-router-dom';
+import { Activity, HardDrive, Settings, LockKeyhole } from 'lucide-react';
+import { useState } from 'react';
 import type { ReactNode } from 'react';
+import { LockScreen } from '../LockScreen';
+import { api, errorText } from '../api';
+import { useToast } from '../ui/Toast';
 import { useStatus } from '../status';
-import { Led, Skeleton } from '../ui/controls';
+import { Led, Skeleton, IconButton } from '../ui/controls';
 
 const NAV = [
   { to: '/drives', label: '드라이브', icon: HardDrive },
@@ -45,6 +49,7 @@ function AgentBadge() {
 
 /** 왼쪽 레일(내비게이션)과 본문. 상단바는 각 화면이 PageFrame으로 그립니다. */
 export function AppShell() {
+  const { status, loading, error } = useStatus();
   return (
     <div className="flex h-full">
       <aside className="flex w-[212px] flex-none flex-col bg-rail px-3 py-4 text-rail-text">
@@ -79,7 +84,7 @@ export function AppShell() {
         </div>
       </aside>
       <main className="flex min-w-0 flex-1 flex-col">
-        <Outlet />
+        {loading ? <div className="p-6"><Skeleton className="h-40 w-full" /></div> : error ? <div role="alert" className="p-6 text-danger">{error}</div> : status?.locked ? <LockScreen /> : <Outlet />}
       </main>
     </div>
   );
@@ -112,15 +117,31 @@ export function PageFrame({
               <span aria-hidden="true">/</span>
             </span>
           ))}
-          <h1 className="truncate text-[17px] font-[750] tracking-tight text-ink [font-stretch:94%]">{title}</h1>
+          <h1 data-ui-audit-context-title className="truncate text-[17px] font-[750] tracking-tight text-ink [font-stretch:94%]">{title}</h1>
         </nav>
-        {actions ? <div className="flex flex-none items-center gap-1">{actions}</div> : null}
+        <div className="flex flex-none items-center gap-1">{actions}<LockAction /></div>
       </header>
       <div
+        data-ui-audit-scroll-root={scroll ? true : undefined}
         className={`dot-grid flex min-h-0 flex-1 flex-col ${scroll ? 'overflow-y-auto' : 'overflow-hidden'}`}
       >
         {children}
       </div>
     </>
   );
+}
+
+function LockAction() {
+  const { status, refresh } = useStatus();
+  const navigate = useNavigate();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const lock = async () => {
+    if (!status?.pinConfigured) { navigate('/settings'); return; }
+    setBusy(true);
+    try { await api.lock(); }
+    catch (e) { toast.error(errorText(e)); }
+    finally { await refresh(); setBusy(false); }
+  };
+  return <IconButton label={status?.pinConfigured ? '전체 드라이브 잠금' : '잠금 PIN 설정'} icon={LockKeyhole} busy={busy} disabled={!status} onClick={() => void lock()} />;
 }

@@ -38,7 +38,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <div
               key={t.id}
               role={t.tone === 'error' ? 'alert' : 'status'}
-              className="rise pointer-events-auto flex items-start gap-2.5 rounded-xl border border-line-strong bg-surface px-3.5 py-3 text-[13px] text-ink shadow-[0_12px_30px_var(--shadow-color)]"
+              className="rise pointer-events-none flex items-start gap-2.5 rounded-xl border border-line-strong bg-surface px-3.5 py-3 text-[13px] text-ink shadow-[0_12px_30px_var(--shadow-color)]"
             >
               {t.tone === 'ok' ? (
                 <CircleCheck size={17} className="mt-px flex-none text-ok" aria-hidden="true" />
@@ -50,7 +50,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 type="button"
                 aria-label="알림 닫기"
                 onClick={() => dismiss(t.id)}
-                className="-m-1 rounded p-1 text-ink-3 hover:text-ink"
+                className="pointer-events-auto -m-1 rounded p-1 text-ink-3 hover:text-ink"
               >
                 <X size={14} aria-hidden="true" />
               </button>

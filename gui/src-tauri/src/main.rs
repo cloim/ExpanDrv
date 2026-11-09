@@ -5,18 +5,30 @@
 mod agent;
 mod commands;
 mod drives;
+mod launch;
 
 use commands::{AppState, Paths};
 
 fn main() {
-    let paths = match Paths::detect() {
+    let launch = match launch::Launch::parse(std::env::args_os().skip(1)) {
+        Ok(launch) => launch,
+        Err(e) => {
+            eprintln!("오류: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut paths = match Paths::detect() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("오류: {e}");
             std::process::exit(1);
         }
     };
+    if let Some(config) = &launch.config {
+        paths.config = expandrv_core::config::expand_tilde(config);
+    }
     tauri::Builder::default()
+        .manage(launch)
         .manage(AppState {
             paths,
             config_lock: Default::default(),
@@ -29,14 +41,21 @@ fn main() {
             commands::get_drive,
             commands::add_drive,
             commands::update_drive,
+            commands::update_connection,
             commands::set_drive_secret,
             commands::delete_drive,
             commands::test_connection,
             commands::check_drive,
             commands::free_drive_letters,
             commands::get_settings,
+            commands::set_explorer_menu,
+            commands::launch_drive,
             commands::set_autostart,
+            commands::set_auto_lock,
             commands::stop_agent,
+            commands::lock_drives,
+            commands::unlock_drives,
+            commands::set_lock_pin,
         ])
         // 앱 자산 밖의 주소로 이동하지 않습니다(외부 링크 차단).
         .plugin(navigation_guard())

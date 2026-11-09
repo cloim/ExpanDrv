@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { KeyRound, Loader2, Play, PlugZap, RotateCcw, Save, Square } from 'lucide-react';
 import { Modal } from '../components/Modal';
+import SelectControl from '../components/SelectControl';
+import { ConnectionEditor } from './ConnectionEditor';
+import { RecoveryPanel } from '../ui/RecoveryPanel';
+import { PERFORMANCE_PRESETS, performancePreset } from '../performance';
 import { api, BACKEND_LABEL, errorText, STATE_LABEL } from '../api';
 import type { CacheSettings, DriveDetail, SecretInfo, TransferSettings } from '../api';
 import { PageFrame } from '../shell/AppShell';
@@ -45,6 +49,7 @@ const CACHE_FIELDS: { key: keyof CacheSettings; label: string; unit: string; min
   { key: 'memoryLimitMib', label: '블록 캐시 메모리 상한', unit: 'MiB', min: 8, max: 8192 },
   { key: 'pollIntervalSecs', label: '원격 변경 확인 주기', unit: '초, 0이면 끔', min: 0, max: 86400 },
   { key: 'diskLimitMib', label: '암호화 디스크 캐시 상한', unit: 'MiB, 0이면 끔', min: 0, max: 1048576 },
+  { key: 'readaheadBlocks', label: '선행 읽기 상한', unit: '블록, 0이면 끔', min: 0, max: 16 },
 ];
 
 const TRANSFER_FIELDS: { key: keyof TransferSettings; label: string }[] = [
@@ -86,6 +91,8 @@ export function DrivePropertiesPage() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [connectionError, setConnectionError] = useState('');
   const [toggling, setToggling] = useState(false);
   const [secretFor, setSecretFor] = useState<SecretInfo | null>(null);
   const [secretValue, setSecretValue] = useState('');
@@ -154,6 +161,7 @@ export function DrivePropertiesPage() {
           memoryLimitMib: Number(draft.cache.memoryLimitMib),
           pollIntervalSecs: Number(draft.cache.pollIntervalSecs),
           diskLimitMib: Number(draft.cache.diskLimitMib),
+          readaheadBlocks: Number(draft.cache.readaheadBlocks),
         },
         transfer: {
           uploadKibPerSec: Number(draft.transfer.uploadKibPerSec),
@@ -175,9 +183,11 @@ export function DrivePropertiesPage() {
 
   const check = async () => {
     setChecking(true);
+    setConnectionError('');
     try {
       toast.ok(await api.checkDrive(id));
     } catch (e) {
+      setConnectionError(errorText(e));
       toast.error(`연결 실패: ${errorText(e)}`);
     } finally {
       setChecking(false);
@@ -186,6 +196,7 @@ export function DrivePropertiesPage() {
 
   const toggleMount = async () => {
     setToggling(true);
+    setConnectionError('');
     try {
       if (mounted) {
         await api.unmount(id);
@@ -195,6 +206,7 @@ export function DrivePropertiesPage() {
         toast.ok(`${id}를 마운트했습니다`);
       }
     } catch (e) {
+      setConnectionError(errorText(e));
       toast.error(errorText(e));
     } finally {
       setToggling(false);
@@ -291,6 +303,12 @@ export function DrivePropertiesPage() {
         </div>
       ) : (
         <div className="rise mx-auto grid w-full max-w-[1100px] grid-cols-1 gap-4 p-5 lg:grid-cols-2">
+          {connectionError || (live?.state === 'failed' && live.message) ? <div className="lg:col-span-2"><RecoveryPanel message={connectionError || live?.message || ''} busy={checking || toggling} onAction={(action) => {
+            if (action === 'retry') { void check(); return; }
+            if (action === 'credentials') { setSecretFor(detail?.secrets[0] ?? null); return; }
+            if (action === 'mountPoint') { document.querySelector<HTMLInputElement>('[data-mount-point]')?.focus(); return; }
+            document.getElementById('drive-connection')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }} /></div> : null}
           <Section
             title="일반"
             actions={
@@ -325,6 +343,7 @@ export function DrivePropertiesPage() {
                     <input
                       {...p}
                       className="control mono"
+                      data-mount-point
                       value={draft.mountPoint}
                       onChange={(e) => {
                         patchDraft({ mountPoint: e.target.value });
@@ -353,7 +372,7 @@ export function DrivePropertiesPage() {
             />
           </Section>
 
-          <Section title={`연결 정보${detail ? ` · ${BACKEND_LABEL[detail.backend]}` : ''}`}>
+          <Section title={`연결 정보${detail ? ` | ${BACKEND_LABEL[detail.backend]}` : ''}`} actions={<button id="drive-connection" type="button" className="btn btn-ghost h-8 px-3 text-xs" disabled={!detail || mounted || dirty || saving || checking || toggling} onClick={() => setConnectionOpen(true)}>수정</button>}>
             <dl className="grid grid-cols-[120px_1fr] gap-x-4 gap-y-2.5 text-[13px]">
               {detail
                 ? detail.connection.map((f) => (
@@ -373,7 +392,7 @@ export function DrivePropertiesPage() {
                     </div>
                   ))}
             </dl>
-            <p className="text-xs text-ink-3">연결 정보를 바꾸려면 드라이브를 지우고 다시 추가하세요</p>
+            <p className="text-xs text-ink-2">{mounted ? '드라이브를 해제하면 연결 정보를 수정할 수 있습니다' : dirty ? '다른 변경 사항을 저장하거나 취소한 뒤 연결 정보를 수정하세요' : '연결 검사에 성공한 정보만 저장하고 자격 증명은 유지합니다'}</p>
           </Section>
 
           <Section title="비밀 값">
@@ -458,6 +477,16 @@ export function DrivePropertiesPage() {
           </Section>
 
           <Section title="캐시">
+            <Field label="작업 용도">
+              {(p) => <SelectControl {...p} disabled={!draft || saving} value={draft ? performancePreset(draft.cache)?.id ?? 'custom' : 'custom'} onChange={(e) => {
+                const preset = PERFORMANCE_PRESETS.find((v) => v.id === e.target.value);
+                if (preset) { patchDraft({ cache: Object.fromEntries(Object.entries(preset.cache).map(([key, value]) => [key, String(value)])) as Draft['cache'] }); setErrors({}); }
+              }}><option value="custom" disabled>직접 설정</option>{PERFORMANCE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</SelectControl>}
+            </Field>
+            {draft ? <div className="rounded-lg border border-line bg-surface-2 p-3 text-xs leading-relaxed text-ink-2" aria-live="polite">
+              <p>{performancePreset(draft.cache)?.description ?? '필요한 캐시와 선행 읽기 값을 직접 조정합니다'}</p>
+              <p className="mt-1">메모리 최대 {draft.cache.memoryLimitMib}MiB | 디스크 최대 {draft.cache.diskLimitMib}MiB<br />{Number(draft.cache.pollIntervalSecs) === 0 ? '주기적 원격 확인 끔' : `원격 변경 ${draft.cache.pollIntervalSecs}초마다 확인`} | 저장 후 다시 마운트하면 적용</p>
+            </div> : null}
             <div className="grid grid-cols-2 gap-4">
               {CACHE_FIELDS.map((f) => num('cache', f.key, f.label, f.unit))}
             </div>
@@ -471,6 +500,7 @@ export function DrivePropertiesPage() {
         </div>
       )}
 
+      {connectionOpen && detail ? <ConnectionEditor detail={detail} onClose={() => setConnectionOpen(false)} onCredentials={() => setSecretFor(detail.secrets[0] ?? null)} onSaved={async () => { await load(); await refresh(); setConnectionError(''); }} /> : null}
       <Modal
         isOpen={secretFor !== null}
         onClose={() => {

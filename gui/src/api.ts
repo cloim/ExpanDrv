@@ -19,6 +19,9 @@ export interface DriveRow {
 }
 
 export interface StatusView {
+  locked: boolean;
+  locking: boolean;
+  pinConfigured: boolean;
   running: boolean;
   agentVersion: string | null;
   configError: string | null;
@@ -36,6 +39,7 @@ export interface CacheSettings {
   memoryLimitMib: number;
   pollIntervalSecs: number;
   diskLimitMib: number;
+  readaheadBlocks: number;
 }
 
 export interface TransferSettings {
@@ -59,6 +63,7 @@ export interface DriveDetail {
   autoMount: boolean;
   backend: BackendKind;
   connection: { label: string; value: string }[];
+  connectionEdit: Record<string, string>;
   secrets: SecretInfo[];
   cache: CacheSettings;
   transfer: TransferSettings;
@@ -127,6 +132,9 @@ export interface DrivePatch {
 }
 
 export interface SettingsView {
+  lockOnSessionLock: boolean;
+  idleLockMinutes: number;
+  explorerMenu: boolean;
   autostart: boolean;
   autostartCommand: string | null;
   configPath: string;
@@ -149,12 +157,16 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 
 export const api = {
   status: () => call<StatusView>('agent_status'),
+  lock: () => call<void>('lock_drives'),
+  unlock: (pin: string) => call<void>('unlock_drives', { pin }),
+  setPin: (current: string, newPin: string) => call<void>('set_lock_pin', { current, new: newPin }),
   mount: (id: string) => call<void>('mount_drive', { id }),
   mountAll: () => call<MountResult[]>('mount_all'),
   unmount: (id: string) => call<void>('unmount_drive', { id }),
   drive: (id: string) => call<DriveDetail>('get_drive', { id }),
   addDrive: (drive: NewDrive) => call<string>('add_drive', { drive }),
   updateDrive: (id: string, patch: DrivePatch) => call<void>('update_drive', { id, patch }),
+  updateConnection: (id: string, fields: Record<string, string>) => call<string>('update_connection', { id, fields }),
   setSecret: (id: string, field: string, value: string) =>
     call<void>('set_drive_secret', { id, field, value }),
   deleteDrive: (id: string) => call<number>('delete_drive', { id }),
@@ -163,7 +175,10 @@ export const api = {
   checkDrive: (id: string) => call<string>('check_drive', { id }),
   freeLetters: () => call<string[]>('free_drive_letters'),
   settings: () => call<SettingsView>('get_settings'),
+  setExplorerMenu: (enabled: boolean) => call<SettingsView>('set_explorer_menu', { enabled }),
+  launchDrive: () => call<string | null>('launch_drive'),
   setAutostart: (enabled: boolean) => call<SettingsView>('set_autostart', { enabled }),
+  setAutoLock: (sessionLock: boolean, idleMinutes: number) => call<SettingsView>('set_auto_lock', { sessionLock, idleMinutes }),
   stopAgent: () => call<boolean>('stop_agent'),
 };
 

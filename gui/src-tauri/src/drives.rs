@@ -560,6 +560,12 @@ pub struct CacheInput {
     pub memory_limit_mib: u32,
     pub poll_interval_secs: u64,
     pub disk_limit_mib: u64,
+    #[serde(default = "default_readahead")]
+    pub readahead_blocks: u32,
+}
+
+fn default_readahead() -> u32 {
+    4
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -596,6 +602,7 @@ fn build_cache(c: CacheInput) -> Result<CacheConfig> {
         memory_limit_mib: in_range("캐시 메모리 상한", c.memory_limit_mib, 8, 8192)?,
         poll_interval_secs: in_range("변경 확인 주기", c.poll_interval_secs, 0, 86_400)?,
         disk_limit_mib: in_range("디스크 캐시 상한", c.disk_limit_mib, 0, 1 << 20)?,
+        readahead_blocks: in_range("선행 읽기 상한", c.readahead_blocks, 0, 16)?,
     })
 }
 
@@ -737,7 +744,11 @@ pub fn delete_drive(cfg_path: &Path, store: &dyn SecretStore, id: &str) -> Resul
     Ok(targets.len())
 }
 
-// ---- 화면에 보낼 읽기 전용 정보(비밀 값은 넣지 않음) ----
+#[path = "connection.rs"]
+mod connection;
+pub use connection::{connection_fields, edited_backend, save_connection};
+
+// ---- 화면에 보낼 정보(비밀 값은 넣지 않음) ----
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -776,6 +787,7 @@ pub struct DriveDetail {
     pub auto_mount: bool,
     pub backend: &'static str,
     pub connection: Vec<Field>,
+    pub connection_edit: std::collections::BTreeMap<String, String>,
     pub secrets: Vec<SecretInfo>,
     pub cache: CacheInput,
     pub transfer: TransferInput,
@@ -910,6 +922,7 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
         auto_mount: d.auto_mount,
         backend: d.backend.kind(),
         connection,
+        connection_edit: connection_fields(&d.backend),
         secrets,
         cache: CacheInput {
             metadata_ttl_secs: d.cache.metadata_ttl_secs,
@@ -917,6 +930,7 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
             memory_limit_mib: d.cache.memory_limit_mib,
             poll_interval_secs: d.cache.poll_interval_secs,
             disk_limit_mib: d.cache.disk_limit_mib,
+            readahead_blocks: d.cache.readahead_blocks,
         },
         transfer: TransferInput {
             upload_kib_per_sec: d.transfer.upload_kib_per_sec,

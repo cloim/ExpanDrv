@@ -1,5 +1,6 @@
+import { PinSettings } from '../LockScreen';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Copy, Power, RefreshCw } from 'lucide-react';
+import { Copy, Power, RefreshCw, Loader2 } from 'lucide-react';
 import SelectControl from '../components/SelectControl';
 import { Modal } from '../components/Modal';
 import { api, errorText } from '../api';
@@ -38,10 +39,10 @@ function PathRow({ label, value, note }: { label: string; value?: string; note?:
 
 export function SettingsPage() {
   const toast = useToast();
-  const { refresh } = useStatus();
+  const { refresh, status } = useStatus();
   const [view, setView] = useState<SettingsView | null>(null);
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState<'autostart' | 'stop' | 'load' | null>('load');
+  const [busy, setBusy] = useState<'autostart' | 'explorer' | 'security' | 'stop' | 'load' | null>('load');
   const [confirmStop, setConfirmStop] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const [theme, setTheme] = useTheme();
@@ -72,6 +73,24 @@ export function SettingsPage() {
     } finally {
       setBusy(null);
     }
+  };
+
+  const toggleExplorer = async (enabled: boolean) => {
+    setBusy('explorer');
+    try {
+      setView(await api.setExplorerMenu(enabled));
+      toast.ok(enabled ? '탐색기 메뉴를 등록했습니다' : '탐색기 메뉴를 해제했습니다');
+    } catch (e) { toast.error(errorText(e)); }
+    finally { setBusy(null); }
+  };
+
+  const updateAutoLock = async (sessionLock: boolean, idleMinutes: number) => {
+    setBusy('security');
+    try {
+      setView(await api.setAutoLock(sessionLock, idleMinutes));
+      toast.ok('자동 잠금 설정을 저장했습니다');
+    } catch (e) { toast.error(errorText(e)); }
+    finally { setBusy(null); }
   };
 
   const stop = async () => {
@@ -149,6 +168,15 @@ export function SettingsPage() {
           ) : null}
         </Section>
 
+        <Section title="탐색기 메뉴">
+          <Switch label="탐색기 우클릭 메뉴에 ExpanDrv 표시"
+            hint="드라이브와 폴더에서 앱 또는 드라이브 속성을 엽니다"
+            checked={view?.explorerMenu ?? false} disabled={!view || busy !== null}
+            onChange={(enabled) => void toggleExplorer(enabled)} />
+          <p className="text-xs leading-relaxed text-ink-3">Windows 11에서는 ‘추가 옵션 표시’에서 사용할 수 있습니다</p>
+          {busy === 'explorer' ? <p role="status" className="text-xs text-ink-2">탐색기 메뉴를 변경하는 중</p> : null}
+        </Section>
+
         <Section title="경로" className="lg:col-span-2">
           <PathRow label="설정 파일" value={view?.configPath} />
           <PathRow label="로그 폴더" value={view?.logDir} />
@@ -157,6 +185,24 @@ export function SettingsPage() {
             value={view?.cliPath}
             note={view && !view.cliFound ? '파일이 없어 에이전트를 시작할 수 없습니다' : undefined}
           />
+        </Section>
+
+        <Section title="드라이브 잠금"><PinSettings /></Section>
+
+        <Section title="자동 잠금">
+          <Switch label="Windows를 잠그면 드라이브도 잠금"
+            hint="Windows 잠금을 풀어도 ExpanDrv는 PIN으로 직접 해제합니다"
+            checked={view?.lockOnSessionLock ?? true} disabled={!view || !status?.pinConfigured || busy !== null}
+            onChange={(enabled) => void updateAutoLock(enabled, view?.idleLockMinutes ?? 0)} />
+          <Field label="입력이 없을 때 잠금" hint="마우스와 키보드를 사용하지 않은 시간">
+            {(p) => <SelectControl {...p} value={view?.idleLockMinutes ?? 0} disabled={!view || !status?.pinConfigured || busy !== null}
+              onChange={(e) => void updateAutoLock(view?.lockOnSessionLock ?? true, Number(e.target.value))}>
+              {[0, 1, 5, 10, 15, 30, 60, 120, 240, 480, 1440].map((n) => <option key={n} value={n}>{n === 0 ? '사용 안 함' : `${n}분`}</option>)}
+              {view && ![0, 1, 5, 10, 15, 30, 60, 120, 240, 480, 1440].includes(view.idleLockMinutes) ? <option value={view.idleLockMinutes}>{view.idleLockMinutes}분</option> : null}
+            </SelectControl>}
+          </Field>
+          {!status?.pinConfigured ? <p className="text-xs text-ink-2">PIN을 먼저 등록하면 자동 잠금을 설정할 수 있습니다</p> : null}
+          {busy === 'security' ? <p role="status" className="flex items-center gap-2 text-xs text-ink-2"><Loader2 size={14} className="spin" aria-hidden="true" />설정을 저장하는 중</p> : null}
         </Section>
 
         <Section title="화면">

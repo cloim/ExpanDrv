@@ -7,14 +7,21 @@ const COMMANDS: &[&str] = &[
     "get_drive",
     "add_drive",
     "update_drive",
+    "update_connection",
     "set_drive_secret",
     "delete_drive",
     "test_connection",
     "check_drive",
     "free_drive_letters",
     "get_settings",
+    "set_explorer_menu",
+    "launch_drive",
     "set_autostart",
+    "set_auto_lock",
     "stop_agent",
+    "lock_drives",
+    "unlock_drives",
+    "set_lock_pin",
 ];
 
 fn main() {
