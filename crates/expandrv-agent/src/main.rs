@@ -462,6 +462,7 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
         cache: CacheConfig::default(),
         transfer: TransferConfig::default(),
         auto_mount: a.auto_mount,
+        network_drive: true,
         proxy,
         backend,
     });

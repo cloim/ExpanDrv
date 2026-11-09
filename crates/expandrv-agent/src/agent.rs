@@ -110,6 +110,7 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
             label: d.label.clone(),
             file_info_timeout_ms: 1000,
             serial: serial(&d.id),
+            network_share: d.network_drive.then(|| d.id.clone()),
         },
     )?;
     vfs.start_watch(Duration::from_secs(d.cache.poll_interval_secs));

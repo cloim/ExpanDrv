@@ -276,6 +276,7 @@ mod tests {
             mount_point: "W:".into(),
             read_only: false,
             auto_mount: false,
+            network_drive: true,
             cache: CacheConfig::default(),
             transfer: TransferConfig::default(),
             proxy: None,

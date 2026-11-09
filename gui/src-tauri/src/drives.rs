@@ -518,6 +518,7 @@ pub fn build_drive(input: NewDrive) -> Result<(DriveConfig, Vec<PendingSecret>)>
         cache: CacheConfig::default(),
         transfer: TransferConfig::default(),
         auto_mount: input.auto_mount,
+        network_drive: true,
         proxy,
         backend,
     };

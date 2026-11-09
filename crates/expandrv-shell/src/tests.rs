@@ -101,6 +101,7 @@ fn paths_respect_boundaries_case_and_nested_mounts() {
             cache: Default::default(),
             transfer: Default::default(),
             auto_mount: false,
+            network_drive: true,
             proxy: None,
             backend: expandrv_core::config::BackendConfig::Local { root: "C:/".into() },
         };

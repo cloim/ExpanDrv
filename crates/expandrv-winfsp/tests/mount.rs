@@ -22,6 +22,54 @@ fn free_drive() -> String {
 }
 
 #[test]
+fn network_share_mounts_as_remote_drive() {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::core::HSTRING;
+    const DRIVE_REMOTE: u32 = 4;
+    if runtime::runtime_dll().is_none() {
+        eprintln!("WinFsp 런타임 미설치: 건너뜀");
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.txt"), b"network").unwrap();
+    let vfs = Arc::new(
+        Vfs::new(
+            Arc::new(LocalBackend::new(root.path()).unwrap()),
+            rt.handle().clone(),
+            VfsOptions::new(staging.path().to_owned()),
+        )
+        .unwrap(),
+    );
+    let mount_point = free_drive();
+    let drive = MountedDrive::mount(
+        vfs.clone(),
+        &MountOptions {
+            mount_point: mount_point.clone(),
+            label: "ExpanDrvNet".into(),
+            file_info_timeout_ms: 1000,
+            serial: 2,
+            network_share: Some("ExpanDrvNetTest".into()),
+        },
+    )
+    .unwrap();
+    let unc = drive.unc_path().expect("UNC 경로");
+    assert!(unc.starts_with(r"\\ExpanDrv-") && unc.ends_with(r"\ExpanDrvNetTest"));
+    let kind = unsafe { GetDriveTypeW(&HSTRING::from(format!("{mount_point}\\"))) };
+    assert_eq!(kind, DRIVE_REMOTE, "네트워크 드라이브로 보여야 합니다");
+    assert_eq!(
+        fs::read(format!("{mount_point}\\hello.txt")).unwrap(),
+        b"network"
+    );
+    fs::write(format!("{mount_point}\\new.txt"), b"x").unwrap();
+    drop(drive);
+    vfs.sync(Duration::from_secs(10)).unwrap();
+    assert_eq!(fs::read(root.path().join("new.txt")).unwrap(), b"x");
+}
+
+#[test]
 fn local_backend_mount_end_to_end() {
     if runtime::runtime_dll().is_none() {
         eprintln!("WinFsp 런타임 미설치: 건너뜀");
@@ -54,6 +102,7 @@ fn local_backend_mount_end_to_end() {
             label: "ExpanDrvTest".into(),
             file_info_timeout_ms: 1000,
             serial: 0x4558_5044,
+            network_share: None,
         },
     )
     .unwrap();
@@ -171,6 +220,7 @@ fn remote_change_reaches_directory_watchers() {
             label: "ExpanDrvNotify".into(),
             file_info_timeout_ms: 1000,
             serial: 1,
+            network_share: None,
         },
     )
     .unwrap();

@@ -65,6 +65,10 @@ pub struct DriveConfig {
     /// 에이전트가 시작할 때 자동으로 마운트할지 여부
     #[serde(default)]
     pub auto_mount: bool,
+    /// 드라이브 문자 마운트를 네트워크 드라이브(UNC)로 등록합니다. 탐색기, 백신과 검색 색인이
+    /// 로컬 디스크처럼 파일 내용을 미리 읽지 않아 우클릭, 속성, 미리보기가 빨라집니다.
+    #[serde(default = "default_true")]
+    pub network_drive: bool,
     /// 이 드라이브의 원격 연결에 쓸 프록시
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,

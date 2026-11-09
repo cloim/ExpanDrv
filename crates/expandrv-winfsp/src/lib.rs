@@ -1,6 +1,7 @@
 //! VFS를 WinFsp 볼륨으로 마운트합니다.
 
 mod fs;
+mod network;
 pub mod runtime;
 pub mod security;
 
@@ -21,19 +22,33 @@ pub struct MountOptions {
     /// 커널 캐시가 파일 정보를 유지하는 시간(ms)
     pub file_info_timeout_ms: u32,
     pub serial: u32,
+    /// 네트워크 드라이브로 등록할 때의 공유 이름(`\\ExpanDrv-<사용자>\<공유>`).
+    /// `None`이거나 폴더 마운트면 로컬 디스크로 등록합니다.
+    pub network_share: Option<String>,
 }
 
 /// 마운트된 드라이브. 드롭하면 디스패처를 멈추고 마운트를 해제합니다.
 pub struct MountedDrive {
     host: FileSystemHost<ExpanFs>,
     mount_point: String,
+    /// 네트워크 드라이브로 등록했다면 UNC 접두사
+    unc_prefix: Option<String>,
 }
 
 impl MountedDrive {
     pub fn mount(vfs: Arc<Vfs>, opts: &MountOptions) -> Result<Self> {
         runtime::init()?;
         let security = security::owner_only_descriptor()?;
+        let unc_prefix = opts
+            .network_share
+            .as_deref()
+            .filter(|_| network::is_drive_letter(&opts.mount_point))
+            .map(network::unc_prefix);
         let mut vp = VolumeParams::new();
+        if let Some(prefix) = &unc_prefix {
+            // 접두사가 있으면 WinFsp.Net 장치로 만들어 탐색기가 네트워크 드라이브로 다룹니다.
+            vp.prefix(prefix);
+        }
         vp.filesystem_name("ExpanDrv")
             .sector_size(4096)
             .sectors_per_allocation_unit(1)
@@ -62,15 +77,28 @@ impl MountedDrive {
             host.unmount();
             return Err(fsp_err("디스패처 시작", e));
         }
-        tracing::info!(mount_point = %opts.mount_point, "마운트 완료");
+        if let Some(prefix) = &unc_prefix {
+            network::set_explorer_label(prefix, &opts.label);
+        }
+        tracing::info!(
+            mount_point = %opts.mount_point,
+            unc = unc_prefix.as_deref().unwrap_or(""),
+            "마운트 완료"
+        );
         Ok(Self {
             host,
             mount_point: opts.mount_point.clone(),
+            unc_prefix,
         })
     }
 
     pub fn mount_point(&self) -> &str {
         &self.mount_point
+    }
+
+    /// 네트워크 드라이브로 등록했다면 `\\서버\공유` 형태의 UNC 경로
+    pub fn unc_path(&self) -> Option<String> {
+        self.unc_prefix.as_ref().map(|p| format!(r"\{p}"))
     }
 }
 
@@ -82,6 +110,9 @@ impl Drop for MountedDrive {
     fn drop(&mut self) {
         self.host.stop();
         self.host.unmount();
+        if let Some(prefix) = &self.unc_prefix {
+            network::clear_explorer_label(prefix);
+        }
         tracing::info!(mount_point = %self.mount_point, "마운트 해제");
     }
 }
