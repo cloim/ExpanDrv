@@ -40,6 +40,9 @@ struct State {
     shutting_down: bool,
     locked: bool,
     locking: bool,
+    lock_reason: Option<Reason>,
+    session_restore_drives: Vec<String>,
+    session_locked: bool,
     pin_configured: bool,
     pin_failures: u32,
     pin_retry: Option<Instant>,
@@ -53,6 +56,7 @@ pub struct Agent {
     stop: Arc<Notify>,
     lock_requested: Arc<Notify>,
     session_lock_requested: Arc<Notify>,
+    session_unlock_requested: Arc<Notify>,
     transitions: tokio::sync::Mutex<()>,
     tray: Option<crate::tray::Tray>,
 }
@@ -174,11 +178,13 @@ impl Agent {
         let stop = Arc::new(Notify::new());
         let lock_requested = Arc::new(Notify::new());
         let session_lock_requested = Arc::new(Notify::new());
+        let session_unlock_requested = Arc::new(Notify::new());
         let tray = crate::tray::Tray::start(
             rt.clone(),
             stop.clone(),
             lock_requested.clone(),
             session_lock_requested.clone(),
+            session_unlock_requested.clone(),
         )
         .map_err(|e| tracing::warn!(error = %e, "트레이 스레드 시작 실패"))
         .ok();
@@ -189,12 +195,18 @@ impl Agent {
                 config,
                 pin_configured,
                 locked: pin_configured,
+                lock_reason: if pin_configured {
+                    Some(Reason::Manual)
+                } else {
+                    None
+                },
                 activity_anchor: Some(Instant::now()),
                 ..State::default()
             }),
             stop,
             lock_requested,
             session_lock_requested,
+            session_unlock_requested,
             tray,
             transitions: tokio::sync::Mutex::new(()),
         })
@@ -361,7 +373,28 @@ impl Agent {
                 if st.config.security != cfg.security {
                     st.activity_anchor = Some(Instant::now());
                 }
+                let policy_disabled =
+                    st.config.security.lock_on_session_lock && !cfg.security.lock_on_session_lock;
                 st.config = cfg;
+                if policy_disabled && st.locked && st.lock_reason == Some(Reason::Session) {
+                    let to_restore = std::mem::take(&mut st.session_restore_drives);
+                    st.locked = false;
+                    st.lock_reason = None;
+                    drop(st);
+                    for id in to_restore {
+                        let a = self.rt.clone();
+                        // 드라이브 복구를 비동기 예약합니다.
+                        let id_clone = id.clone();
+                        let a_self = self;
+                        let _ = a.block_on(async { a_self.mount(&id_clone).await });
+                    }
+                    if let Some(tray) = &self.tray {
+                        tray.status(self.status());
+                        tray.notice("잠금 해제", "세션 잠금 정책 해제로 드라이브를 복구했습니다");
+                    }
+                    tracing::info!("세션 잠금 정책 해제로 드라이브를 복구했습니다");
+                    return Response::Ok;
+                }
                 tracing::info!("설정을 다시 읽었습니다");
                 Response::Ok
             }
@@ -371,36 +404,86 @@ impl Agent {
 
     async fn lock_drives(&self, reason: Reason) -> Response {
         let _guard = self.transitions.lock().await;
-        {
+        let should_drain = {
             let mut st = self.lock();
             if st.shutting_down {
                 return Response::error(ErrorCode::ShuttingDown, "에이전트가 종료 중입니다");
             }
-            if reason != Reason::Manual
-                && (!st.pin_configured
-                    || st.locked
-                    || !auto_lock::due(
-                        &st.config.security,
-                        reason,
-                        if reason == Reason::Idle {
-                            auto_lock::idle_time()
-                        } else {
-                            None
-                        },
-                        st.activity_anchor.map_or(Duration::ZERO, |at| at.elapsed()),
-                    ))
-            {
-                return Response::Ok;
+            match reason {
+                Reason::Session => {
+                    st.session_locked = true;
+                    if !st.config.security.lock_on_session_lock {
+                        return Response::Ok;
+                    }
+                    if st.locked {
+                        return Response::Ok;
+                    }
+                    st.session_restore_drives = st.mounted.keys().cloned().collect();
+                    st.locked = true;
+                    st.locking = true;
+                    st.lock_reason = Some(Reason::Session);
+                    tracing::info!(?reason, drives = ?st.session_restore_drives, "Windows 세션 잠금으로 드라이브 잠금 시작");
+                    true
+                }
+                Reason::Manual => {
+                    if !st.pin_configured {
+                        return Response::error(
+                            ErrorCode::Config,
+                            "설정에서 잠금 PIN을 먼저 등록하세요",
+                        );
+                    }
+                    if st.locked && st.lock_reason == Some(Reason::Manual) {
+                        return Response::Ok;
+                    }
+                    st.session_restore_drives.clear();
+                    st.locked = true;
+                    st.locking = true;
+                    st.lock_reason = Some(Reason::Manual);
+                    tracing::info!(?reason, "수동 PIN 잠금 시작");
+                    true
+                }
+                Reason::Idle => {
+                    if !st.pin_configured
+                        || st.locked
+                        || !auto_lock::due(
+                            &st.config.security,
+                            reason,
+                            auto_lock::idle_time(),
+                            st.activity_anchor.map_or(Duration::ZERO, |at| at.elapsed()),
+                        )
+                    {
+                        return Response::Ok;
+                    }
+                    st.session_restore_drives.clear();
+                    st.locked = true;
+                    st.locking = true;
+                    st.lock_reason = Some(Reason::Idle);
+                    tracing::info!(?reason, "유휴 시간 초과로 자동 잠금 시작");
+                    true
+                }
             }
-            if !st.pin_configured {
-                return Response::error(ErrorCode::Config, "설정에서 잠금 PIN을 먼저 등록하세요");
-            }
-            st.locked = true;
-            st.locking = true;
-            tracing::info!(?reason, "드라이브 잠금 시작");
+        };
+
+        if !should_drain {
+            return Response::Ok;
         }
+
         let errors = self.drain_all().await;
-        self.lock().locking = false;
+
+        let needs_restore = {
+            let mut st = self.lock();
+            st.locking = false;
+            reason == Reason::Session
+                && !st.session_locked
+                && st.locked
+                && st.lock_reason == Some(Reason::Session)
+        };
+
+        if needs_restore {
+            tracing::info!("잠금 처리 중 세션 해제 이벤트가 감지되어 즉시 복구합니다");
+            self.unlock_session().await;
+        }
+
         if errors.is_empty() {
             Response::Ok
         } else {
@@ -411,6 +494,37 @@ impl Agent {
                     errors.join("; ")
                 ),
             )
+        }
+    }
+
+    async fn unlock_session(&self) {
+        let _guard = self.transitions.lock().await;
+        let to_restore = {
+            let mut st = self.lock();
+            st.session_locked = false;
+            if st.locking {
+                return;
+            }
+            if !st.locked || st.lock_reason != Some(Reason::Session) {
+                // 수동 또는 유휴 잠금 상태는 Windows 세션 해제 이벤트로 임의 해제하지 않습니다.
+                return;
+            }
+            st.locked = false;
+            st.lock_reason = None;
+            st.activity_anchor = Some(Instant::now());
+            std::mem::take(&mut st.session_restore_drives)
+        };
+
+        tracing::info!(drives = ?to_restore, "Windows 세션 잠금 해제에 맞춰 드라이브 복구 시작");
+        for id in &to_restore {
+            let _ = self.mount(id).await;
+        }
+        if let Some(tray) = &self.tray {
+            tray.status(self.status());
+            tray.notice(
+                "드라이브 복구",
+                "Windows 잠금 해제에 맞춰 드라이브를 복구했습니다",
+            );
         }
     }
 
@@ -460,6 +574,8 @@ impl Agent {
                     st.pin_configured = true;
                 } else {
                     st.locked = false;
+                    st.lock_reason = None;
+                    st.session_restore_drives.clear();
                 }
                 Response::Ok
             }
@@ -591,28 +707,57 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let reason = tokio::select! {
-                    _ = auto_agent.session_lock_requested.notified() => Reason::Session,
-                    _ = tick.tick() => Reason::Idle,
-                };
-                if auto_agent.lock().locked {
-                    continue;
+                enum Event {
+                    SessionLock,
+                    SessionUnlock,
+                    Idle,
                 }
-                let response = auto_agent.lock_drives(reason).await;
-                if let Some(tray) = &auto_agent.tray {
-                    let status = auto_agent.status();
-                    if status.locked {
-                        tray.status(status);
-                        match response {
-                            Response::Error { message, .. } => tray.notice("자동 잠금", &message),
-                            _ => tray.notice(
-                                "자동 잠금",
-                                if reason == Reason::Session {
-                                    "Windows 잠금에 맞춰 드라이브를 잠갔습니다"
-                                } else {
-                                    "유휴 시간이 지나 드라이브를 잠갔습니다"
-                                },
-                            ),
+                let event = tokio::select! {
+                    _ = auto_agent.session_lock_requested.notified() => Event::SessionLock,
+                    _ = auto_agent.session_unlock_requested.notified() => Event::SessionUnlock,
+                    _ = tick.tick() => Event::Idle,
+                };
+                match event {
+                    Event::SessionUnlock => {
+                        auto_agent.unlock_session().await;
+                    }
+                    Event::SessionLock => {
+                        let response = auto_agent.lock_drives(Reason::Session).await;
+                        if let Some(tray) = &auto_agent.tray {
+                            let status = auto_agent.status();
+                            if status.locked {
+                                tray.status(status);
+                                match response {
+                                    Response::Error { message, .. } => {
+                                        tray.notice("자동 잠금", &message)
+                                    }
+                                    _ => tray.notice(
+                                        "자동 잠금",
+                                        "Windows 잠금에 맞춰 드라이브를 잠갔습니다",
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    Event::Idle => {
+                        if auto_agent.lock().locked {
+                            continue;
+                        }
+                        let response = auto_agent.lock_drives(Reason::Idle).await;
+                        if let Some(tray) = &auto_agent.tray {
+                            let status = auto_agent.status();
+                            if status.locked {
+                                tray.status(status);
+                                match response {
+                                    Response::Error { message, .. } => {
+                                        tray.notice("자동 잠금", &message)
+                                    }
+                                    _ => tray.notice(
+                                        "자동 잠금",
+                                        "유휴 시간이 지나 드라이브를 잠갔습니다",
+                                    ),
+                                }
+                            }
                         }
                     }
                 }

@@ -19,6 +19,12 @@ const CALLBACK: u32 = WM_APP + 1;
 const ACTION: u32 = WM_APP + 2;
 const RESET: u32 = WM_APP + 3;
 
+#[derive(Clone)]
+pub struct SessionNotifiers {
+    pub lock: Arc<Notify>,
+    pub unlock: Arc<Notify>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateStatus {
     Idle,
@@ -64,14 +70,19 @@ impl Tray {
         rt: tokio::runtime::Handle,
         stop: Arc<Notify>,
         lock: Arc<Notify>,
-        session: Arc<Notify>,
+        session_lock: Arc<Notify>,
+        session_unlock: Arc<Notify>,
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(128);
         let tx_clone = tx.clone();
+        let notifiers = Arc::new(SessionNotifiers {
+            lock: session_lock,
+            unlock: session_unlock,
+        });
         std::thread::Builder::new()
             .name("expandrv-tray".into())
             .spawn(move || {
-                if let Err(e) = unsafe { run(rx, tx_clone, rt, stop, lock, session) } {
+                if let Err(e) = unsafe { run(rx, tx_clone, rt, stop, lock, notifiers) } {
                     tracing::warn!(error = %e, "트레이를 시작하지 못했습니다");
                 }
             })?;
@@ -157,10 +168,13 @@ fn open_gui() {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_WTSSESSION_CHANGE {
-            if wp.0 as u32 == WTS_SESSION_LOCK {
-                let notify = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Notify;
-                if let Some(notify) = notify.as_ref() {
-                    notify.notify_one();
+            let code = wp.0 as u32;
+            let notifiers = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SessionNotifiers;
+            if let Some(notifiers) = notifiers.as_ref() {
+                if code == WTS_SESSION_LOCK {
+                    notifiers.lock.notify_one();
+                } else if code == WTS_SESSION_UNLOCK {
+                    notifiers.unlock.notify_one();
                 }
             }
             return LRESULT(0);
@@ -186,7 +200,7 @@ unsafe fn run(
     rt: tokio::runtime::Handle,
     stop: Arc<Notify>,
     lock: Arc<Notify>,
-    session: Arc<Notify>,
+    notifiers: Arc<SessionNotifiers>,
 ) -> windows::core::Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -212,8 +226,8 @@ unsafe fn run(
             Some(instance.into()),
             None,
         )?;
-        // Notify의 Arc는 창 파괴까지 살아 있으므로 WindowProc의 포인터도 유효합니다.
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&session) as isize);
+        // Notifiers의 Arc는 창 파괴까지 살아 있으므로 WindowProc의 포인터도 유효합니다.
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&notifiers) as isize);
         let mut session_events = SessionNotifications {
             hwnd,
             registered: false,
@@ -258,13 +272,6 @@ unsafe fn run(
                         WM_LBUTTONDBLCLK => open_gui(),
                         WM_RBUTTONUP | WM_CONTEXTMENU => {
                             let menu = CreatePopupMenu()?;
-                            let _ = AppendMenuW(menu, MF_STRING, 1, w!("ExpanDrv 열기"));
-                            let _ = AppendMenuW(menu, MF_STRING, 3, w!("드라이브 잠금"));
-                            let _ =
-                                AppendMenuW(menu, MF_STRING, 2, w!("모든 드라이브 해제 후 종료"));
-                            let _ =
-                                AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-
                             let mut menu_text_buf = [0u16; 64];
                             let (label, enabled, item_id) =
                                 menu_item_for_update_status(&update_status);
@@ -280,6 +287,9 @@ unsafe fn run(
                                 item_id as usize,
                                 windows::core::PCWSTR(menu_text_buf.as_ptr()),
                             );
+                            let _ = AppendMenuW(menu, MF_STRING, 1, w!("열기"));
+                            let _ = AppendMenuW(menu, MF_STRING, 3, w!("잠금"));
+                            let _ = AppendMenuW(menu, MF_STRING, 2, w!("종료"));
 
                             let mut point = POINT::default();
                             let _ = GetCursorPos(&mut point);
@@ -742,29 +752,29 @@ mod tests {
     #[test]
     fn native_tray_starts_and_removes_icon_on_shutdown() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let session = Arc::new(Notify::new());
+        let session_lock = Arc::new(Notify::new());
+        let session_unlock = Arc::new(Notify::new());
         let tray = Tray::start(
             rt.handle().clone(),
             Arc::new(Notify::new()),
             Arc::new(Notify::new()),
-            session.clone(),
+            session_lock.clone(),
+            session_unlock.clone(),
         )
         .unwrap();
         tray.0
             .try_send(Update::SessionEvent(WTS_SESSION_UNLOCK))
             .unwrap();
         rt.block_on(async {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), session.notified())
-                    .await
-                    .is_err()
-            );
+            tokio::time::timeout(Duration::from_secs(2), session_unlock.notified())
+                .await
+                .unwrap();
         });
         tray.0
             .try_send(Update::SessionEvent(WTS_SESSION_LOCK))
             .unwrap();
         rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), session.notified())
+            tokio::time::timeout(Duration::from_secs(2), session_lock.notified())
                 .await
                 .unwrap();
         });

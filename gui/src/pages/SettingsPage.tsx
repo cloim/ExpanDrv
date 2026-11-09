@@ -191,8 +191,8 @@ export function SettingsPage() {
 
         <Section title="자동 잠금">
           <Switch label="Windows를 잠그면 드라이브도 잠금"
-            hint="Windows 잠금을 풀어도 ExpanDrv는 PIN으로 직접 해제합니다"
-            checked={view?.lockOnSessionLock ?? true} disabled={!view || !status?.pinConfigured || busy !== null}
+            hint="Windows 잠금 시 드라이브를 잠그고 해제 시 직전 드라이브를 자동 복구합니다 (수동 잠금은 PIN 유지)"
+            checked={view?.lockOnSessionLock ?? true} disabled={!view || busy !== null}
             onChange={(enabled) => void updateAutoLock(enabled, view?.idleLockMinutes ?? 0)} />
           <Field label="입력이 없을 때 잠금" hint="마우스와 키보드를 사용하지 않은 시간">
             {(p) => <SelectControl {...p} value={view?.idleLockMinutes ?? 0} disabled={!view || !status?.pinConfigured || busy !== null}
@@ -201,7 +201,7 @@ export function SettingsPage() {
               {view && ![0, 1, 5, 10, 15, 30, 60, 120, 240, 480, 1440].includes(view.idleLockMinutes) ? <option value={view.idleLockMinutes}>{view.idleLockMinutes}분</option> : null}
             </SelectControl>}
           </Field>
-          {!status?.pinConfigured ? <p className="text-xs text-ink-2">PIN을 먼저 등록하면 자동 잠금을 설정할 수 있습니다</p> : null}
+          {!status?.pinConfigured ? <p className="text-xs text-ink-2">PIN을 등록하면 유휴 시간 자동 잠금도 사용할 수 있습니다</p> : null}
           {busy === 'security' ? <p role="status" className="flex items-center gap-2 text-xs text-ink-2"><Loader2 size={14} className="spin" aria-hidden="true" />설정을 저장하는 중</p> : null}
         </Section>
 

@@ -285,22 +285,54 @@ fn session_lock_respects_pin_policy_and_preserves_pending_upload() {
             .await
             .unwrap();
         client.hello().await.unwrap();
+
+        // 1. PIN 미설정 상태에서도 Windows 세션 잠금 연동(lock_on_session_lock)으로 드라이브 잠금 및 복구
         send_session_event(pid, WTS_SESSION_LOCK);
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
-            panic!("status")
-        };
-        assert!(!status.locked, "PIN이 없으면 자동 잠금을 시작하지 않습니다");
-        assert_eq!(
-            client
-                .call(&Request::SetPin {
-                    current: Pin(String::new()),
-                    new: Pin("123456".into())
-                })
-                .await
-                .unwrap(),
-            Response::Ok
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+                panic!("status")
+            };
+            if status.locked && !status.locking {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PIN 미설정 세션 잠금 시간 초과"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !drive.exists(),
+            "세션 잠금으로 드라이브가 안전하게 해제되어야 합니다"
         );
+
+        // 세션 해제 시 직전 마운트 드라이브가 자동으로 복구되어야 합니다.
+        send_session_event(pid, WTS_SESSION_UNLOCK);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+                panic!("status")
+            };
+            if !status.locked
+                && status.drives.iter().any(|d| {
+                    d.id == "session-lock-test" && d.state == expandrv_ipc::DriveState::Mounted
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "세션 해제 후 드라이브 복구 시간 초과"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            drive.exists(),
+            "세션 해제로 직전 드라이브가 복구되어야 합니다"
+        );
+
+        // 2. 정책 비활성화(lock_on_session_lock = false) 시 세션 잠금 무시
         let path = env.path("config.toml");
         let mut config = Config::load(&path).unwrap();
         config.security.lock_on_session_lock = false;
@@ -311,7 +343,13 @@ fn session_lock_respects_pin_policy_and_preserves_pending_upload() {
         let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
             panic!("status")
         };
-        assert!(!status.locked);
+        assert!(
+            !status.locked,
+            "정책이 꺼져 있으면 세션 잠금을 수행하지 않습니다"
+        );
+        assert!(drive.exists());
+
+        // 3. 정책 다시 활성화 및 미완료 업로드 정상 보존 후 잠금/복구
         config.security.lock_on_session_lock = true;
         config.save(&path).unwrap();
         assert_eq!(client.call(&Request::Reload).await.unwrap(), Response::Ok);
@@ -336,15 +374,70 @@ fn session_lock_respects_pin_policy_and_preserves_pending_upload() {
             std::fs::read(root.join("pending.txt")).unwrap(),
             b"session-safe"
         );
+
+        // 세션 해제로 드라이브 복구
         send_session_event(pid, WTS_SESSION_UNLOCK);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+                panic!("status")
+            };
+            if !status.locked
+                && status.drives.iter().any(|d| {
+                    d.id == "session-lock-test" && d.state == expandrv_ipc::DriveState::Mounted
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "세션 해제 드라이브 복구 시간 초과"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 4. 수동/PIN 잠금 상태는 세션 해제(UNLOCK) 이벤트로 임의 해제되지 않음
+        assert_eq!(
+            client
+                .call(&Request::SetPin {
+                    current: Pin(String::new()),
+                    new: Pin("123456".into())
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        assert_eq!(client.call(&Request::Lock).await.unwrap(), Response::Ok);
+        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+            panic!("status")
+        };
+        assert!(status.locked, "수동 잠금 완료");
+
+        // 수동 잠금 상태에서 세션 해제 이벤트가 발생해도 잠금 유지
+        send_session_event(pid, WTS_SESSION_UNLOCK);
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
             panic!("status")
         };
         assert!(
             status.locked,
-            "Windows 잠금 해제는 PIN 잠금을 해제하지 않습니다"
+            "수동 잠금 상태는 Windows 세션 해제 이벤트로 임의 해제되지 않아야 합니다"
         );
+
+        // 올바른 PIN으로 수동 해제
+        assert_eq!(
+            client
+                .call(&Request::Unlock {
+                    pin: Pin("123456".into())
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+            panic!("status")
+        };
+        assert!(!status.locked, "PIN으로 정상 잠금 해제");
     });
     assert!(env.run(&["stop"]).ok);
 }

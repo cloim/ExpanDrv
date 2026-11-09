@@ -568,8 +568,8 @@ pub async fn set_auto_lock(
     if live.locked {
         return Err("자동 잠금 설정을 바꾸려면 먼저 PIN으로 잠금을 해제하세요".into());
     }
-    if !live.pin_configured && (session_lock || idle_minutes > 0) {
-        return Err("자동 잠금을 사용하려면 PIN을 먼저 등록하세요".into());
+    if !live.pin_configured && idle_minutes > 0 {
+        return Err("유휴 시간 자동 잠금을 사용하려면 PIN을 먼저 등록하세요".into());
     }
     state.edit(|path| {
         let mut config = Config::load(path)?;
