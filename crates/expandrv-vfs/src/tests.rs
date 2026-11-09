@@ -2,10 +2,15 @@ use super::*;
 use expandrv_backends::local::LocalBackend;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
+#[path = "performance_tests.rs"]
+mod performance;
+
 /// 지연, 오프라인, 실패와 호출 횟수를 흉내 내는 시험용 백엔드
 struct TestBackend {
     inner: LocalBackend,
     write_delay: Mutex<Duration>,
+    metadata_delay: Mutex<Duration>,
+    metadata_calls: AtomicUsize,
     offline: AtomicBool,
     fail_writes: AtomicU32,
     /// 다음 읽기 몇 번을 일시 오류로 실패시킵니다.
@@ -14,6 +19,9 @@ struct TestBackend {
     fail_reads_after: AtomicUsize,
     reads: AtomicUsize,
     writes: AtomicUsize,
+    read_delay: Mutex<Duration>,
+    started_writes: AtomicUsize,
+    connections: Semaphore,
 }
 
 impl TestBackend {
@@ -35,14 +43,25 @@ impl Backend for TestBackend {
         self.inner.capabilities()
     }
     async fn stat(&self, path: &RemotePath) -> Result<Entry> {
+        let _connection = self.connections.acquire().await.unwrap();
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+        let delay = *self.metadata_delay.lock();
+        tokio::time::sleep(delay).await;
         self.check()?;
         self.inner.stat(path).await
     }
     async fn list(&self, path: &RemotePath) -> Result<Vec<Entry>> {
+        let _connection = self.connections.acquire().await.unwrap();
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+        let delay = *self.metadata_delay.lock();
+        tokio::time::sleep(delay).await;
         self.check()?;
         self.inner.list(path).await
     }
     async fn read_range(&self, path: &RemotePath, offset: u64, len: u64) -> Result<Bytes> {
+        let _connection = self.connections.acquire().await.unwrap();
+        let delay = *self.read_delay.lock();
+        tokio::time::sleep(delay).await;
         self.check()?;
         if self
             .fail_reads
@@ -56,6 +75,8 @@ impl Backend for TestBackend {
         self.inner.read_range(path, offset, len).await
     }
     async fn write(&self, path: &RemotePath, source: WriteSource) -> Result<Entry> {
+        let _connection = self.connections.acquire().await.unwrap();
+        self.started_writes.fetch_add(1, Ordering::SeqCst);
         self.check()?;
         let delay = *self.write_delay.lock();
         tokio::time::sleep(delay).await;
@@ -100,12 +121,17 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
     let backend = Arc::new(TestBackend {
         inner: LocalBackend::new(root.path()).unwrap(),
         write_delay: Mutex::new(Duration::ZERO),
+        metadata_delay: Mutex::new(Duration::ZERO),
+        metadata_calls: AtomicUsize::new(0),
         offline: AtomicBool::new(false),
         fail_writes: AtomicU32::new(0),
         reads: AtomicUsize::new(0),
         fail_reads: AtomicU32::new(0),
         fail_reads_after: AtomicUsize::new(usize::MAX),
         writes: AtomicUsize::new(0),
+        read_delay: Mutex::new(Duration::ZERO),
+        started_writes: AtomicUsize::new(0),
+        connections: Semaphore::new(4),
     });
     let mut opts = VfsOptions::new(staging.path().join("stage"));
     opts.metadata_ttl = Duration::from_secs(60);
@@ -163,6 +189,11 @@ fn create_write_upload_after_last_cleanup() {
     );
     assert_eq!(f.vfs.pending_uploads(), 0);
     assert_eq!(staging_files(&f), 0);
+    assert_eq!(
+        f.vfs.take_transfer_events(),
+        vec![TransferEvent::Uploaded(p("/a.txt"))]
+    );
+    assert!(f.vfs.take_transfer_events().is_empty());
 }
 
 #[test]
@@ -558,6 +589,10 @@ fn recovered_upload_keeps_remote_change_and_writes_conflict_copy() {
         .collect();
     assert_eq!(copies.len(), 1, "{copies:?}");
     assert_eq!(
+        vfs.take_transfer_events(),
+        vec![TransferEvent::Conflict(p(&format!("/{}", copies[0])))]
+    );
+    assert_eq!(
         std::fs::read(f.root.path().join(&copies[0])).unwrap(),
         b"local edit"
     );
@@ -634,7 +669,8 @@ fn interrupted_staging_download_resumes_without_refetch() {
     assert!(f.vfs.write(&h, 0, b"X", false, false).is_err());
     assert_eq!(f.backend.reads.load(Ordering::SeqCst), 2);
 
-    // 연결이 돌아오면 나머지 3블록만 받아 마칩니다.
+    // 연결이 돌아오고 대기 시간이 지나면 나머지 3블록만 받아 마칩니다.
+    *f.vfs.s.offline_until.lock() = Some(Instant::now() - Duration::from_secs(1));
     f.backend
         .fail_reads_after
         .store(usize::MAX, Ordering::SeqCst);
@@ -747,4 +783,71 @@ fn offline_open_by_path_uses_saved_entry_and_disk_cache() {
     let mut again = vec![0u8; data.len()];
     assert_eq!(vfs.read(&h, 0, &mut again).unwrap(), data.len());
     assert_eq!(again, data);
+}
+
+#[test]
+fn offline_cooldown_skips_remote_and_recovers_after_deadline() {
+    let f = fixture_with(|o| {
+        o.meta_db = Some(o.staging_dir.with_file_name("meta.db"));
+        o.op_timeout = Duration::from_millis(50);
+    });
+    std::fs::write(f.root.path().join("cached.txt"), b"old").unwrap();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    f.vfs.refresh();
+    *f.backend.metadata_delay.lock() = Duration::from_secs(5);
+    let before = f.backend.metadata_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        f.vfs.list(&RemotePath::root()).unwrap()[0].name,
+        "cached.txt"
+    );
+    assert_eq!(f.backend.metadata_calls.load(Ordering::SeqCst), before + 1);
+    assert_eq!(f.vfs.stat(&p("/cached.txt")).unwrap().1.size, 3);
+    assert_eq!(f.vfs.list(&RemotePath::root()).unwrap().len(), 1);
+    assert!(matches!(
+        f.vfs.list(&p("/uncached")),
+        Err(Error::Network(_))
+    ));
+    assert_eq!(f.backend.metadata_calls.load(Ordering::SeqCst), before + 1);
+    *f.backend.metadata_delay.lock() = Duration::ZERO;
+    std::fs::write(f.root.path().join("cached.txt"), b"updated").unwrap();
+    *f.vfs.s.offline_until.lock() = Some(Instant::now() - Duration::from_secs(1));
+    assert_eq!(f.vfs.stat(&p("/cached.txt")).unwrap().1.size, 7);
+    assert!(f.vfs.s.offline_until.lock().is_none());
+}
+
+#[test]
+fn authentication_and_not_found_do_not_trigger_offline_cooldown() {
+    let f = fixture(false);
+    let result: Result<()> = f._rt.block_on(
+        f.vfs
+            .s
+            .remote_read(async { Err(Error::Auth("test".into())) }, true),
+    );
+    assert!(matches!(result, Err(Error::Auth(_))));
+    assert!(matches!(f.vfs.stat(&p("/missing")), Err(Error::NotFound)));
+    assert!(f.vfs.s.offline_until.lock().is_none());
+}
+
+#[test]
+fn shutdown_releases_backend_held_by_directory_watcher() {
+    let f = fixture(false);
+    f.vfs.list(&RemotePath::root()).unwrap();
+    *f.backend.metadata_delay.lock() = Duration::from_secs(5);
+    let before = f.backend.metadata_calls.load(Ordering::SeqCst);
+    f.vfs.start_watch(Duration::from_millis(1));
+    for _ in 0..100 {
+        if f.backend.metadata_calls.load(Ordering::SeqCst) > before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(f.backend.metadata_calls.load(Ordering::SeqCst) > before);
+    let backend = f.backend.clone();
+    f.vfs.shutdown();
+    drop(f.vfs);
+    assert_eq!(
+        Arc::strong_count(&backend),
+        2,
+        "해제 후 백그라운드 작업이 백엔드를 보관합니다"
+    );
 }

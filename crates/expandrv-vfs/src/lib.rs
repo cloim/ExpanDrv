@@ -12,6 +12,8 @@ mod block;
 mod diskcache;
 mod meta;
 mod persist;
+mod read_pattern;
+mod scheduler;
 mod throttle;
 
 pub use diskcache::{DiskCacheOptions, generate_key as generate_cache_key};
@@ -30,7 +32,7 @@ use std::io::Write;
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::Semaphore;
@@ -39,6 +41,8 @@ use tokio::task::AbortHandle;
 /// 일시 오류로 실패한 원격 읽기를 다시 시도하는 횟수와 첫 대기 시간(이후 두 배씩)
 const READ_RETRIES: u32 = 3;
 const READ_RETRY_BASE: Duration = Duration::from_millis(200);
+const OFFLINE_COOLDOWN: Duration = Duration::from_secs(30);
+const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 /// 자동 재시도 횟수. 넘으면 다음 정리나 `sync` 때 다시 시도합니다.
 const MAX_UPLOAD_RETRIES: u32 = 5;
@@ -64,6 +68,12 @@ pub struct Change {
     pub path: RemotePath,
     pub kind: ChangeKind,
     pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferEvent {
+    Uploaded(RemotePath),
+    Conflict(RemotePath),
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +104,7 @@ impl VfsOptions {
             op_timeout: Duration::from_secs(120),
             block_size: 4 << 20,
             memory_cache_bytes: 64 << 20,
-            readahead_blocks: 2,
+            readahead_blocks: 4,
             meta_db: None,
             max_parallel_uploads: 4,
             disk_cache: None,
@@ -109,6 +119,9 @@ pub struct Vfs {
 
 struct Shared {
     backend: Arc<dyn Backend>,
+    background_backend: Arc<dyn Backend>,
+    speculative_backend: Arc<dyn Backend>,
+    prefetch_slots: Arc<Semaphore>,
     rt: tokio::runtime::Handle,
     opts: VfsOptions,
     meta: MetaCache,
@@ -125,13 +138,22 @@ struct Shared {
     disk: Option<DiskCache>,
     /// 원격에서 받고 있는 블록 수
     downloads: AtomicUsize,
+    offline_until: Mutex<Option<Instant>>,
+    events: Mutex<Vec<TransferEvent>>,
+    background: Mutex<Vec<AbortHandle>>,
+}
+
+struct ActiveDownload<'a>(&'a AtomicUsize);
+impl Drop for ActiveDownload<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// 열린 파일 또는 디렉터리 핸들. 같은 경로의 핸들은 하나의 노드를 공유합니다.
 pub struct FileHandle {
     node: Arc<Node>,
-    /// 마지막 읽기 끝 위치(순차 읽기 감지)
-    last_read_end: AtomicU64,
+    read_pattern: Mutex<read_pattern::ReadPattern>,
 }
 
 struct Node {
@@ -223,6 +245,52 @@ impl Shared {
         })
     }
 
+    async fn remote_read<T>(
+        &self,
+        fut: impl Future<Output = Result<T>>,
+        cached: bool,
+    ) -> Result<T> {
+        if self
+            .offline_until
+            .lock()
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return Err(Error::Network("원격 확인 대기 중".into()));
+        }
+        let timeout = if cached {
+            self.opts.op_timeout.min(CACHE_PROBE_TIMEOUT)
+        } else {
+            self.opts.op_timeout
+        };
+        let result = tokio::time::timeout(timeout, fut)
+            .await
+            .unwrap_or(Err(Error::Timeout));
+        let mut until = self.offline_until.lock();
+        if result.as_ref().is_err_and(offline) {
+            *until = Some(Instant::now() + OFFLINE_COOLDOWN);
+        } else if result.is_ok() {
+            *until = None;
+        }
+        result
+    }
+
+    fn spawn_background(&self, work: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.background.lock();
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(self.rt.spawn(work).abort_handle());
+    }
+
+    fn event(&self, event: TransferEvent) {
+        let mut events = self.events.lock();
+        if events.len() == MAX_PENDING_CHANGES {
+            events.remove(0);
+        }
+        events.push(event);
+    }
+
     /// 메모리와 디스크 캐시에서 경로와 하위 경로의 블록을 지웁니다.
     fn drop_blocks(&self, path: &RemotePath) {
         self.blocks.invalidate(path);
@@ -232,11 +300,22 @@ impl Shared {
     }
 
     /// 일시 오류(네트워크, 시간 초과, 서버 프로토콜 오류)면 지수 백오프로 다시 읽습니다.
-    async fn read_retry(&self, path: &RemotePath, offset: u64, len: u64) -> Result<Bytes> {
+    async fn read_retry(
+        &self,
+        path: &RemotePath,
+        offset: u64,
+        len: u64,
+        speculative: bool,
+    ) -> Result<Bytes> {
+        let backend = if speculative {
+            &self.speculative_backend
+        } else {
+            &self.backend
+        };
         let mut delay = READ_RETRY_BASE;
         let mut attempt = 0;
         loop {
-            match self.backend.read_range(path, offset, len).await {
+            match backend.read_range(path, offset, len).await {
                 Err(e @ (Error::Network(_) | Error::Timeout | Error::Protocol(_)))
                     if attempt < READ_RETRIES =>
                 {
@@ -257,6 +336,7 @@ impl Shared {
         ver: &str,
         idx: u64,
         size: u64,
+        speculative: bool,
     ) -> Result<Bytes> {
         if let Some(b) = self.disk.as_ref().and_then(|d| d.get(path, ver, idx)) {
             self.blocks.put(path, ver, idx, b.clone());
@@ -265,19 +345,31 @@ impl Shared {
         let bs = self.blocks.block_size();
         let off = idx * bs;
         self.downloads.fetch_add(1, Ordering::SeqCst);
-        let r = self.read_retry(path, off, bs.min(size - off)).await;
-        self.downloads.fetch_sub(1, Ordering::SeqCst);
+        let active = ActiveDownload(&self.downloads);
+        let r = self
+            .remote_read(
+                self.read_retry(path, off, bs.min(size - off), speculative),
+                false,
+            )
+            .await;
+        drop(active);
         let b = r?;
         self.blocks.put(path, ver, idx, b.clone());
         if self.disk.is_some() {
             let (s, path, ver, data) = (self.clone(), path.clone(), ver.to_owned(), b.clone());
-            self.rt.spawn_blocking(move || {
+            let mut tasks = self.background.lock();
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(b);
+            }
+            tasks.retain(|task| !task.is_finished());
+            let task = self.rt.spawn_blocking(move || {
                 if let Some(d) = &s.disk
                     && let Err(e) = d.put(&path, &ver, idx, &data)
                 {
                     tracing::debug!(%path, idx, error = %e, "디스크 캐시 저장 실패");
                 }
             });
+            tasks.push(task.abort_handle());
         }
         Ok(b)
     }
@@ -340,34 +432,36 @@ impl Shared {
                 }
             };
             let Some((path, source, mtime, recovered_base)) = job else {
-                s.upload_done(&n, generation, None);
+                s.upload_done(&n, generation, None, None);
                 return;
             };
+            let mut conflict = None;
             let result = async {
                 // 복구 업로드인데 그사이 원격이 바뀌었으면 덮어쓰지 않고 충돌 사본으로 올립니다.
                 let mut target = path.clone();
                 let mut remote_kept = None;
                 if let Some(base) = &recovered_base
-                    && let Ok(remote) = s.backend.stat(&path).await
+                    && let Ok(remote) = s.background_backend.stat(&path).await
                     && remote.etag.as_deref() != Some(base.as_str())
                 {
                     target = conflict_path(&path, SystemTime::now())?;
                     remote_kept = Some(remote);
                 }
-                let mut e = s.backend.write(&target, source).await?;
+                let mut e = s.background_backend.write(&target, source).await?;
                 if let Some(m) = mtime.filter(|_| s.backend.capabilities().set_mtime) {
-                    s.backend.set_mtime(&target, m).await?;
+                    s.background_backend.set_mtime(&target, m).await?;
                     e.modified = Some(m);
                 }
                 if let Some(remote) = remote_kept {
                     tracing::warn!(%path, conflict = %target, "원격 파일이 바뀌어 충돌 사본으로 올렸습니다");
                     s.meta.invalidate(&target);
+                    conflict = Some(target);
                     return Ok(remote);
                 }
                 Ok(e)
             }
             .await;
-            s.upload_done(&n, generation, Some((path, result)));
+            s.upload_done(&n, generation, Some((path, result)), conflict);
         });
         st.upload = Some((generation, task.abort_handle()));
     }
@@ -377,6 +471,7 @@ impl Shared {
         node: &Arc<Node>,
         generation: u64,
         outcome: Option<(RemotePath, Result<Entry>)>,
+        conflict: Option<RemotePath>,
     ) {
         let mut st = node.state.lock();
         // 취소된 이전 작업이 늦게 끝난 경우 현재 업로드 상태를 건드리지 않습니다.
@@ -387,6 +482,10 @@ impl Shared {
         match outcome {
             Some((path, Ok(entry))) if st.generation == generation && !st.deleted => {
                 tracing::debug!(%path, size = entry.size, "업로드 완료");
+                self.event(match conflict {
+                    Some(target) => TransferEvent::Conflict(target),
+                    None => TransferEvent::Uploaded(path.clone()),
+                });
                 st.entry = entry.clone();
                 st.dirty = false;
                 st.staged = None;
@@ -433,21 +532,24 @@ impl Shared {
         let (cell, _) = self.blocks.inflight(path, idx);
         let got = self.run(async {
             Ok(cell
-                .get_or_init(|| async { self.load_block(path, ver, idx, size).await.ok() })
+                .get_or_init(|| async { self.load_block(path, ver, idx, size, false).await.ok() })
                 .await
                 .clone())
         });
         self.blocks.finish_inflight(path, idx);
+        if got.as_ref().is_err_and(offline) {
+            *self.offline_until.lock() = Some(Instant::now() + OFFLINE_COOLDOWN);
+        }
         match got? {
             Some(b) => Ok(b),
             // 공유 셀에는 오류를 담지 않으므로 직접 다시 요청해 원래 오류를 돌려줍니다.
-            None => self.run(self.load_block(path, ver, idx, size)),
+            None => self.run(self.load_block(path, ver, idx, size, false)),
         }
     }
 
-    fn prefetch(self: &Arc<Self>, path: &RemotePath, ver: &str, from: u64, size: u64) {
+    fn prefetch(self: &Arc<Self>, path: &RemotePath, ver: &str, from: u64, size: u64, window: u32) {
         let bs = self.blocks.block_size();
-        for idx in from..from + self.opts.readahead_blocks as u64 {
+        for idx in from..from + u64::from(window) {
             if idx * bs >= size || self.blocks.get(path, ver, idx).is_some() {
                 continue;
             }
@@ -455,10 +557,17 @@ impl Shared {
             if !created {
                 continue;
             }
+            let Ok(permit) = self.prefetch_slots.clone().try_acquire_owned() else {
+                self.blocks.finish_inflight(path, idx);
+                break;
+            };
             let (s, path, ver) = (self.clone(), path.clone(), ver.to_owned());
-            self.rt.spawn(async move {
-                cell.get_or_init(|| async { s.load_block(&path, &ver, idx, size).await.ok() })
-                    .await;
+            self.spawn_background(async move {
+                let _permit = permit;
+                cell.get_or_init(|| async {
+                    s.load_block(&path, &ver, idx, size, true).await.ok()
+                })
+                .await;
                 s.blocks.finish_inflight(&path, idx);
             });
         }
@@ -583,7 +692,10 @@ impl Shared {
             let Some(old) = self.meta.snapshot(&dir) else {
                 continue;
             };
-            let new = match self.backend.list(&dir).await {
+            let new = match self
+                .remote_read(self.background_backend.list(&dir), true)
+                .await
+            {
                 Ok(l) => l,
                 Err(Error::NotFound | Error::NotADirectory) => {
                     self.watched.lock().remove(&dir);
@@ -625,8 +737,12 @@ impl Vfs {
         std::fs::create_dir_all(&opts.staging_dir)?;
         let store = opts.meta_db.as_deref().map(MetaStore::open).transpose()?;
         let disk = opts.disk_cache.as_ref().map(DiskCache::open).transpose()?;
+        let [backend, background_backend, speculative_backend] = scheduler::schedule(backend);
         let s = Arc::new(Shared {
             backend,
+            background_backend,
+            speculative_backend,
+            prefetch_slots: Arc::new(Semaphore::new(2)),
             rt,
             meta: MetaCache::new(opts.metadata_ttl),
             store,
@@ -639,11 +755,14 @@ impl Vfs {
             closed: AtomicBool::new(false),
             disk,
             downloads: AtomicUsize::new(0),
+            offline_until: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            background: Mutex::new(Vec::new()),
             opts,
         });
         // 유휴 블록 정리 작업. VFS가 사라지면 멈춥니다.
         let weak = Arc::downgrade(&s);
-        s.rt.spawn(async move {
+        s.spawn_background(async move {
             let mut tick = tokio::time::interval(BLOCK_TRIM_INTERVAL);
             loop {
                 tick.tick().await;
@@ -664,11 +783,21 @@ impl Vfs {
     /// 마운트 해제 뒤 호출합니다. 진행 중 업로드를 멈추고 남은 변경분은 저널과 스테이징 파일로 남깁니다.
     pub fn shutdown(&self) {
         self.s.closed.store(true, Ordering::SeqCst);
+        let mut tasks = std::mem::take(&mut *self.s.background.lock());
         for node in self.s.nodes.lock().values() {
-            if let Some((_, h)) = node.state.lock().upload.take() {
-                h.abort();
+            if let Some((_, task)) = node.state.lock().upload.take() {
+                tasks.push(task);
             }
         }
+        for task in &tasks {
+            task.abort();
+        }
+        // 해제 완료를 알리기 전에 백그라운드 작업의 백엔드 참조를 내려놓습니다.
+        self.s.rt.block_on(async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
     }
 
     pub fn read_only(&self) -> bool {
@@ -711,7 +840,19 @@ impl Vfs {
             Lookup::Missing => return Err(Error::NotFound),
             Lookup::Unknown => {}
         }
-        match s.run(s.backend.stat(path)) {
+        let saved_dir = path.parent().and_then(|parent| {
+            s.store
+                .as_ref()
+                .and_then(|st| st.load_dir(&parent).ok().flatten())
+        });
+        let saved_entry = s
+            .store
+            .as_ref()
+            .and_then(|st| st.load_entry(path).ok().flatten());
+        match s.rt.block_on(s.remote_read(
+            s.backend.stat(path),
+            saved_dir.is_some() || saved_entry.is_some(),
+        )) {
             Ok(e) => {
                 s.meta.put_entry(path, e.clone());
                 if let Some(store) = &s.store
@@ -740,22 +881,14 @@ impl Vfs {
                 let (Some(parent), Some(name)) = (path.parent(), path.name()) else {
                     return Err(e);
                 };
-                let saved = s
-                    .store
-                    .as_ref()
-                    .and_then(|st| st.load_dir(&parent).ok().flatten());
-                match saved {
+                match saved_dir {
                     Some(list) => list
                         .into_iter()
                         .find(|x| x.name.eq_ignore_ascii_case(name))
                         .map(|x| (parent.join(&x.name).unwrap_or(path.clone()), x))
                         .ok_or(Error::NotFound),
                     // 목록을 받은 적이 없으면 단일 항목 조회 기록을 씁니다.
-                    None => match s
-                        .store
-                        .as_ref()
-                        .and_then(|st| st.load_entry(path).ok().flatten())
-                    {
+                    None => match saved_entry {
                         Some(x) => Ok((path.clone(), x)),
                         None => Err(e),
                     },
@@ -771,32 +904,35 @@ impl Vfs {
         s.watched.lock().insert(path.clone(), Instant::now());
         let list = match s.meta.dir(path) {
             Some(l) => l,
-            None => match s.run(s.backend.list(path)) {
-                Ok(l) => {
-                    if let Some(store) = &s.store
-                        && let Err(e) = store.save_dir(path, &l)
-                    {
-                        tracing::warn!(%path, error = %e, "메타 저장 실패");
+            None => {
+                let saved = s
+                    .store
+                    .as_ref()
+                    .and_then(|st| st.load_dir(path).ok().flatten());
+                match s
+                    .rt
+                    .block_on(s.remote_read(s.backend.list(path), saved.is_some()))
+                {
+                    Ok(l) => {
+                        if let Some(store) = &s.store
+                            && let Err(e) = store.save_dir(path, &l)
+                        {
+                            tracing::warn!(%path, error = %e, "메타 저장 실패");
+                        }
+                        let l = Arc::new(l);
+                        s.meta.put_dir(path, l.clone());
+                        l
                     }
-                    let l = Arc::new(l);
-                    s.meta.put_dir(path, l.clone());
-                    l
-                }
-                Err(e) if offline(&e) => {
-                    let saved = s
-                        .store
-                        .as_ref()
-                        .and_then(|st| st.load_dir(path).ok().flatten());
-                    match saved {
+                    Err(e) if offline(&e) => match saved {
                         Some(l) => {
                             tracing::warn!(%path, error = %e, "원격 응답 없음: 저장된 목록 사용");
                             Arc::new(l)
                         }
                         None => return Err(e),
-                    }
+                    },
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            },
+            }
         };
         let overlay: Vec<(String, Entry)> = {
             let nodes = s.nodes.lock();
@@ -851,7 +987,7 @@ impl Vfs {
         node.opens.fetch_add(1, Ordering::SeqCst);
         Arc::new(FileHandle {
             node,
-            last_read_end: AtomicU64::new(u64::MAX),
+            read_pattern: Mutex::new(read_pattern::ReadPattern::default()),
         })
     }
 
@@ -917,10 +1053,14 @@ impl Vfs {
             buf[at..at + n].copy_from_slice(&block[in_off..in_off + n]);
             pos += n as u64;
         }
-        let prev_end = h.last_read_end.swap(pos, Ordering::Relaxed);
-        if prev_end == offset || offset == 0 {
-            s.prefetch(&path, &ver, (pos - 1) / bs + 1, size);
-        }
+        let memory_window = (s.opts.memory_cache_bytes as u64 / bs / 2).min(16) as u32;
+        let window = h.read_pattern.lock().observe(
+            offset,
+            pos,
+            bs,
+            s.opts.readahead_blocks.min(memory_window),
+        );
+        s.prefetch(&path, &ver, (pos - 1) / bs + 1, size, window);
         Ok((pos - offset) as usize)
     }
 
@@ -1182,6 +1322,10 @@ impl Vfs {
         Ok(())
     }
 
+    pub fn take_transfer_events(&self) -> Vec<TransferEvent> {
+        std::mem::take(&mut *self.s.events.lock())
+    }
+
     /// 원격에서 받고 있는 블록 수
     pub fn active_downloads(&self) -> usize {
         self.s.downloads.load(Ordering::SeqCst)
@@ -1250,7 +1394,11 @@ impl Vfs {
         {
             return v;
         }
-        let v = self.s.run(self.s.backend.quota()).unwrap_or_default();
+        let v = self
+            .s
+            .rt
+            .block_on(self.s.remote_read(self.s.backend.quota(), true))
+            .unwrap_or_default();
         *q = Some((v, Instant::now()));
         v
     }
@@ -1261,7 +1409,7 @@ impl Vfs {
             return;
         }
         let weak = Arc::downgrade(&self.s);
-        self.s.rt.spawn(async move {
+        self.s.spawn_background(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(s) = weak.upgrade() else { break };

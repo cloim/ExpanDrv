@@ -1,15 +1,18 @@
 ﻿# 성능 목표 측정: 유휴 메모리, 1GB 순차 읽기 처리량, 1만 항목 디렉터리 열거
-# 사용법: pwsh -File scripts/bench.ps1 [-SizeMB 1024] [-Files 10000] [-SkipWebDav]
+# 사용법: pwsh -NoProfile -File scripts/bench.ps1 [-SizeMB 1024] [-Files 10000] [-SkipWebDav] [-Executable <비교 실행 파일>] [-ResultPath <JSON>]
 # 필요: 릴리스 빌드(target\release\expandrv.exe), WinFsp 런타임, WebDAV 측정 시 Docker
 param(
     [int]$SizeMB = 1024,
     [int]$Files = 10000,
-    [switch]$SkipWebDav
+    [switch]$SkipWebDav,
+    [string]$Executable,
+    [string]$ResultPath
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $repo = Split-Path $PSScriptRoot -Parent
-$exe = Join-Path $repo 'target\release\expandrv.exe'
+$exe = if ($Executable) { (Resolve-Path -LiteralPath $Executable).Path } else { Join-Path $repo 'target\release\expandrv.exe' }
+if (-not $ResultPath) { $ResultPath = Join-Path $repo 'target\bench-latest.json' }
 if (-not (Test-Path $exe)) { throw "릴리스 빌드가 없습니다: cargo build --release -p expandrv-agent" }
 
 $work = Join-Path $env:TEMP ('expandrv-bench-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -18,6 +21,7 @@ $container = 'expandrv-bench-webdav'
 $results = [ordered]@{}
 $mountProc = $null
 $savedLocalAppData = $env:LOCALAPPDATA
+$savedPipe = $env:EXPANDRV_PIPE
 
 function Read-Throughput([string]$path) {
     $buf = New-Object byte[] (1MB)
@@ -52,6 +56,7 @@ function Free-Letters([int]$n) {
 try {
     New-Item -ItemType Directory -Force "$work\big", "$work\many", "$work\small", "$work\localappdata" | Out-Null
     $env:LOCALAPPDATA = "$work\localappdata"
+    $env:EXPANDRV_PIPE = '\\.\pipe\expandrv-bench-' + [guid]::NewGuid().ToString('N')
 
     Write-Host "==> 준비: ${SizeMB}MB 파일, 항목 ${Files}개"
     $chunk = New-Object byte[] (4MB); (New-Object Random 42).NextBytes($chunk)
@@ -79,9 +84,25 @@ try {
         & $exe --config $cfg add davdrv $mThird webdav 'http://127.0.0.1:18095/' | Out-Null
     }
 
-    Write-Host '==> 마운트'
-    $mountProc = Start-Process -FilePath $exe -ArgumentList @('--config', $cfg, 'mount') -PassThru -NoNewWindow `
-        -RedirectStandardOutput "$work\mount.out" -RedirectStandardError "$work\mount.err"
+    # 실제 사용자 캐시 키를 만들지 않도록 격리된 측정에서는 디스크 캐시를 끕니다.
+    $configText = [IO.File]::ReadAllText($cfg).Replace('disk_limit_mib = 1024', 'disk_limit_mib = 0')
+    [IO.File]::WriteAllText($cfg, $configText, [Text.UTF8Encoding]::new($false))
+    Write-Host '==> 격리된 에이전트와 마운트'
+    $helper = Join-Path $PSScriptRoot 'bench-agent.ps1'
+    $commandLine = 'pwsh.exe -NoProfile -File "{0}" -Executable "{1}" -Config "{2}" -DataDir "{3}\localappdata" -Pipe "{4}" -LogDir "{3}"' -f $helper, $exe, $cfg, $work, $env:EXPANDRV_PIPE
+    $launch = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine; CurrentDirectory = $repo }
+    if ($launch.ReturnValue -ne 0) { throw "에이전트 시작 실패: $($launch.ReturnValue)" }
+    $ready = $false
+    for ($i = 0; $i -lt 100; $i++) {
+        if ([IO.Directory]::GetFiles('\\.\pipe\') -contains $env:EXPANDRV_PIPE) { $ready = $true; break }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $ready) { throw '측정 에이전트 IPC 준비 시간을 초과했습니다' }
+    & $exe --config $cfg mount | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw '측정 드라이브 마운트 실패' }
+    $agent = Get-CimInstance Win32_Process -Filter "Name='expandrv.exe'" | Where-Object { $_.CommandLine.Contains($cfg) -and $_.CommandLine.Contains($env:EXPANDRV_PIPE) -and $_.CommandLine -match '\sagent(\s|$)' } | Select-Object -First 1
+    if (-not $agent) { throw '측정 에이전트 프로세스를 찾지 못했습니다' }
+    $mountProc = Get-Process -Id $agent.ProcessId
     foreach ($m in $mBig, $mMany, $mThird) {
         for ($i = 0; $i -lt 100 -and -not (Test-Path "$m\"); $i++) { Start-Sleep -Milliseconds 100 }
         if (-not (Test-Path "$m\")) { throw "$m 마운트 실패: $(Get-Content -Raw "$work\mount.err")" }
@@ -128,15 +149,23 @@ try {
     $results['부하 후 40초 유휴 메모리'] = "$($rest.WorkingSet) MB (전용 $($rest.Private) MB)"
 }
 finally {
+    if ($launch -and $launch.ReturnValue -eq 0 -and -not $mountProc) {
+        & $exe --config $cfg stop 2>$null | Out-Null
+    }
     if ($mountProc -and -not $mountProc.HasExited) {
-        foreach ($id in 'bigdrv', 'manydrv', 'davdrv', 'smalldrv') { & $exe --config $cfg unmount $id 2>$null | Out-Null }
-        if (-not $mountProc.WaitForExit(30000)) { Stop-Process -Id $mountProc.Id -Force }
+        & $exe --config $cfg stop 2>$null | Out-Null
+        if (-not $mountProc.WaitForExit(30000)) { throw "측정 에이전트 종료를 확인하세요: PID $($mountProc.Id), $work" }
     }
     if (-not $SkipWebDav) { docker stop $container 2>$null | Out-Null }
     $env:LOCALAPPDATA = $savedLocalAppData
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    $env:EXPANDRV_PIPE = $savedPipe
+    $resolvedWork = [IO.Path]::GetFullPath($work)
+    $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+    if (-not $resolvedWork.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $resolvedWork -Leaf) -notlike 'expandrv-bench-*') { throw '측정 임시 경로 확인 실패' }
+    Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ''
 Write-Host '==> 결과'
 $results.GetEnumerator() | ForEach-Object { '{0,-36} {1}' -f $_.Key, $_.Value }
+$results | ConvertTo-Json | Set-Content -LiteralPath $ResultPath -Encoding utf8
