@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="ExpanDrvDeployment" Guid="B7F6D785-7FAF-490E-9B7E-747B34577111" Win64="yes">
+        <RegistryValue Root="HKLM" Key="Software\ExpanDrv\Deployment" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <Property Id="EXPANDRV_WINFSP32">
+      <RegistrySearch Id="ExpanDrvWinFsp32" Root="HKLM" Key="Software\WinFsp" Name="InstallDir" Type="directory" Win64="no">
+        <DirectorySearch Id="ExpanDrvWinFspBin32" Path="bin">
+          <FileSearch Id="ExpanDrvWinFspDll32" Name="winfsp-x64.dll" MinVersion="2.1.0.0" />
+        </DirectorySearch>
+      </RegistrySearch>
+    </Property>
+    <Property Id="EXPANDRV_WINFSP64">
+      <RegistrySearch Id="ExpanDrvWinFsp64" Root="HKLM" Key="Software\WinFsp" Name="InstallDir" Type="directory" Win64="yes">
+        <DirectorySearch Id="ExpanDrvWinFspBin64" Path="bin">
+          <FileSearch Id="ExpanDrvWinFspDll64" Name="winfsp-x64.dll" MinVersion="2.1.0.0" />
+        </DirectorySearch>
+      </RegistrySearch>
+    </Property>
+    <Condition Message="WinFsp 2.1 or later is required. Install WinFsp first or use the ExpanDrv setup EXE.">Installed OR EXPANDRV_WINFSP32 OR EXPANDRV_WINFSP64</Condition>
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <CustomAction Id="ExpanDrvStopAgent" Directory="INSTALLDIR" ExeCommand="&quot;[INSTALLDIR]expandrv.exe&quot; stop" Execute="immediate" Return="check" />
+    <CustomAction Id="ExpanDrvDisableShell" Directory="INSTALLDIR" ExeCommand="&quot;[INSTALLDIR]expandrv.exe&quot; shell disable-local" Execute="immediate" Return="check" />
+    <CustomAction Id="ExpanDrvDisableAutostart" Directory="INSTALLDIR" ExeCommand="&quot;[INSTALLDIR]expandrv.exe&quot; autostart disable" Execute="immediate" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="ExpanDrvStopAgent" Before="InstallValidate">Installed</Custom>
+      <Custom Action="ExpanDrvDisableShell" After="ExpanDrvStopAgent">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="ExpanDrvDisableAutostart" After="ExpanDrvDisableShell">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

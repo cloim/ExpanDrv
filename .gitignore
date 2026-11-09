@@ -57,3 +57,7 @@ docs/
 
 # 에이전트 작업 트리
 .claude/worktrees/
+
+# 설치 패키지와 고정 검증한 외부 원본
+/release/
+/gui/src-tauri/installer/deps/

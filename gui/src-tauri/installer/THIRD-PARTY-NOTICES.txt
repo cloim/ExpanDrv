@@ -1,0 +1,18 @@
+ExpanDrv
+License: GPL-3.0-only. See the included LICENSE or LICENSE.txt file.
+
+WinFsp 2.1.25156
+Copyright (C) Bill Zissimopoulos.
+License: GPLv3 with the project's FLOSS exception. See WinFsp-LICENSE.txt.
+The setup EXE embeds the original, unmodified WinFsp MSI release.
+Release and corresponding source:
+https://github.com/winfsp/winfsp/releases/tag/v2.1
+https://github.com/winfsp/winfsp/tree/v2.1
+
+Microsoft Edge WebView2 Runtime
+Provided by Microsoft under its own license. The installer embeds Microsoft's
+bootstrapper, which downloads the runtime if it is not already installed.
+https://developer.microsoft.com/microsoft-edge/webview2/
+
+The WinFsp runtime is shared by multiple applications. ExpanDrv's uninstaller
+preserves WinFsp, user configuration, credentials, cache and pending uploads.

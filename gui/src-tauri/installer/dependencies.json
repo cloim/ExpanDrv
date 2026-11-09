@@ -1,0 +1,8 @@
+{
+  "winfsp": {
+    "version": "2.1.25156",
+    "url": "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi",
+    "sha256": "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A",
+    "licenseUrl": "https://raw.githubusercontent.com/winfsp/winfsp/v2.1/License.txt"
+  }
+}
