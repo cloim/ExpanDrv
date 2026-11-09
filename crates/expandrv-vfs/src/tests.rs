@@ -18,6 +18,14 @@ struct TestBackend {
     /// 성공한 읽기가 이 횟수에 이르면 이후 읽기를 모두 일시 오류로 실패시킵니다.
     fail_reads_after: AtomicUsize,
     reads: AtomicUsize,
+    /// 성공한 읽기로 받은 바이트 합계
+    read_bytes: AtomicUsize,
+    /// 연속 전송 백엔드처럼 동작합니다.
+    sequential: AtomicBool,
+    /// 읽기 요청 위치 순서와 동시에 진행된 읽기 수
+    read_offsets: Mutex<Vec<u64>>,
+    reading: AtomicUsize,
+    max_reading: AtomicUsize,
     writes: AtomicUsize,
     read_delay: Mutex<Duration>,
     started_writes: AtomicUsize,
@@ -40,7 +48,10 @@ impl Backend for TestBackend {
         "test"
     }
     fn capabilities(&self) -> expandrv_core::Capabilities {
-        self.inner.capabilities()
+        expandrv_core::Capabilities {
+            sequential_transfer: self.sequential.load(Ordering::SeqCst),
+            ..self.inner.capabilities()
+        }
     }
     async fn stat(&self, path: &RemotePath) -> Result<Entry> {
         let _connection = self.connections.acquire().await.unwrap();
@@ -60,6 +71,16 @@ impl Backend for TestBackend {
     }
     async fn read_range(&self, path: &RemotePath, offset: u64, len: u64) -> Result<Bytes> {
         let _connection = self.connections.acquire().await.unwrap();
+        self.read_offsets.lock().push(offset);
+        let now = self.reading.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_reading.fetch_max(now, Ordering::SeqCst);
+        struct Done<'a>(&'a AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _done = Done(&self.reading);
         let delay = *self.read_delay.lock();
         tokio::time::sleep(delay).await;
         self.check()?;
@@ -72,6 +93,7 @@ impl Backend for TestBackend {
             return Err(Error::Network("injected read".into()));
         }
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.read_bytes.fetch_add(len as usize, Ordering::SeqCst);
         self.inner.read_range(path, offset, len).await
     }
     async fn write(&self, path: &RemotePath, source: WriteSource) -> Result<Entry> {
@@ -126,6 +148,11 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
         offline: AtomicBool::new(false),
         fail_writes: AtomicU32::new(0),
         reads: AtomicUsize::new(0),
+        read_bytes: AtomicUsize::new(0),
+        sequential: AtomicBool::new(false),
+        read_offsets: Mutex::new(Vec::new()),
+        reading: AtomicUsize::new(0),
+        max_reading: AtomicUsize::new(0),
         fail_reads: AtomicU32::new(0),
         fail_reads_after: AtomicUsize::new(usize::MAX),
         writes: AtomicUsize::new(0),

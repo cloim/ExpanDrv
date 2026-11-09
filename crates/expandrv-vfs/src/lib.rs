@@ -54,6 +54,16 @@ const MAX_PENDING_CHANGES: usize = 10_000;
 /// 이 시간 동안 쓰지 않은 읽기 블록은 메모리에서 비웁니다.
 const BLOCK_IDLE: Duration = Duration::from_secs(20);
 const BLOCK_TRIM_INTERVAL: Duration = Duration::from_secs(10);
+/// 탐색기 미리보기와 속성 처리기처럼 짧게 여기저기 읽는 요청은 블록 전체 대신 이 크기만 받습니다.
+const PROBE_CHUNK: u64 = 256 * 1024;
+/// 이 크기 이하의 단일 읽기만 조각 읽기 대상입니다.
+const PROBE_MAX_READ: usize = 128 * 1024;
+/// 연속 읽기가 이만큼 쌓이면 일반 블록 읽기와 선행 읽기로 전환합니다.
+const PROBE_ESCALATE: u64 = 1 << 20;
+/// 파일 끝에서 이 거리 안의 조각 읽기는 파일 끝까지 받습니다.
+const PROBE_TAIL: u64 = 1 << 20;
+/// 조각 캐시 메모리 상한
+const PROBE_CACHE_MAX: usize = 16 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
@@ -127,6 +137,8 @@ struct Shared {
     meta: MetaCache,
     store: Option<MetaStore>,
     blocks: BlockCache,
+    /// 짧은 임의 읽기용 [`PROBE_CHUNK`] 조각 캐시(메모리 전용)
+    probes: BlockCache,
     nodes: Mutex<HashMap<RemotePath, Arc<Node>>>,
     quota: Mutex<Option<(Quota, Instant)>>,
     uploads: Semaphore,
@@ -138,9 +150,19 @@ struct Shared {
     disk: Option<DiskCache>,
     /// 원격에서 받고 있는 블록 수
     downloads: AtomicUsize,
+    /// 연속 전송 백엔드에서 파일별로 하나씩 도는 순차 선행 읽기 범위
+    seq_prefetch: Mutex<HashMap<RemotePath, SeqPrefetch>>,
     offline_until: Mutex<Option<Instant>>,
     events: Mutex<Vec<TransferEvent>>,
     background: Mutex<Vec<AbortHandle>>,
+}
+
+/// 순차 선행 읽기가 받을 블록 범위. 작업이 도는 동안 읽기가 진행되면 `end`를 늘립니다.
+#[derive(Clone, Copy)]
+struct SeqPrefetch {
+    /// 이 블록보다 앞은 건너뜁니다. 멀리 탐색하면 앞으로 옮깁니다.
+    next: u64,
+    end: u64,
 }
 
 struct ActiveDownload<'a>(&'a AtomicUsize);
@@ -294,6 +316,7 @@ impl Shared {
     /// 메모리와 디스크 캐시에서 경로와 하위 경로의 블록을 지웁니다.
     fn drop_blocks(&self, path: &RemotePath) {
         self.blocks.invalidate(path);
+        self.probes.invalidate(path);
         if let Some(d) = &self.disk {
             d.invalidate(path);
         }
@@ -556,7 +579,75 @@ impl Shared {
         }
     }
 
+    /// 메모리나 디스크에 이미 있는 블록만 돌려줍니다. 원격에는 요청하지 않습니다.
+    fn cached_block(&self, path: &RemotePath, ver: &str, idx: u64) -> Option<Bytes> {
+        if let Some(b) = self.blocks.get(path, ver, idx) {
+            return Some(b);
+        }
+        let b = self.disk.as_ref()?.get(path, ver, idx)?;
+        self.blocks.put(path, ver, idx, b.clone());
+        Some(b)
+    }
+
+    /// `pos`를 포함한 데이터와 그 시작 위치를 돌려줍니다.
+    /// 블록이 캐시에 없으면 블록 전체 대신 [`PROBE_CHUNK`] 조각만 받습니다.
+    fn fetch_probe(
+        self: &Arc<Self>,
+        path: &RemotePath,
+        ver: &str,
+        pos: u64,
+        size: u64,
+    ) -> Result<(Bytes, u64)> {
+        let bs = self.blocks.block_size();
+        let idx = pos / bs;
+        if let Some(b) = self.cached_block(path, ver, idx) {
+            return Ok((b, idx * bs));
+        }
+        let chunk = pos / PROBE_CHUNK;
+        let start = chunk * PROBE_CHUNK;
+        if let Some(b) = self.probes.get(path, ver, chunk) {
+            return Ok((b, start));
+        }
+        let load = || async {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveDownload(&self.downloads);
+            // 파일 끝 근처는 끝까지 받습니다. 전송이 중간에 끊기지 않아 연결을 다시 쓸 수 있고,
+            // 끝부분을 여러 번 읽는 PDF와 MP4 처리기도 한 번에 끝납니다.
+            let len = match size - start {
+                rest if rest <= PROBE_TAIL => rest,
+                rest => PROBE_CHUNK.min(rest),
+            };
+            let all = self
+                .remote_read(self.read_retry(path, start, len, false), false)
+                .await?;
+            let mut first = None;
+            for (i, at) in (0..all.len()).step_by(PROBE_CHUNK as usize).enumerate() {
+                let end = (at + PROBE_CHUNK as usize).min(all.len());
+                let piece = all.slice(at..end);
+                self.probes.put(path, ver, chunk + i as u64, piece.clone());
+                first.get_or_insert(piece);
+            }
+            Ok::<_, Error>(first.unwrap_or_default())
+        };
+        // 탐색기와 백신이 같은 머리 부분을 동시에 읽어도 한 번만 받습니다.
+        let (cell, _) = self.probes.inflight(path, chunk);
+        let got = self.run(async {
+            Ok(cell
+                .get_or_init(|| async { load().await.ok() })
+                .await
+                .clone())
+        });
+        self.probes.finish_inflight(path, chunk);
+        match got? {
+            Some(b) => Ok((b, start)),
+            None => Ok((self.run(load())?, start)),
+        }
+    }
+
     fn prefetch(self: &Arc<Self>, path: &RemotePath, ver: &str, from: u64, size: u64, window: u32) {
+        if self.backend.capabilities().sequential_transfer {
+            return self.prefetch_sequential(path, ver, from, size, window);
+        }
         let bs = self.blocks.block_size();
         for idx in from..from + u64::from(window) {
             if idx * bs >= size || self.blocks.get(path, ver, idx).is_some() {
@@ -580,6 +671,75 @@ impl Shared {
                 s.blocks.finish_inflight(&path, idx);
             });
         }
+    }
+
+    /// 연속 전송 백엔드용 선행 읽기. 블록을 동시에 요청하면 전송마다 연결을 새로 열고 끊으므로
+    /// 파일마다 작업 하나가 블록을 순서대로 받아 백엔드가 같은 전송을 이어 받게 합니다.
+    fn prefetch_sequential(
+        self: &Arc<Self>,
+        path: &RemotePath,
+        ver: &str,
+        from: u64,
+        size: u64,
+        window: u32,
+    ) {
+        let bs = self.blocks.block_size();
+        let end = (from + u64::from(window)).min(size.div_ceil(bs));
+        if from >= end {
+            return;
+        }
+        {
+            let mut running = self.seq_prefetch.lock();
+            if let Some(r) = running.get_mut(path) {
+                // 이미 도는 작업이 범위를 넓혀 이어 받습니다. 멀리 건너뛰면 그 위치부터 받습니다.
+                if from > r.end {
+                    r.next = from;
+                }
+                r.end = r.end.max(end);
+                return;
+            }
+            running.insert(path.clone(), SeqPrefetch { next: from, end });
+        }
+        let Ok(permit) = self.prefetch_slots.clone().try_acquire_owned() else {
+            self.seq_prefetch.lock().remove(path);
+            return;
+        };
+        let (s, path, ver) = (self.clone(), path.clone(), ver.to_owned());
+        self.spawn_background(async move {
+            let _permit = permit;
+            let mut idx = from;
+            loop {
+                {
+                    let mut running = s.seq_prefetch.lock();
+                    let Some(r) = running.get(&path).copied() else {
+                        break;
+                    };
+                    idx = idx.max(r.next);
+                    if idx >= r.end {
+                        running.remove(&path);
+                        break;
+                    }
+                }
+                if s.blocks.get(&path, &ver, idx).is_none() {
+                    let (cell, created) = s.blocks.inflight(&path, idx);
+                    if created {
+                        let got = cell
+                            .get_or_init(|| async {
+                                s.load_block(&path, &ver, idx, size, true).await.ok()
+                            })
+                            .await
+                            .is_some();
+                        s.blocks.finish_inflight(&path, idx);
+                        if !got {
+                            // 파일을 닫았거나 연결 여유가 없으면 멈춥니다. 다음 읽기가 다시 시작합니다.
+                            s.seq_prefetch.lock().remove(&path);
+                            break;
+                        }
+                    }
+                }
+                idx += 1;
+            }
+        });
     }
 }
 
@@ -756,6 +916,10 @@ impl Vfs {
             meta: MetaCache::new(opts.metadata_ttl),
             store,
             blocks: BlockCache::new(opts.block_size, opts.memory_cache_bytes),
+            probes: BlockCache::new(
+                PROBE_CHUNK,
+                (opts.memory_cache_bytes / 4).min(PROBE_CACHE_MAX),
+            ),
             nodes: Mutex::new(HashMap::new()),
             quota: Mutex::new(None),
             uploads: Semaphore::new(opts.max_parallel_uploads.max(1)),
@@ -764,6 +928,7 @@ impl Vfs {
             closed: AtomicBool::new(false),
             disk,
             downloads: AtomicUsize::new(0),
+            seq_prefetch: Mutex::new(HashMap::new()),
             offline_until: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             background: Mutex::new(Vec::new()),
@@ -777,6 +942,7 @@ impl Vfs {
                 tick.tick().await;
                 let Some(s) = weak.upgrade() else { break };
                 s.blocks.trim_idle(BLOCK_IDLE);
+                s.probes.trim_idle(BLOCK_IDLE);
             }
         });
         let recovered = s.recover();
@@ -1050,10 +1216,19 @@ impl Vfs {
         let bs = s.blocks.block_size();
         let end = (offset + buf.len() as u64).min(size);
         let mut pos = offset;
+        // 짧은 머리, 꼬리 조회는 4MiB 블록 대신 작은 조각만 받아 미리보기와 속성 표시를 빠르게 합니다.
+        let probe = bs >= 2 * PROBE_CHUNK
+            && buf.len() <= PROBE_MAX_READ
+            && h.read_pattern.lock().continued(offset) + buf.len() as u64 <= PROBE_ESCALATE;
+        tracing::trace!(%path, offset, len = buf.len(), probe, "읽기 요청");
         while pos < end {
-            let idx = pos / bs;
-            let block = s.fetch_block(&path, &ver, idx, size)?;
-            let in_off = (pos - idx * bs) as usize;
+            let (block, base) = if probe {
+                s.fetch_probe(&path, &ver, pos, size)?
+            } else {
+                let idx = pos / bs;
+                (s.fetch_block(&path, &ver, idx, size)?, idx * bs)
+            };
+            let in_off = (pos - base) as usize;
             if in_off >= block.len() {
                 break;
             }

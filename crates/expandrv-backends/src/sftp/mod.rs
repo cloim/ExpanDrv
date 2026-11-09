@@ -186,6 +186,7 @@ impl Backend for SftpBackend {
             set_mtime: true,
             rename_dir: true,
             case_sensitive: true,
+            sequential_transfer: true,
         }
     }
 

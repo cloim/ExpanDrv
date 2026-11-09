@@ -441,6 +441,7 @@ impl Backend for S3Backend {
             set_mtime: false,
             rename_dir: false,
             case_sensitive: true,
+            sequential_transfer: false,
         }
     }
 

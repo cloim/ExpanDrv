@@ -283,3 +283,114 @@ fn explorer_thumbnail_and_preview_patterns_avoid_redundant_fetches() {
         "예열된 캐시 상태에서는 추가적인 백엔드 네트워크 요청 없이 즉시 반환됩니다"
     );
 }
+
+#[test]
+fn small_random_reads_fetch_probe_chunks_instead_of_whole_blocks() {
+    let f = fixture_with(|o| {
+        o.block_size = 4 << 20;
+        o.readahead_blocks = 0;
+    });
+    let size = 10usize << 20;
+    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    std::fs::write(f.root.path().join("movie.mp4"), &data).unwrap();
+    let h = f.vfs.open(&p("/movie.mp4")).unwrap();
+    let chunk = PROBE_CHUNK as usize;
+
+    // 머리 16KiB는 조각 하나, 꼬리 64KiB는 끝까지 이어지는 조각 하나만 받습니다.
+    let mut head = vec![0u8; 16 * 1024];
+    assert_eq!(f.vfs.read(&h, 0, &mut head).unwrap(), head.len());
+    assert_eq!(head, data[..head.len()]);
+    let tail_at = (size - 64 * 1024) as u64;
+    let mut tail = vec![0u8; 64 * 1024];
+    assert_eq!(f.vfs.read(&h, tail_at, &mut tail).unwrap(), tail.len());
+    assert_eq!(tail, data[size - 64 * 1024..]);
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(f.backend.read_bytes.load(Ordering::SeqCst), 2 * chunk);
+
+    // 파일 끝 1MiB 안의 조회는 끝까지 한 번에 받아 이후 꼬리 조회는 다시 받지 않습니다.
+    let near_end = (size - 900 * 1024) as u64;
+    let mut piece = vec![0u8; 4096];
+    assert_eq!(f.vfs.read(&h, near_end, &mut piece).unwrap(), piece.len());
+    assert_eq!(piece, data[near_end as usize..near_end as usize + 4096]);
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), 3);
+    let mid_tail = (size - 300 * 1024) as u64;
+    assert_eq!(f.vfs.read(&h, mid_tail, &mut piece).unwrap(), piece.len());
+    assert_eq!(piece, data[mid_tail as usize..mid_tail as usize + 4096]);
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), 3);
+    let reads_before_cross = f.backend.reads.load(Ordering::SeqCst);
+
+    // 같은 조각 안의 다른 위치는 다시 받지 않습니다.
+    let mut again = vec![0u8; 4096];
+    assert_eq!(f.vfs.read(&h, 100_000, &mut again).unwrap(), again.len());
+    assert_eq!(again, data[100_000..104_096]);
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), reads_before_cross);
+
+    // 조각 경계에 걸친 읽기는 이어지는 조각을 하나 더 받습니다.
+    let at = PROBE_CHUNK - 1000;
+    let mut cross = vec![0u8; 8192];
+    assert_eq!(f.vfs.read(&h, at, &mut cross).unwrap(), cross.len());
+    assert_eq!(cross, data[at as usize..at as usize + 8192]);
+    assert_eq!(
+        f.backend.reads.load(Ordering::SeqCst),
+        reads_before_cross + 1
+    );
+
+    // 연속 읽기가 1MiB를 넘으면 일반 블록 읽기로 전환하고, 이후 짧은 읽기도 그 블록을 씁니다.
+    let mut pos = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    while pos < (2 << 20) {
+        let n = f.vfs.read(&h, pos, &mut buf).unwrap();
+        assert_eq!(buf[..n], data[pos as usize..pos as usize + n]);
+        pos += n as u64;
+    }
+    let bytes = f.backend.read_bytes.load(Ordering::SeqCst);
+    assert!(bytes >= 4 << 20, "첫 블록 전체를 받았습니다: {bytes}");
+    let reads = f.backend.reads.load(Ordering::SeqCst);
+    assert_eq!(f.vfs.read(&h, 3 << 20, &mut again).unwrap(), again.len());
+    assert_eq!(f.backend.reads.load(Ordering::SeqCst), reads);
+}
+
+#[test]
+fn sequential_transfer_backends_prefetch_blocks_in_order() {
+    let f = fixture_with(|o| {
+        o.block_size = 64 * 1024;
+        o.readahead_blocks = 4;
+    });
+    f.backend.sequential.store(true, Ordering::SeqCst);
+    *f.backend.read_delay.lock() = Duration::from_millis(15);
+    let data: Vec<u8> = (0..(40 * 64 * 1024)).map(|i| (i % 249) as u8).collect();
+    std::fs::write(f.root.path().join("doc.pdf"), &data).unwrap();
+    let h = f.vfs.open(&p("/doc.pdf")).unwrap();
+    // PowerToys PDF 썸네일처럼 처음부터 끝까지 큰 단위로 이어 읽습니다.
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.vfs.read(&h, out.len() as u64, &mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(out, data);
+    finish_prefetch(&f);
+    let offsets = f.backend.read_offsets.lock().clone();
+    let mut unique = offsets.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        offsets.len(),
+        "블록마다 한 번만 받습니다: {offsets:?}"
+    );
+    assert_eq!(offsets.len(), 40);
+    assert!(
+        f.backend.max_reading.load(Ordering::SeqCst) <= 2,
+        "선행 읽기는 한 번에 하나씩: 최대 {}",
+        f.backend.max_reading.load(Ordering::SeqCst)
+    );
+    let behind = offsets.windows(2).filter(|w| w[1] < w[0]).count();
+    assert!(
+        behind <= 1,
+        "요청 순서가 거의 오름차순이어야 합니다: {offsets:?}"
+    );
+}

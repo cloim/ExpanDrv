@@ -84,6 +84,9 @@ pub struct Capabilities {
     /// `rename`이 디렉터리를 원자적으로 옮길 수 있는지 여부
     pub rename_dir: bool,
     pub case_sensitive: bool,
+    /// 부분 읽기를 중간에 끊는 비용이 커서 연속 블록을 하나의 전송으로 이어 받는 백엔드인지 여부.
+    /// true면 VFS가 선행 읽기 블록을 동시에 요청하지 않고 순서대로 요청합니다.
+    pub sequential_transfer: bool,
 }
 
 impl Default for Capabilities {
@@ -93,6 +96,7 @@ impl Default for Capabilities {
             set_mtime: false,
             rename_dir: true,
             case_sensitive: false,
+            sequential_transfer: false,
         }
     }
 }

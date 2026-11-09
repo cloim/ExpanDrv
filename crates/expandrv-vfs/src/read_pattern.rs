@@ -6,6 +6,15 @@ pub(crate) struct ReadPattern {
 }
 
 impl ReadPattern {
+    /// `offset`이 앞 읽기에 이어지면 지금까지 연속으로 읽은 바이트 수, 아니면 0
+    pub fn continued(&self, offset: u64) -> u64 {
+        if self.end == Some(offset) {
+            self.sequential_bytes
+        } else {
+            0
+        }
+    }
+
     pub fn observe(&mut self, offset: u64, end: u64, block_size: u64, max: u32) -> u32 {
         self.sequential_bytes = if self.end == Some(offset) {
             self.sequential_bytes

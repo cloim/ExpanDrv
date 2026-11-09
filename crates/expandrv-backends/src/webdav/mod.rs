@@ -289,6 +289,7 @@ impl Backend for WebDavBackend {
             set_mtime: false,
             rename_dir: true,
             case_sensitive: true,
+            sequential_transfer: false,
         }
     }
 
