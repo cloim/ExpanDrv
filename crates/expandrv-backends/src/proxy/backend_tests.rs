@@ -141,6 +141,7 @@ async fn ftp_via(mode: ProxyMode) {
     };
     let port: u16 = port.parse().unwrap();
     let cfg = expandrv_core::config::FtpConfig {
+        pinned_cert_sha256: None,
         host: host.clone(),
         port,
         username: env("EXPANDRV_TEST_FTP_USER").unwrap_or_else(|| "u".into()),

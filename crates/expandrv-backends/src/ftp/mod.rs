@@ -132,7 +132,7 @@ impl FtpBackend {
         secrets: &dyn SecretResolver,
         proxy: Option<Arc<Proxy>>,
     ) -> Result<Self> {
-        Self::open_backend(cfg, secrets, default_tls_config()?, proxy).await
+        Self::open_backend(cfg, secrets, configured_tls(cfg)?, proxy).await
     }
 
     /// 인증서 고정 등 TLS 검증 방식을 직접 정해 연결합니다. 평문(`tls = "none"`)이면 무시합니다.
@@ -302,6 +302,20 @@ impl FtpBackend {
 
 fn transfer_budget(bytes: u64) -> Duration {
     OP_TIMEOUT + Duration::from_secs(bytes / MIN_RATE)
+}
+
+fn configured_tls(cfg: &FtpConfig) -> Result<Arc<ClientConfig>> {
+    if let Some(pin) = &cfg.pinned_cert_sha256 {
+        if cfg.tls == FtpTls::None {
+            return Err(Error::Config(
+                "인증서 지문을 사용하려면 TLS를 선택하세요".into(),
+            ));
+        }
+        return Ok(Arc::new(crate::tls::pinned_client_config(
+            crate::tls::parse_fingerprint(pin)?,
+        )?));
+    }
+    default_tls_config()
 }
 
 fn default_tls_config() -> Result<Arc<ClientConfig>> {

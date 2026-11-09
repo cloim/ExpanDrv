@@ -224,6 +224,9 @@ pub struct FtpConfig {
     pub password: Option<SecretSource>,
     #[serde(default)]
     pub tls: FtpTls,
+    /// 서버 관리자에게 확인한 리프 인증서 SHA-256 지문. 비우면 시스템 신뢰 저장소로 검증합니다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_cert_sha256: Option<String>,
     /// 서버 파일 이름 문자셋(`utf-8`, `euc-kr` 등 WHATWG 레이블)
     #[serde(default = "default_encoding")]
     pub encoding: String,

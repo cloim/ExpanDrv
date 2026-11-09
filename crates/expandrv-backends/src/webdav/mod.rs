@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 mod tests;
-mod tls;
 mod xml;
 
 use crate::proxy::Proxy;
+use crate::tls;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use expandrv_core::config::{SecretResolver, WebDavConfig};
@@ -157,7 +157,8 @@ impl WebDavBackend {
                     "pinned_cert_sha256은 https URL에서만 사용할 수 있습니다".into(),
                 ));
             }
-            let tls = tls::pinned_client_config(tls::parse_fingerprint(pin)?)?;
+            let mut tls = tls::pinned_client_config(tls::parse_fingerprint(pin)?)?;
+            tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             builder = builder.tls_backend_preconfigured(tls);
         }
         let client = builder.build().map_err(|e| {

@@ -3,6 +3,95 @@ use super::*;
 use suppaftp::Encoding as _;
 use suppaftp::types::Response;
 
+#[tokio::test]
+async fn ftps_pinning_accepts_only_confirmed_certificate() {
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+    use sha2::{Digest, Sha256};
+    use suppaftp::tokio_rustls::TlsAcceptor;
+    use tokio::net::{TcpListener, TcpStream};
+
+    // 로컬 테스트 전용 자체 서명 인증서와 키이며 실제 서버 자격 증명이 아닙니다.
+    let cert = include_bytes!("../../tests/fixtures/ftps-localhost.der");
+    let key = include_bytes!("../../tests/fixtures/ftps-localhost-key.der");
+    let pin = format!("{:x}", Sha256::digest(cert));
+    for tls in [FtpTls::Explicit, FtpTls::Implicit] {
+        for (configured_pin, expected) in [
+            (None, false),
+            (Some("00".repeat(32)), false),
+            (Some(pin.clone()), true),
+        ] {
+            let mut cfg: FtpConfig = toml_config_for_tls_test();
+            cfg.tls = tls;
+            cfg.pinned_cert_sha256 = configured_pin;
+            let client_config = configured_tls(&cfg).unwrap();
+            assert!(
+                client_config.alpn_protocols.is_empty(),
+                "FTPS에 HTTP ALPN을 보내지 않습니다"
+            );
+            let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.to_vec())],
+                PrivatePkcs8KeyDer::from(key.to_vec()).into(),
+            )
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = TlsAcceptor::from(Arc::new(server_config));
+                if let Ok(mut tls) = acceptor.accept(stream).await {
+                    let _ = tls.write_all(b"X").await;
+                }
+            });
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let stream = TcpStream::connect(addr).await.unwrap();
+                let mut stream = TlsConnector::from(client_config)
+                    .connect(ServerName::try_from("localhost").unwrap(), stream)
+                    .await?;
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await?;
+                assert_eq!(byte, [b'X']);
+                Ok::<_, std::io::Error>(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), expected, "TLS {tls:?}: {result:?}");
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+fn toml_config_for_tls_test() -> FtpConfig {
+    FtpConfig {
+        host: "localhost".into(),
+        port: 21,
+        username: "anonymous".into(),
+        password: None,
+        tls: FtpTls::Explicit,
+        pinned_cert_sha256: None,
+        encoding: "utf-8".into(),
+        root: "/".into(),
+    }
+}
+
+#[test]
+fn ftps_rejects_invalid_pin_and_plaintext_pin() {
+    let mut cfg = toml_config_for_tls_test();
+    cfg.pinned_cert_sha256 = Some("invalid".into());
+    assert!(configured_tls(&cfg).is_err());
+    cfg.pinned_cert_sha256 = Some("00".repeat(32));
+    cfg.tls = FtpTls::None;
+    assert!(configured_tls(&cfg).is_err());
+}
+
 #[test]
 fn euc_kr_names_roundtrip() {
     let cs = Charset::new("euc-kr").unwrap();

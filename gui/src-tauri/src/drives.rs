@@ -149,6 +149,8 @@ pub enum BackendInput {
         username: String,
         password: Option<Secret>,
         tls: FtpTls,
+        #[serde(default)]
+        pinned_cert_sha256: Option<String>,
         encoding: String,
         root: String,
     },
@@ -304,7 +306,7 @@ fn secret_ref(
     Ok(Some(SecretSource::Credential { target }))
 }
 
-/// WebDAV 인증서 지문을 구분자 없는 대문자 16진수 64자리로 맞춥니다.
+/// 서버 인증서 지문을 구분자 없는 대문자 16진수 64자리로 맞춥니다.
 fn normalize_pin(pin: Option<String>) -> Result<Option<String>> {
     let Some(pin) = optional("인증서 지문", pin, 200)? else {
         return Ok(None);
@@ -428,9 +430,14 @@ pub fn build_backend(
             username,
             password,
             tls,
+            pinned_cert_sha256,
             encoding,
             root,
         } => {
+            let pinned_cert_sha256 = normalize_pin(pinned_cert_sha256)?;
+            if tls == FtpTls::None && pinned_cert_sha256.is_some() {
+                return Err(bad("인증서 지문을 사용하려면 TLS를 선택하세요"));
+            }
             let encoding = required("문자셋", &encoding, 32)?;
             if !encoding
                 .chars()
@@ -444,6 +451,7 @@ pub fn build_backend(
                 username: required("사용자", &username, 256)?,
                 password: secret_ref(id, "password", password, pending)?,
                 tls,
+                pinned_cert_sha256,
                 encoding,
                 root: remote_root(&root)?,
             })
@@ -900,6 +908,10 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
                     },
                 ),
                 f("문자셋", &c.encoding),
+                f(
+                    "인증서 지문",
+                    c.pinned_cert_sha256.as_deref().unwrap_or("-"),
+                ),
                 f("원격 루트", &c.root),
             ]
         }

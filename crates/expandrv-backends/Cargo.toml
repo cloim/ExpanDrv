@@ -40,6 +40,8 @@ s3 = [
 ]
 ftp = [
     "dep:suppaftp",
+    "dep:rustls",
+    "dep:sha2",
     "dep:rustls-platform-verifier",
     "dep:encoding_rs",
     "dep:chrono",

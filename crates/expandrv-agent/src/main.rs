@@ -219,6 +219,9 @@ enum AddBackend {
         /// none, explicit, implicit
         #[arg(long, default_value = "explicit")]
         tls: String,
+        /// 서버 관리자에게 확인한 서버 인증서 SHA-256 지문(TLS 전용)
+        #[arg(long)]
+        pin_sha256: Option<String>,
         #[arg(long, default_value = "utf-8")]
         encoding: String,
         #[arg(long, default_value = "/")]
@@ -344,9 +347,11 @@ fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<Backen
             password_env,
             ask_password,
             tls,
+            pin_sha256,
             encoding,
             root,
         } => BackendConfig::Ftp(FtpConfig {
+            pinned_cert_sha256: pin_sha256,
             host,
             port,
             username: user,

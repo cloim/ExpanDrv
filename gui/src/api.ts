@@ -107,6 +107,7 @@ export type BackendInput =
       username: string;
       password: string;
       tls: 'none' | 'explicit' | 'implicit';
+      pinnedCertSha256?: string;
       encoding: string;
       root: string;
     };

@@ -42,6 +42,10 @@ pub fn connection_fields(backend: &BackendConfig) -> BTreeMap<String, String> {
             ("pathStyle", c.path_style.to_string()),
         ],
         BackendConfig::Ftp(c) => vec![
+            (
+                "pinnedCertSha256",
+                c.pinned_cert_sha256.clone().unwrap_or_default(),
+            ),
             ("host", c.host.clone()),
             ("port", c.port.to_string()),
             ("username", c.username.clone()),
@@ -156,6 +160,10 @@ pub fn edited_backend(
                 "implicit" => FtpTls::Implicit,
                 _ => return Err(bad("TLS 방식을 확인하세요")),
             };
+            c.pinned_cert_sha256 = normalize_pin(Some(v("pinnedCertSha256")))?;
+            if c.tls == FtpTls::None && c.pinned_cert_sha256.is_some() {
+                return Err(bad("인증서 지문을 사용하려면 TLS를 선택하세요"));
+            }
         }
     }
     Ok(out)

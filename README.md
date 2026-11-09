@@ -12,8 +12,10 @@
 | WebDAV | 지원 | Range 읽기, 스트리밍 업로드, 자체 서명 인증서 SHA-256 고정 |
 | SFTP | 지원 | 암호와 OpenSSH 개인키(암호문 포함), known_hosts 검증 |
 | S3 호환 | 지원 | 경로 방식과 가상 호스트 방식, 멀티파트 업로드 |
-| FTP, FTPS | 지원 | 명시적과 암묵적 TLS, 서버 문자셋 선택 |
+| FTP, FTPS | 지원 | 명시적과 암묵적 TLS, 인증서 SHA-256 고정, 서버 문자셋 선택 |
 | OneDrive, Google Drive 등 | 계획 | OAuth 2.0 PKCE |
+
+FTPS에서 `UnknownIssuer`가 표시되면 서버 인증서의 발급자를 Windows가 신뢰하지 못한 상태입니다. 드라이브 추가 또는 연결 정보 수정에서 서버 관리자에게 확인한 **인증서 SHA-256 지문**을 입력하면 해당 인증서만 허용합니다. 지문을 비우면 기존 Windows 신뢰 저장소 검증을 사용하며, 서버 인증서가 바뀌면 지문을 다시 확인해야 합니다. CLI에서는 `ftp --pin-sha256 <SHA-256 지문>`, 설정 파일에서는 FTP 백엔드의 `pinned_cert_sha256`을 사용합니다.
 
 ## 특징
 

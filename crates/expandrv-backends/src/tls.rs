@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// `AB:CD:..`, 공백 구분, 대소문자를 모두 받아 32바이트 지문으로 바꿉니다.
-pub(super) fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
+pub(crate) fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
     let hex: String = s
         .chars()
         .filter(|c| !matches!(c, ':' | ' ' | '-'))
@@ -28,13 +28,13 @@ pub(super) fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
 }
 
 #[derive(Debug)]
-pub(super) struct PinnedVerifier {
+pub(crate) struct PinnedVerifier {
     pin: [u8; 32],
     algs: WebPkiSupportedAlgorithms,
 }
 
 impl PinnedVerifier {
-    pub(super) fn new(pin: [u8; 32], provider: &CryptoProvider) -> Self {
+    pub(crate) fn new(pin: [u8; 32], provider: &CryptoProvider) -> Self {
         Self {
             pin,
             algs: provider.signature_verification_algorithms,
@@ -85,15 +85,14 @@ impl ServerCertVerifier for PinnedVerifier {
 }
 
 /// 고정 지문 검증기를 쓰는 rustls 설정. TLS 1.2 이상만 허용합니다.
-pub(super) fn pinned_client_config(pin: [u8; 32]) -> Result<ClientConfig> {
+pub(crate) fn pinned_client_config(pin: [u8; 32]) -> Result<ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedVerifier::new(pin, &provider));
-    let mut cfg = ClientConfig::builder_with_provider(provider)
+    let cfg = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| Error::Config(format!("TLS 설정 실패: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(cfg)
 }

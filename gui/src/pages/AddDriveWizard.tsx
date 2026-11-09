@@ -10,6 +10,7 @@ import type { BackendInput, BackendKind, NewDrive, ProxyInput } from '../api';
 import { useStatus } from '../status';
 import { Field, Skeleton, Switch } from '../ui/controls';
 import { useToast } from '../ui/Toast';
+import { recoveryAdvice } from '../recovery';
 
 const KINDS: { kind: BackendKind; title: string; desc: string; icon: LucideIcon }[] = [
   { kind: 'webdav', title: 'WebDAV', desc: 'Nextcloud, NAS 등 HTTPS 파일 서버', icon: Cloud },
@@ -138,6 +139,7 @@ function toBackend(kind: BackendKind, f: Form): BackendInput {
         username: f.username,
         password: f.password,
         tls: f.tls as 'none' | 'explicit' | 'implicit',
+        pinnedCertSha256: f.tls === 'none' ? '' : f.pinnedCertSha256,
         encoding: f.encoding,
         root: f.remoteRoot,
       };
@@ -367,6 +369,10 @@ export function AddDriveWizard() {
           </Field>
           {input('remoteRoot', '원격 루트', { mono: true })}
         </div>
+        {form.tls !== 'none' ? <div className="flex flex-col gap-2 break-keep">
+          {input('pinnedCertSha256', '인증서 SHA-256 지문', { hint: '선택', mono: true })}
+          <p className="text-xs leading-relaxed text-ink-2">자체 서명 인증서나 사설 인증서를 사용하면 서버 관리자에게 확인한 SHA-256 지문을 입력하세요<br />비우면 Windows의 신뢰 저장소로 검증합니다</p>
+        </div> : null}
       </>
     ),
   };
@@ -540,7 +546,7 @@ export function AddDriveWizard() {
               ) : (
                 <span className="inline-flex items-start gap-1.5 break-all text-danger">
                   <CircleAlert size={16} className="mt-0.5 flex-none" aria-hidden="true" />
-                  {test.message}
+                  <span>{/UnknownIssuer/i.test(test.message) ? <span className="mb-1 block break-keep">{recoveryAdvice(test.message).text}</span> : null}{test.message}</span>
                 </span>
               )}
             </p>

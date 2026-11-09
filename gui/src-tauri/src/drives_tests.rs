@@ -2,6 +2,47 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+#[test]
+fn ftp_certificate_pin_roundtrips_and_rejects_plaintext() {
+    let input = |tls: &str, pin: Option<&str>| -> BackendInput {
+        json(serde_json::json!({
+            "type": "ftp", "host": "ftp.example.com", "port": 21,
+            "username": "anonymous", "password": null, "tls": tls,
+            "encoding": "utf-8", "root": "/", "pinnedCertSha256": pin
+        }))
+    };
+    let mut pending = Vec::new();
+    let pin = "ab:".repeat(32);
+    let backend = build_backend("ftp", input("explicit", Some(&pin)), &mut pending).unwrap();
+    let BackendConfig::Ftp(cfg) = &backend else {
+        panic!()
+    };
+    assert_eq!(
+        cfg.pinned_cert_sha256.as_deref(),
+        Some("AB".repeat(32).as_str())
+    );
+    let mut fields = connection::connection_fields(&backend);
+    assert_eq!(fields["pinnedCertSha256"], "AB".repeat(32));
+    fields.insert("pinnedCertSha256".into(), "CD".repeat(32));
+    let edited = connection::edited_backend(&backend, &fields).unwrap();
+    let BackendConfig::Ftp(edited) = edited else {
+        panic!()
+    };
+    assert_eq!(edited.pinned_cert_sha256, Some("CD".repeat(32)));
+    assert!(build_backend("ftp", input("none", Some(&pin)), &mut pending).is_err());
+    assert!(build_backend("ftp", input("explicit", Some("invalid")), &mut pending).is_err());
+    fields.insert("tls".into(), "none".into());
+    assert!(connection::edited_backend(&backend, &fields).is_err());
+    fields.insert("pinnedCertSha256".into(), String::new());
+    assert!(connection::edited_backend(&backend, &fields).is_ok());
+    let BackendConfig::Ftp(legacy) =
+        build_backend("ftp", input("explicit", None), &mut pending).unwrap()
+    else {
+        panic!()
+    };
+    assert!(legacy.pinned_cert_sha256.is_none());
+}
+
 const PW: &str = "pw-Very$ecret-7";
 
 /// 메모리 저장소. `fail_on` 대상을 저장하려 하면 실패합니다.

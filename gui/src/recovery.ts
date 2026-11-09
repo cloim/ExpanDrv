@@ -2,6 +2,8 @@ export interface RecoveryAdvice { title: string; text: string; action: 'credenti
 
 /** 원문 오류를 유지하고, 알려진 원인에만 다음 행동을 연결합니다. */
 export function recoveryAdvice(message: string): RecoveryAdvice {
+  if (/UnknownIssuer/i.test(message))
+    return { title: '서버 인증서 확인', text: '인증서 발급자를 신뢰할 수 없습니다. 서버 관리자에게 확인한 SHA-256 지문을 연결 정보에 입력하거나 신뢰할 수 있는 인증서를 서버에 설치하세요', action: 'connection' };
   if (/인증서|certificate|known.?hosts|호스트.?키|host key|fingerprint/i.test(message))
     return { title: '서버 신원 확인', text: '서버 관리자에게 인증서 지문 또는 호스트 키를 확인한 뒤 연결 정보를 수정하세요', action: 'connection' };
   if (/인증|암호|비밀번호|401|403|authentication|permission denied|권한/i.test(message))

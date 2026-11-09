@@ -15,6 +15,9 @@ pub mod sftp;
 #[cfg(feature = "webdav")]
 pub mod webdav;
 
+#[cfg(any(feature = "webdav", feature = "ftp"))]
+mod tls;
+
 /// reqwest가 쓸 프로세스 기본 rustls 프로바이더로 ring을 설치합니다. HTTP 클라이언트를 만들기 전에 호출합니다.
 #[cfg(any(feature = "webdav", feature = "s3"))]
 pub(crate) fn install_crypto_provider() {

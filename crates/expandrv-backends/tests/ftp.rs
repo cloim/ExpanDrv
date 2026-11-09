@@ -47,6 +47,7 @@ fn config(port_var: &str, tls: FtpTls, encoding: &str) -> Option<FtpConfig> {
         return None;
     };
     Some(FtpConfig {
+        pinned_cert_sha256: None,
         host,
         port: port.parse().unwrap(),
         username: env("EXPANDRV_TEST_FTP_USER").unwrap_or_else(|| "u".into()),
