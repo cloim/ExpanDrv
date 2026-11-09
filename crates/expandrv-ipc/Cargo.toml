@@ -8,6 +8,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+zeroize.workspace = true
 async-trait.workspace = true
 rmp-serde = "1.3.1"
 serde.workspace = true

@@ -13,11 +13,13 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize + ?Sized,
 {
-    let body = rmp_serde::to_vec_named(msg).map_err(|e| Error::Codec(e.to_string()))?;
+    let body = zeroize::Zeroizing::new(
+        rmp_serde::to_vec_named(msg).map_err(|e| Error::Codec(e.to_string()))?,
+    );
     if body.len() > MAX_FRAME {
         return Err(Error::FrameTooLarge(body.len()));
     }
-    let mut buf = Vec::with_capacity(4 + body.len());
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(4 + body.len()));
     buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
     buf.extend_from_slice(&body);
     w.write_all(&buf).await?;
@@ -47,7 +49,7 @@ where
     if len > MAX_FRAME {
         return Err(Error::FrameTooLarge(len));
     }
-    let mut body = vec![0u8; len];
+    let mut body = zeroize::Zeroizing::new(vec![0u8; len]);
     r.read_exact(&mut body).await.map_err(|e| match e.kind() {
         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe => Error::Closed,
         _ => e.into(),
@@ -70,6 +72,14 @@ mod tests {
             Request::Status,
             Request::Mount { id: "nas".into() },
             Request::Unmount { id: "nas".into() },
+            Request::Lock,
+            Request::Unlock {
+                pin: crate::Pin("123456".into()),
+            },
+            Request::SetPin {
+                current: crate::Pin(String::new()),
+                new: crate::Pin("123456".into()),
+            },
             Request::Reload,
             Request::Shutdown,
         ];
@@ -83,6 +93,7 @@ mod tests {
                 pending_uploads: 3,
                 active_downloads: 0,
             }],
+            ..AgentStatus::default()
         });
         let sent = reqs.clone();
         let resp2 = resp.clone();

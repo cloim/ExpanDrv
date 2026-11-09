@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -11,6 +11,14 @@ pub enum Request {
         version: u32,
     },
     Status,
+    Lock,
+    Unlock {
+        pin: Pin,
+    },
+    SetPin {
+        current: Pin,
+        new: Pin,
+    },
     Mount {
         id: String,
     },
@@ -43,6 +51,8 @@ impl Response {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     BadRequest,
+    Locked,
+    Authentication,
     UnknownDrive,
     AlreadyMounted,
     NotMounted,
@@ -58,6 +68,9 @@ pub enum ErrorCode {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatus {
+    pub locked: bool,
+    pub locking: bool,
+    pub pin_configured: bool,
     pub drives: Vec<DriveStatus>,
 }
 
@@ -80,4 +93,37 @@ pub enum DriveState {
     Unmounted,
     /// 마지막 마운트 또는 해제 실패 사유
     Failed(String),
+}
+
+/// PIN은 IPC Debug 출력에서 가리고 소유권 해제 시 메모리를 지웁니다.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Pin(pub String);
+impl std::fmt::Debug for Pin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[PIN]")
+    }
+}
+impl Drop for Pin {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pin_is_hidden_from_request_debug() {
+        let req = Request::Unlock {
+            pin: Pin("123456".into()),
+        };
+        assert!(!format!("{req:?}").contains("123456"));
+        let req = Request::SetPin {
+            current: Pin("123456".into()),
+            new: Pin("654321".into()),
+        };
+        let debug = format!("{req:?}");
+        assert!(!debug.contains("123456") && !debug.contains("654321"));
+    }
 }

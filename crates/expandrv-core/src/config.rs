@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 현재 설정 스키마 버전. 형식이 바뀌면 올리고 [`migrate`]에 변환 단계를 추가합니다.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +16,8 @@ pub struct Config {
     pub version: u32,
     #[serde(default, rename = "drive")]
     pub drives: Vec<DriveConfig>,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl Default for Config {
@@ -23,6 +25,24 @@ impl Default for Config {
         Self {
             version: CONFIG_VERSION,
             drives: Vec::new(),
+            security: SecurityConfig::default(),
+        }
+    }
+}
+
+/// PIN 등록 뒤 적용하는 자동 잠금 정책. 유휴 잠금 0은 사용 안 함입니다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    pub lock_on_session_lock: bool,
+    pub idle_minutes: u32,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            lock_on_session_lock: true,
+            idle_minutes: 0,
         }
     }
 }
@@ -101,6 +121,8 @@ pub struct CacheConfig {
     pub poll_interval_secs: u64,
     /// 암호화한 디스크 블록 캐시 상한(MiB). 0이면 디스크 캐시를 쓰지 않습니다.
     pub disk_limit_mib: u64,
+    /// 적응형 선행 읽기 상한. 0이면 선행 읽기를 끕니다.
+    pub readahead_blocks: u32,
 }
 
 impl Default for CacheConfig {
@@ -111,6 +133,7 @@ impl Default for CacheConfig {
             memory_limit_mib: 64,
             poll_interval_secs: 60,
             disk_limit_mib: 1024,
+            readahead_blocks: 4,
         }
     }
 }
@@ -287,7 +310,7 @@ pub fn migrate(table: &mut toml::Table) -> Result<Option<u32>> {
     if from == CONFIG_VERSION {
         return Ok(None);
     }
-    // v0 -> v1: 필드 변경 없이 버전만 기록합니다. 이후 단계는 여기에 순서대로 추가합니다.
+    // v0 -> v1: 버전 필드. v1 -> v2: 자동 잠금. v2 -> v3: 적응형 선행 읽기 상한.
     table.insert(
         "version".into(),
         toml::Value::Integer(CONFIG_VERSION.into()),
@@ -310,7 +333,23 @@ impl Config {
         let cfg: Config = table.try_into().map_err(|e| parse_err(&e))?;
         cfg.validate()?;
         if let Some(from) = migrated {
-            std::fs::copy(path, path.with_extension(format!("toml.v{from}.bak")))?;
+            use std::io::Write;
+            let backup = path.with_extension(format!("toml.v{from}.bak"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(text.as_bytes()) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&backup);
+                        return Err(error.into());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
             cfg.save(path)?;
         }
         Ok(cfg)
@@ -330,7 +369,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.security.idle_minutes > 1440 {
+            return Err(Error::Config(
+                "유휴 잠금 시간은 0~1440분으로 설정하세요".into(),
+            ));
+        }
         for d in &self.drives {
+            if d.cache.readahead_blocks > 16 {
+                return Err(Error::Config("선행 읽기 상한은 0~16개로 설정하세요".into()));
+            }
             if let Some(p) = &d.proxy {
                 p.parse()?;
             }
@@ -368,6 +415,56 @@ impl Config {
     pub fn drive(&self, id: &str) -> Option<&DriveConfig> {
         self.drives.iter().find(|d| d.id == id)
     }
+}
+
+/// 현재 사용자의 홈 디렉터리를 구합니다(`USERPROFILE` 또는 `HOME`).
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// `~` 접두사로 시작하는 경로를 홈 디렉터리 경로로 확장합니다.
+pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
+    let p = path.as_ref();
+    if let Ok(rest) = p.strip_prefix("~") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// 기본 설정 디렉터리 경로(`~/.config/ExpanDrv`).
+pub fn default_config_dir() -> Result<PathBuf> {
+    let home = home_dir().ok_or_else(|| {
+        Error::Config("홈 디렉터리(USERPROFILE 또는 HOME)를 찾을 수 없습니다".into())
+    })?;
+    Ok(home.join(".config").join("ExpanDrv"))
+}
+
+/// 이전 버전에서 쓰던 설정 파일 경로(`%APPDATA%\ExpanDrv\config.toml`).
+pub fn legacy_config_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(|a| PathBuf::from(a).join("ExpanDrv").join("config.toml"))
+}
+
+/// 기본 설정 파일 경로(`~/.config/ExpanDrv/config.toml`).
+/// 만약 새 위치에 설정 파일이 없고 기존 `%APPDATA%\ExpanDrv\config.toml`이 있으면
+/// 새 위치로 안전하게 복사(이관)합니다.
+pub fn default_config_path() -> Result<PathBuf> {
+    let target = default_config_dir()?.join("config.toml");
+    if !target.exists() {
+        if let Some(legacy) = legacy_config_path() {
+            if legacy.exists() {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::copy(&legacy, &target);
+            }
+        }
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -441,7 +538,7 @@ root = 'C:\tmp'
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()
-                .contains("version = 1")
+                .contains(&format!("version = {CONFIG_VERSION}"))
         );
         // 두 번째 불러오기에서는 다시 백업하지 않습니다.
         std::fs::remove_file(path.with_extension("toml.v0.bak")).unwrap();
@@ -504,5 +601,81 @@ root = 'C:\tmp'
             Config::load(&dir.path().join("none.toml")).unwrap(),
             Config::default()
         );
+    }
+    #[test]
+    fn migrates_v1_security_policy_without_losing_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let previous = format!("version = 1\n{SAMPLE}");
+        std::fs::write(&path, &previous).unwrap();
+        let mut config = Config::load(&path).unwrap();
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.security, SecurityConfig::default());
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("toml.v1.bak")).unwrap(),
+            previous
+        );
+        assert!(!config.drives.is_empty());
+        config.security.idle_minutes = 15;
+        config.security.lock_on_session_lock = false;
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().security, config.security);
+        config.security.idle_minutes = 1441;
+        assert!(config.save(&path).is_err());
+        assert_eq!(Config::load(&path).unwrap().security.idle_minutes, 15);
+    }
+    #[test]
+    fn migration_keeps_an_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backup = path.with_extension("toml.v1.bak");
+        std::fs::write(&path, "version = 1\n").unwrap();
+        std::fs::write(&backup, "original backup").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "original backup");
+    }
+
+    #[test]
+    fn migrates_v2_readahead_with_backup_and_validates_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let before = format!("version = 2\n{SAMPLE}");
+        std::fs::write(&path, &before).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.version, 3);
+        assert_eq!(cfg.drives[0].cache.readahead_blocks, 4);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("toml.v2.bak")).unwrap(),
+            before
+        );
+        cfg.drives[0].cache.readahead_blocks = 17;
+        assert!(cfg.save(&path).is_err());
+        cfg.drives[0].cache.readahead_blocks = 0;
+        cfg.save(&path).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().drives[0]
+                .cache
+                .readahead_blocks,
+            0
+        );
+    }
+
+    #[test]
+    fn default_config_path_ends_with_dot_config() {
+        let path = default_config_path().unwrap();
+        assert!(
+            path.ends_with(".config/ExpanDrv/config.toml")
+                || path.ends_with(r".config\ExpanDrv\config.toml")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_replaces_home_prefix() {
+        let home = home_dir().unwrap();
+        let expanded = expand_tilde("~/.config/ExpanDrv");
+        assert_eq!(expanded, home.join(".config").join("ExpanDrv"));
+        let not_tilde = expand_tilde(r"C:\tmp\test");
+        assert_eq!(not_tilde, PathBuf::from(r"C:\tmp\test"));
     }
 }

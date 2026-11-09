@@ -18,6 +18,7 @@ expandrv-winfsp = { path = "crates/expandrv-winfsp" }
 expandrv-log = { path = "crates/expandrv-log" }
 expandrv-ipc = { path = "crates/expandrv-ipc" }
 expandrv-autostart = { path = "crates/expandrv-autostart" }
+expandrv-shell = { path = "crates/expandrv-shell" }
 
 async-trait = "0.1.92"
 bytes = "1.12"

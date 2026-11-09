@@ -12,7 +12,7 @@ mod sid;
 pub use frame::{MAX_FRAME, read_frame, write_frame};
 pub use pipe::{Handler, IpcClient, IpcServer, default_pipe_name};
 pub use proto::{
-    AgentStatus, DriveState, DriveStatus, ErrorCode, PROTOCOL_VERSION, Request, Response,
+    AgentStatus, DriveState, DriveStatus, ErrorCode, PROTOCOL_VERSION, Pin, Request, Response,
 };
 pub use sid::{current_user_sid, process_user_sid};
 

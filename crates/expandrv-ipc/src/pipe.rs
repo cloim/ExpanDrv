@@ -321,6 +321,7 @@ mod tests {
                         pending_uploads: 0,
                         active_downloads: 0,
                     }],
+                    ..AgentStatus::default()
                 }),
                 Request::Mount { id } => Response::error(ErrorCode::UnknownDrive, id),
                 Request::Shutdown => {

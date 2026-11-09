@@ -1341,6 +1341,7 @@ dependencies = [
  "expandrv-ipc",
  "expandrv-log",
  "expandrv-secrets",
+ "expandrv-shell",
  "expandrv-vfs",
  "expandrv-winfsp",
  "rpassword",
@@ -1418,6 +1419,7 @@ dependencies = [
  "expandrv-core",
  "expandrv-ipc",
  "expandrv-secrets",
+ "expandrv-shell",
  "secrecy",
  "serde",
  "serde_json",
@@ -1440,6 +1442,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1456,9 +1459,19 @@ name = "expandrv-secrets"
 version = "0.1.0"
 dependencies = [
  "expandrv-core",
+ "ring",
  "secrecy",
  "windows 0.62.2",
  "zeroize",
+]
+
+[[package]]
+name = "expandrv-shell"
+version = "0.1.0"
+dependencies = [
+ "expandrv-core",
+ "tempfile",
+ "windows 0.62.2",
 ]
 
 [[package]]

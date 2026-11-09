@@ -1,6 +1,8 @@
 //! 비밀 값을 Windows 자격 증명 관리자에 저장합니다. 값은 DPAPI(현재 사용자)로 한 번 더 암호화하고,
 //! 설정 파일에는 [`SecretSource::Credential`] 참조만 둡니다.
 
+pub mod lock;
+
 mod dpapi;
 
 use expandrv_core::config::{EnvSecrets, SecretResolver, SecretSource};
