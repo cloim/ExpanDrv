@@ -176,6 +176,8 @@ impl Agent {
     fn new(cfg_path: PathBuf, config: Config, rt: Handle) -> Result<Self> {
         let pins = PinStore::new(&cfg_path)?;
         let pin_configured = pins.configured()?;
+        // PIN으로 해제한 상태는 재시작 뒤에도 유지하고, 사용자가 잠근 상태만 잠긴 채로 시작합니다.
+        let start_locked = pin_configured && pins.remembered_locked();
         let stop = Arc::new(Notify::new());
         let lock_requested = Arc::new(Notify::new());
         let session_lock_requested = Arc::new(Notify::new());
@@ -195,8 +197,8 @@ impl Agent {
             state: Mutex::new(State {
                 config,
                 pin_configured,
-                locked: pin_configured,
-                lock_reason: if pin_configured {
+                locked: start_locked,
+                lock_reason: if start_locked {
                     Some(Reason::Manual)
                 } else {
                     None
@@ -441,6 +443,7 @@ impl Agent {
                     st.locking = true;
                     st.lock_reason = Some(Reason::Manual);
                     tracing::info!(?reason, "수동 PIN 잠금 시작");
+                    self.remember_locked(true);
                     true
                 }
                 Reason::Idle => {
@@ -460,6 +463,7 @@ impl Agent {
                     st.locking = true;
                     st.lock_reason = Some(Reason::Idle);
                     tracing::info!(?reason, "유휴 시간 초과로 자동 잠금 시작");
+                    self.remember_locked(true);
                     true
                 }
             }
@@ -529,6 +533,14 @@ impl Agent {
         }
     }
 
+    /// 사용자 잠금(수동, 유휴)을 기록합니다. Windows 세션 잠금은 해제 때 자동 복구하므로 기록하지 않습니다.
+    fn remember_locked(&self, locked: bool) {
+        let result = PinStore::new(&self.cfg_path).and_then(|pins| pins.remember_locked(locked));
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "잠금 상태 기록 실패");
+        }
+    }
+
     async fn pin_action(
         &self,
         current: expandrv_ipc::Pin,
@@ -559,9 +571,14 @@ impl Agent {
             tokio::task::spawn_blocking(move || {
                 let pins = pins?;
                 match new {
-                    Some(new) => pins.set(&current.0, &new.0),
-                    None => pins.verify(&current.0),
+                    Some(new) => pins.set(&current.0, &new.0)?,
+                    None => pins.verify(&current.0)?,
                 }
+                // PIN 등록과 잠금 해제 모두 해제 상태가 되므로 재시작 뒤에도 유지합니다.
+                if let Err(e) = pins.remember_locked(false) {
+                    tracing::warn!(error = %e, "잠금 해제 상태 기록 실패");
+                }
+                Ok(())
             })
             .await,
         );

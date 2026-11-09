@@ -544,6 +544,14 @@ fn pin_lock_drains_uploads_blocks_mount_and_survives_restart() {
     });
     assert!(env.run(&["mount", "locked-test"]).ok);
     assert!(drive.exists());
+    // PIN으로 해제한 상태는 에이전트를 다시 시작해도 유지합니다.
+    assert!(env.run(&["stop"]).ok);
+    assert!(env.run(&["mount", "locked-test"]).ok, "해제 상태 유지");
+    assert!(drive.exists());
+    let _unlocked_restart = AgentGuard {
+        env: &env,
+        pid: env.agent_pid().unwrap(),
+    };
     rt.block_on(async {
         let mut client = IpcClient::connect_to(&env.pipe, Duration::from_secs(2))
             .await

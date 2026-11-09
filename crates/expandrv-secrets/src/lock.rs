@@ -9,9 +9,13 @@ use secrecy::{ExposeSecret, SecretString};
 use std::{num::NonZeroU32, path::Path};
 
 const ITERATIONS: NonZeroU32 = NonZeroU32::new(120_000).unwrap();
+const LOCKED: &str = "locked";
+const UNLOCKED: &str = "unlocked";
 
 pub struct PinStore {
     target: String,
+    /// 재시작 뒤에도 유지할 마지막 잠금 상태
+    state_target: String,
 }
 
 impl PinStore {
@@ -19,10 +23,25 @@ impl PinStore {
         let path = std::path::absolute(config)?
             .to_string_lossy()
             .to_lowercase();
-        let hash = digest::digest(&digest::SHA256, path.as_bytes());
+        let hash = hex(digest::digest(&digest::SHA256, path.as_bytes()).as_ref());
         Ok(Self {
-            target: format!("ExpanDrv.AppLock/{}/pin", hex(hash.as_ref())),
+            target: format!("ExpanDrv.AppLock/{hash}/pin"),
+            state_target: format!("ExpanDrv.AppLock/{hash}/state"),
         })
+    }
+
+    /// 마지막으로 기록한 잠금 상태. 기록이 없거나 읽지 못하면 잠김으로 봅니다.
+    pub fn remembered_locked(&self) -> bool {
+        !matches!(
+            CredentialStore.get(&self.state_target),
+            Ok(v) if v.expose_secret() == UNLOCKED
+        )
+    }
+
+    /// PIN 잠금 해제나 사용자의 잠금을 기록해 에이전트를 다시 시작해도 같은 상태로 시작하게 합니다.
+    pub fn remember_locked(&self, locked: bool) -> Result<()> {
+        let value = if locked { LOCKED } else { UNLOCKED };
+        CredentialStore.set(&self.state_target, &SecretString::from(value))
     }
 
     pub fn configured(&self) -> Result<bool> {
@@ -40,7 +59,11 @@ impl PinStore {
 
     pub fn remove(&self, current: &str) -> Result<()> {
         self.verify(current)?;
-        CredentialStore.delete(&self.target)
+        CredentialStore.delete(&self.target)?;
+        match CredentialStore.delete(&self.state_target) {
+            Err(Error::NotFound) => Ok(()),
+            r => r,
+        }
     }
 
     pub fn set(&self, current: &str, new: &str) -> Result<()> {
