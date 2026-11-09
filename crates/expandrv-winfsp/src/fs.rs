@@ -33,6 +33,16 @@ const FILE_ACTION_ADDED: u32 = 1;
 const FILE_ACTION_REMOVED: u32 = 2;
 const FILE_ACTION_MODIFIED: u32 = 3;
 
+pub fn path_to_file_id(path: &RemotePath) -> u64 {
+    // FNV-1a 64비트 해시로 파일 경로마다 안정적이고 고유한 FileId(index_number)를 부여합니다.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.as_str().as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
 pub struct ExpanFs {
     vfs: Arc<Vfs>,
     label: String,
@@ -55,7 +65,7 @@ impl ExpanFs {
         }
     }
 
-    fn fill(&self, e: &Entry, fi: &mut FileInfo) {
+    fn fill(&self, path: &RemotePath, e: &Entry, fi: &mut FileInfo) {
         let mut attrs = if e.is_dir() {
             FILE_ATTRIBUTE_DIRECTORY
         } else {
@@ -73,7 +83,7 @@ impl ExpanFs {
         fi.last_access_time = modified;
         fi.last_write_time = modified;
         fi.change_time = modified;
-        fi.index_number = 0;
+        fi.index_number = path_to_file_id(path);
         fi.hard_links = 0;
         fi.ea_size = 0;
     }
@@ -138,9 +148,9 @@ impl FileSystemContext for ExpanFs {
         security_descriptor: Option<&mut [c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let (_, entry) = self.vfs.stat(&parse(file_name)?).map_err(fsp)?;
+        let (real, entry) = self.vfs.stat(&parse(file_name)?).map_err(fsp)?;
         let mut fi = FileInfo::default();
-        self.fill(&entry, &mut fi);
+        self.fill(&real, &entry, &mut fi);
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: self.copy_security(security_descriptor)?,
@@ -167,7 +177,7 @@ impl FileSystemContext for ExpanFs {
             let wide: Vec<u16> = real.as_str().replace('/', "\\").encode_utf16().collect();
             file_info.set_normalized_name(&wide, None);
         }
-        self.fill(&self.vfs.info(&handle), file_info.as_mut());
+        self.fill(&real, &self.vfs.info(&handle), file_info.as_mut());
         Ok(Context {
             handle,
             dir_buffer: DirBuffer::new(),
@@ -196,7 +206,7 @@ impl FileSystemContext for ExpanFs {
             EntryKind::File
         };
         let handle = self.vfs.create(&parse(file_name)?, kind).map_err(fsp)?;
-        self.fill(&self.vfs.info(&handle), file_info.as_mut());
+        self.fill(&handle.path(), &self.vfs.info(&handle), file_info.as_mut());
         Ok(Context {
             handle,
             dir_buffer: DirBuffer::new(),
@@ -213,13 +223,17 @@ impl FileSystemContext for ExpanFs {
     fn flush(&self, context: Option<&Context>, file_info: &mut FileInfo) -> winfsp::Result<()> {
         if let Some(c) = context {
             let e = self.vfs.flush(&c.handle).map_err(fsp)?;
-            self.fill(&e, file_info);
+            self.fill(&c.handle.path(), &e, file_info);
         }
         Ok(())
     }
 
     fn get_file_info(&self, context: &Context, file_info: &mut FileInfo) -> winfsp::Result<()> {
-        self.fill(&self.vfs.info(&context.handle), file_info);
+        self.fill(
+            &context.handle.path(),
+            &self.vfs.info(&context.handle),
+            file_info,
+        );
         Ok(())
     }
 
@@ -251,7 +265,7 @@ impl FileSystemContext for ExpanFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let e = self.vfs.overwrite(&context.handle).map_err(fsp)?;
-        self.fill(&e, file_info);
+        self.fill(&context.handle.path(), &e, file_info);
         Ok(())
     }
 
@@ -268,16 +282,18 @@ impl FileSystemContext for ExpanFs {
             let mut di: DirInfo = DirInfo::new();
             if !path.is_root() {
                 let me = self.vfs.info(&context.handle);
-                for dot in [".", ".."] {
+                let parent = path.parent().unwrap_or_else(RemotePath::root);
+                for (dot, p) in [(".", &path), ("..", &parent)] {
                     di.reset();
-                    self.fill(&me, di.file_info_mut());
+                    self.fill(p, &me, di.file_info_mut());
                     di.set_name(dot)?;
                     lock.write(&mut di)?;
                 }
             }
             for e in list.iter() {
                 di.reset();
-                self.fill(e, di.file_info_mut());
+                let child_path = path.join(&e.name).unwrap_or_else(|_| path.clone());
+                self.fill(&child_path, e, di.file_info_mut());
                 if di.set_name(e.name.as_str()).is_err() {
                     tracing::warn!(dir = %path, name = %e.name, "이름이 너무 길어 건너뜁니다");
                     continue;
@@ -318,7 +334,7 @@ impl FileSystemContext for ExpanFs {
         } else {
             self.vfs.info(&context.handle)
         };
-        self.fill(&e, file_info);
+        self.fill(&context.handle.path(), &e, file_info);
         Ok(())
     }
 
@@ -345,7 +361,7 @@ impl FileSystemContext for ExpanFs {
             .vfs
             .set_size(&context.handle, new_size, set_allocation_size)
             .map_err(fsp)?;
-        self.fill(&e, file_info);
+        self.fill(&context.handle.path(), &e, file_info);
         Ok(())
     }
 
@@ -379,7 +395,7 @@ impl FileSystemContext for ExpanFs {
                 constrained_io,
             )
             .map_err(fsp)?;
-        self.fill(&e, file_info);
+        self.fill(&context.handle.path(), &e, file_info);
         Ok(n as u32)
     }
 
@@ -440,5 +456,30 @@ mod tests {
         let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_nanos(123_400);
         assert_eq!(from_filetime(filetime(t)), t);
         assert_eq!(filetime(UNIX_EPOCH), FILETIME_UNIX_EPOCH);
+    }
+
+    #[test]
+    fn path_to_file_id_is_deterministic_unique_and_nonzero() {
+        let root = RemotePath::root();
+        let p1 = RemotePath::parse("/photo.jpg").unwrap();
+        let p2 = RemotePath::parse("/movie.mp4").unwrap();
+        let p3 = RemotePath::parse("/docs/report.docx").unwrap();
+        let p1_again = RemotePath::parse("/photo.jpg").unwrap();
+
+        let id_root = path_to_file_id(&root);
+        let id1 = path_to_file_id(&p1);
+        let id2 = path_to_file_id(&p2);
+        let id3 = path_to_file_id(&p3);
+
+        assert_ne!(id_root, 0);
+        assert_ne!(id1, 0);
+        assert_ne!(id2, 0);
+        assert_ne!(id3, 0);
+
+        assert_eq!(id1, path_to_file_id(&p1_again));
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+        assert_ne!(id1, id_root);
     }
 }

@@ -338,6 +338,15 @@ impl Shared {
         size: u64,
         speculative: bool,
     ) -> Result<Bytes> {
+        if speculative
+            && self
+                .nodes
+                .lock()
+                .get(path)
+                .is_none_or(|n| n.opens.load(Ordering::SeqCst) == 0)
+        {
+            return Err(Error::Cancelled);
+        }
         if let Some(b) = self.disk.as_ref().and_then(|d| d.get(path, ver, idx)) {
             self.blocks.put(path, ver, idx, b.clone());
             return Ok(b);
@@ -1060,7 +1069,9 @@ impl Vfs {
             bs,
             s.opts.readahead_blocks.min(memory_window),
         );
-        s.prefetch(&path, &ver, (pos - 1) / bs + 1, size, window);
+        if window > 0 && pos > 0 {
+            s.prefetch(&path, &ver, (pos - 1) / bs + 1, size, window);
+        }
         Ok((pos - offset) as usize)
     }
 

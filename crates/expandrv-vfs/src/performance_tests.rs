@@ -184,3 +184,102 @@ fn performance_comparison() {
     assert_eq!(counts, [90, 30]);
     assert!(latency[1] < latency[0] / 2.0);
 }
+
+#[test]
+fn explorer_thumbnail_and_preview_patterns_avoid_redundant_fetches() {
+    let f = fixture_with(|o| o.block_size = 64 * 1024);
+
+    // 1. 대표 파일 형식 준비 (텍스트, 이미지, 동영상, 문서)
+    let txt_path = f.root.path().join("text.txt");
+    let jpg_path = f.root.path().join("photo.jpg");
+    let mp4_path = f.root.path().join("movie.mp4");
+    let doc_path = f.root.path().join("document.docx");
+
+    std::fs::write(&txt_path, vec![1; 8 * 1024]).unwrap(); // 8 KiB
+    std::fs::write(&jpg_path, vec![2; 2 * 1024 * 1024]).unwrap(); // 2 MiB
+    std::fs::write(&mp4_path, vec![3; 50 * 1024 * 1024]).unwrap(); // 50 MiB
+    std::fs::write(&doc_path, vec![4; 10 * 1024 * 1024]).unwrap(); // 10 MiB
+
+    // (1) 텍스트 파일 미리보기 (앞부분 4KiB 읽기)
+    let h_txt = f.vfs.open(&p("/text.txt")).unwrap();
+    let mut buf = [0u8; 4096];
+    assert_eq!(f.vfs.read(&h_txt, 0, &mut buf).unwrap(), 4096);
+    finish_prefetch(&f);
+    let reads_after_txt = f.backend.reads.load(Ordering::SeqCst);
+    assert_eq!(reads_after_txt, 1, "텍스트 4KiB 읽기는 1개 블록만 요청");
+    f.vfs.cleanup(&h_txt, false).unwrap();
+    f.vfs.close(&h_txt);
+
+    // (2) 이미지 파일 썸네일 (EXIF 헤더 64KiB 읽기 후 바로 닫기)
+    let h_jpg = f.vfs.open(&p("/photo.jpg")).unwrap();
+    let mut buf_64k = [0u8; 64 * 1024];
+    assert_eq!(f.vfs.read(&h_jpg, 0, &mut buf_64k).unwrap(), 64 * 1024);
+    // 핸들을 바로 닫아 썸네일러 동작 모사
+    f.vfs.cleanup(&h_jpg, false).unwrap();
+    f.vfs.close(&h_jpg);
+    finish_prefetch(&f);
+    let reads_after_jpg = f.backend.reads.load(Ordering::SeqCst);
+    assert!(
+        reads_after_jpg <= reads_after_txt + 1,
+        "핸들이 닫힌 이미지 파일은 불필요한 전체 2MiB 선행 다운로드를 진행하지 않습니다"
+    );
+
+    // (3) 대용량 동영상 썸네일 (앞 16KiB ftyp 읽고, 파일 끝 64KiB moov atom 읽기)
+    let h_mp4 = f.vfs.open(&p("/movie.mp4")).unwrap();
+    let mut buf_16k = [0u8; 16 * 1024];
+    assert_eq!(f.vfs.read(&h_mp4, 0, &mut buf_16k).unwrap(), 16 * 1024);
+    // 파일 끝부분(50MiB - 64KiB)으로 탐색(Seek)
+    let end_offset = 50 * 1024 * 1024 - 64 * 1024;
+    assert_eq!(
+        f.vfs.read(&h_mp4, end_offset, &mut buf_64k).unwrap(),
+        64 * 1024
+    );
+    f.vfs.cleanup(&h_mp4, false).unwrap();
+    f.vfs.close(&h_mp4);
+    finish_prefetch(&f);
+    let reads_after_mp4 = f.backend.reads.load(Ordering::SeqCst);
+    assert_eq!(
+        reads_after_mp4,
+        reads_after_jpg + 2,
+        "동영상 파일의 앞/끝 헤더 조회는 정확히 요청된 2개 블록만 읽고 전체 50MiB를 받지 않습니다"
+    );
+
+    // (4) 문서 파일 (ZIP 구조 Central Directory: 파일 끝 64KiB 읽기)
+    let h_doc = f.vfs.open(&p("/document.docx")).unwrap();
+    let doc_end_offset = 10 * 1024 * 1024 - 64 * 1024;
+    assert_eq!(
+        f.vfs.read(&h_doc, doc_end_offset, &mut buf_64k).unwrap(),
+        64 * 1024
+    );
+    f.vfs.cleanup(&h_doc, false).unwrap();
+    f.vfs.close(&h_doc);
+    finish_prefetch(&f);
+    let reads_after_doc = f.backend.reads.load(Ordering::SeqCst);
+    assert_eq!(
+        reads_after_doc,
+        reads_after_mp4 + 1,
+        "문서 파일 Central Directory 조회는 정확히 끝 1개 블록만 읽습니다"
+    );
+
+    // (5) Warm(캐시 예열) 상태 재조회 검증
+    // 이미 메모리 캐시에 존재하는 블록 조회 시 백엔드 요청 증가가 0이어야 합니다.
+    let h_txt_warm = f.vfs.open(&p("/text.txt")).unwrap();
+    assert_eq!(f.vfs.read(&h_txt_warm, 0, &mut buf).unwrap(), 4096);
+    f.vfs.cleanup(&h_txt_warm, false).unwrap();
+    f.vfs.close(&h_txt_warm);
+
+    let h_mp4_warm = f.vfs.open(&p("/movie.mp4")).unwrap();
+    assert_eq!(f.vfs.read(&h_mp4_warm, 0, &mut buf_16k).unwrap(), 16 * 1024);
+    assert_eq!(
+        f.vfs.read(&h_mp4_warm, end_offset, &mut buf_64k).unwrap(),
+        64 * 1024
+    );
+    f.vfs.cleanup(&h_mp4_warm, false).unwrap();
+    f.vfs.close(&h_mp4_warm);
+
+    let reads_warm = f.backend.reads.load(Ordering::SeqCst);
+    assert_eq!(
+        reads_warm, reads_after_doc,
+        "예열된 캐시 상태에서는 추가적인 백엔드 네트워크 요청 없이 즉시 반환됩니다"
+    );
+}

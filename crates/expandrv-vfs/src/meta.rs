@@ -47,11 +47,16 @@ impl MetaCache {
 
     pub fn dir(&self, path: &RemotePath) -> Option<Arc<Vec<Entry>>> {
         let inner = self.inner.lock();
+        if let Some((d, at)) = inner.dirs.get(path)
+            && self.fresh(*at)
+        {
+            return Some(d.clone());
+        }
         inner
             .dirs
-            .get(path)
-            .filter(|(_, at)| self.fresh(*at))
-            .map(|(d, _)| d.clone())
+            .iter()
+            .find(|(p, (_, at))| self.fresh(*at) && p.as_str().eq_ignore_ascii_case(path.as_str()))
+            .map(|(_, (d, _))| d.clone())
     }
 
     /// 신선한 부모 목록에서 이름을 찾습니다. 정확한 이름을 먼저, 없으면 대소문자 무시로 찾습니다.
@@ -59,7 +64,23 @@ impl MetaCache {
         let (Some(parent), Some(name)) = (path.parent(), path.name()) else {
             return Lookup::Unknown;
         };
-        let Some(list) = self.dir(&parent) else {
+        let inner = self.inner.lock();
+        let hit_dir = if let Some((d, at)) = inner.dirs.get(&parent) {
+            if self.fresh(*at) {
+                Some((parent.clone(), d.clone()))
+            } else {
+                None
+            }
+        } else {
+            inner
+                .dirs
+                .iter()
+                .find(|(p, (_, at))| {
+                    self.fresh(*at) && p.as_str().eq_ignore_ascii_case(parent.as_str())
+                })
+                .map(|(p, (d, _))| (p.clone(), d.clone()))
+        };
+        let Some((real_parent, list)) = hit_dir else {
             return Lookup::Unknown;
         };
         let hit = list
@@ -69,12 +90,16 @@ impl MetaCache {
             .or_else(|| {
                 list.iter()
                     .find(|e| e.name.to_lowercase() == name.to_lowercase())
-            });
+            })
+            .cloned();
         match hit {
-            Some(e) => match parent.join(&e.name) {
-                Ok(p) => Lookup::Found(p, e.clone()),
-                Err(_) => Lookup::Unknown,
-            },
+            Some(e) => {
+                let real = match real_parent.join(&e.name) {
+                    Ok(p) => p,
+                    Err(_) => return Lookup::Unknown,
+                };
+                Lookup::Found(real, e)
+            }
             None => Lookup::Missing,
         }
     }
@@ -179,6 +204,13 @@ mod tests {
         }
         assert!(matches!(c.lookup(&p("/d/desktop.ini")), Lookup::Missing));
         assert!(matches!(c.lookup(&p("/other/x")), Lookup::Unknown));
+
+        // 부모 경로 대소문자가 다른 경우의 lookup 및 dir 조회
+        assert!(c.dir(&p("/D")).is_some());
+        match c.lookup(&p("/D/README.TXT")) {
+            Lookup::Found(path, e) => assert_eq!((path.as_str(), e.size), ("/d/Readme.TXT", 3)),
+            _ => panic!("expected hit with uppercase parent"),
+        }
     }
 
     #[test]
