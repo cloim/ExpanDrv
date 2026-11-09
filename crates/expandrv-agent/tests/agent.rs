@@ -16,6 +16,13 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(120);
 /// 테스트 전에 없던 키만 끝날 때 지워 사용자의 기존 키는 건드리지 않습니다.
 struct CacheKeys(Vec<String>);
 
+struct PinGuard(expandrv_secrets::lock::PinStore);
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        let _ = self.0.remove("123456");
+    }
+}
+
 impl CacheKeys {
     fn new(ids: &[&str]) -> Self {
         let store = expandrv_secrets::CredentialStore;
@@ -194,6 +201,298 @@ fn line_of<'a>(out: &'a str, id: &str) -> &'a str {
     out.lines()
         .find(|l| l.starts_with(&format!("{id} ")))
         .unwrap_or_else(|| panic!("{id} 행이 없습니다:\n{out}"))
+}
+
+/// 테스트 에이전트의 창에만 알림을 보냅니다. Windows 화면 잠금은 실행하지 않습니다.
+fn send_session_event(pid: u32, event: u32) {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, PostMessageW, WM_WTSSESSION_CHANGE,
+    };
+    unsafe extern "system" fn find(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let target = &mut *(data.0 as *mut (u32, HWND));
+            let mut owner = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut owner));
+            if owner == target.0 {
+                let mut class = [0; 64];
+                let n = GetClassNameW(hwnd, &mut class);
+                if String::from_utf16_lossy(&class[..n as usize]) == "ExpanDrvTray" {
+                    target.1 = hwnd;
+                    return false.into();
+                }
+            }
+            true.into()
+        }
+    }
+    let mut target = (pid, HWND::default());
+    for _ in 0..100 {
+        unsafe {
+            let _ = EnumWindows(
+                Some(find),
+                LPARAM((&mut target as *mut (u32, HWND)) as isize),
+            );
+        }
+        if !target.1.is_invalid() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!target.1.is_invalid(), "테스트 에이전트 창이 필요합니다");
+    unsafe {
+        PostMessageW(
+            Some(target.1),
+            WM_WTSSESSION_CHANGE,
+            WPARAM(event as usize),
+            LPARAM(0),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn session_lock_respects_pin_policy_and_preserves_pending_upload() {
+    use expandrv_core::config::Config;
+    use expandrv_ipc::{Pin, Request, Response};
+    use windows::Win32::UI::WindowsAndMessaging::{WTS_SESSION_LOCK, WTS_SESSION_UNLOCK};
+    if expandrv_winfsp::runtime::runtime_dll().is_none() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let env = Env::new("session-lock");
+    let _keys = CacheKeys::new(&["session-lock-test"]);
+    let _pin = PinGuard(expandrv_secrets::lock::PinStore::new(&env.path("config.toml")).unwrap());
+    let root = env.path("remote");
+    std::fs::create_dir(&root).unwrap();
+    let letter = free_drives(1).remove(0);
+    let drive = PathBuf::from(format!("{letter}\\"));
+    assert!(
+        env.run(&[
+            "add",
+            "session-lock-test",
+            &letter,
+            "local",
+            root.to_str().unwrap()
+        ])
+        .ok
+    );
+    assert!(env.run(&["mount", "session-lock-test"]).ok);
+    let pid = env.agent_pid().unwrap();
+    let _guard = AgentGuard { env: &env, pid };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = IpcClient::connect_to(&env.pipe, Duration::from_secs(2))
+            .await
+            .unwrap();
+        client.hello().await.unwrap();
+        send_session_event(pid, WTS_SESSION_LOCK);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+            panic!("status")
+        };
+        assert!(!status.locked, "PIN이 없으면 자동 잠금을 시작하지 않습니다");
+        assert_eq!(
+            client
+                .call(&Request::SetPin {
+                    current: Pin(String::new()),
+                    new: Pin("123456".into())
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        let path = env.path("config.toml");
+        let mut config = Config::load(&path).unwrap();
+        config.security.lock_on_session_lock = false;
+        config.save(&path).unwrap();
+        assert_eq!(client.call(&Request::Reload).await.unwrap(), Response::Ok);
+        send_session_event(pid, WTS_SESSION_LOCK);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+            panic!("status")
+        };
+        assert!(!status.locked);
+        config.security.lock_on_session_lock = true;
+        config.save(&path).unwrap();
+        assert_eq!(client.call(&Request::Reload).await.unwrap(), Response::Ok);
+        std::fs::write(drive.join("pending.txt"), b"session-safe").unwrap();
+        send_session_event(pid, WTS_SESSION_LOCK);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+                panic!("status")
+            };
+            if status.locked && !status.locking {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "세션 잠금 응답 시간 초과"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!drive.exists());
+        assert_eq!(
+            std::fs::read(root.join("pending.txt")).unwrap(),
+            b"session-safe"
+        );
+        send_session_event(pid, WTS_SESSION_UNLOCK);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+            panic!("status")
+        };
+        assert!(
+            status.locked,
+            "Windows 잠금 해제는 PIN 잠금을 해제하지 않습니다"
+        );
+    });
+    assert!(env.run(&["stop"]).ok);
+}
+
+#[test]
+fn pin_lock_drains_uploads_blocks_mount_and_survives_restart() {
+    use expandrv_ipc::{ErrorCode, Pin, Request, Response};
+    if expandrv_winfsp::runtime::runtime_dll().is_none() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let env = Env::new("pin-lock");
+    let _keys = CacheKeys::new(&["locked-test"]);
+    let _pin = PinGuard(expandrv_secrets::lock::PinStore::new(&env.path("config.toml")).unwrap());
+    let root = env.path("remote");
+    std::fs::create_dir(&root).unwrap();
+    let letter = free_drives(1).remove(0);
+    let drive = PathBuf::from(format!("{letter}\\"));
+    assert!(
+        env.run(&[
+            "add",
+            "locked-test",
+            &letter,
+            "local",
+            root.to_str().unwrap()
+        ])
+        .ok
+    );
+    assert!(env.run(&["mount", "locked-test"]).ok);
+    let _guard = AgentGuard {
+        env: &env,
+        pid: env.agent_pid().unwrap(),
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = IpcClient::connect_to(&env.pipe, Duration::from_secs(2))
+            .await
+            .unwrap();
+        client.hello().await.unwrap();
+        assert!(matches!(
+            client.call(&Request::Lock).await.unwrap(),
+            Response::Error {
+                code: ErrorCode::Config,
+                ..
+            }
+        ));
+        assert_eq!(
+            client
+                .call(&Request::SetPin {
+                    current: Pin(String::new()),
+                    new: Pin("123456".into())
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        std::fs::write(drive.join("pending.txt"), b"save before lock").unwrap();
+        assert_eq!(client.call(&Request::Lock).await.unwrap(), Response::Ok);
+        assert!(!drive.exists());
+        assert!(!env.run(&["check", "locked-test"]).ok);
+        assert_eq!(
+            std::fs::read(root.join("pending.txt")).unwrap(),
+            b"save before lock"
+        );
+        let Response::Status(status) = client.call(&Request::Status).await.unwrap() else {
+            panic!("status")
+        };
+        assert!(status.locked && status.pin_configured && !status.locking);
+        assert!(status.drives.iter().all(|d| d.pending_uploads == 0));
+        assert!(matches!(
+            client
+                .call(&Request::Mount {
+                    id: "locked-test".into()
+                })
+                .await
+                .unwrap(),
+            Response::Error {
+                code: ErrorCode::Locked,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client
+                .call(&Request::Unlock {
+                    pin: Pin("654321".into())
+                })
+                .await
+                .unwrap(),
+            Response::Error {
+                code: ErrorCode::Authentication,
+                ..
+            }
+        ));
+        assert_eq!(
+            client
+                .call(&Request::Unlock {
+                    pin: Pin("123456".into())
+                })
+                .await
+                .unwrap(),
+            Response::Ok
+        );
+        assert!(!drive.exists(), "잠금 해제는 자동 마운트하지 않습니다");
+    });
+    assert!(env.run(&["mount", "locked-test"]).ok);
+    assert!(drive.exists());
+    rt.block_on(async {
+        let mut client = IpcClient::connect_to(&env.pipe, Duration::from_secs(2))
+            .await
+            .unwrap();
+        client.hello().await.unwrap();
+        assert_eq!(client.call(&Request::Lock).await.unwrap(), Response::Ok);
+        for _ in 0..5 {
+            assert!(matches!(
+                client
+                    .call(&Request::Unlock {
+                        pin: Pin("654321".into())
+                    })
+                    .await
+                    .unwrap(),
+                Response::Error {
+                    code: ErrorCode::Authentication,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            client
+                .call(&Request::Unlock {
+                    pin: Pin("123456".into())
+                })
+                .await
+                .unwrap(),
+            Response::Error {
+                code: ErrorCode::Busy,
+                ..
+            }
+        ));
+    });
+    assert!(env.run(&["stop"]).ok);
+    // 재시작으로 PIN 잠금을 건너뛸 수 없습니다.
+    assert!(!env.run(&["mount", "locked-test"]).ok);
+    let _restarted = AgentGuard {
+        env: &env,
+        pid: env.agent_pid().unwrap(),
+    };
+    assert!(!drive.exists());
+    assert!(env.run(&["stop"]).ok);
 }
 
 #[test]

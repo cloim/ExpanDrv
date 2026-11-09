@@ -1,7 +1,9 @@
 //! `expandrv` CLI: 드라이브 설정 관리와 상주 에이전트 제어
 
 mod agent;
+mod auto_lock;
 mod control;
+mod tray;
 
 use clap::{Args, Parser, Subcommand};
 use control::{AgentLink, expect_ok};
@@ -28,7 +30,7 @@ const PIPE_ENV: &str = "EXPANDRV_PIPE";
     about = "원격 스토리지를 Windows 드라이브로 마운트합니다"
 )]
 struct Cli {
-    /// 설정 파일 경로(기본: %APPDATA%\ExpanDrv\config.toml)
+    /// 설정 파일 경로(기본: ~/.config/ExpanDrv/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// 에이전트 파이프 이름(테스트용)
@@ -66,10 +68,21 @@ enum Command {
     },
     /// 모든 드라이브를 해제하고 에이전트를 종료합니다
     Stop,
+    /// 전체 드라이브를 해제하고 잠급니다
+    Lock,
+    /// PIN을 입력해 잠금을 해제합니다
+    Unlock,
+    /// 잠금 PIN을 등록하거나 바꿉니다
+    Pin,
     /// 자격 증명 관리자에 저장한 비밀 값을 관리합니다
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// 탐색기 우클릭 메뉴를 관리합니다
+    Shell {
+        #[command(subcommand)]
+        action: ShellAction,
     },
     /// Windows 로그인 시 에이전트 자동 실행을 설정합니다
     Autostart {
@@ -86,6 +99,15 @@ enum SecretAction {
     Delete { id: String, field: String },
     /// 저장한 비밀 값 대상 이름을 보여 줍니다(값은 보이지 않음)
     List { id: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum ShellAction {
+    Enable,
+    Disable,
+    #[command(hide = true)]
+    DisableLocal,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -341,9 +363,7 @@ fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<Backen
 }
 
 fn default_config_path() -> Result<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")
-        .ok_or_else(|| Error::Config("APPDATA 환경 변수가 없습니다".into()))?;
-    Ok(PathBuf::from(appdata).join("ExpanDrv").join("config.toml"))
+    expandrv_core::config::default_config_path()
 }
 
 /// `%LOCALAPPDATA%\ExpanDrv`
@@ -608,7 +628,7 @@ fn notify_reload(pipe: &str) {
 
 fn run(cli: Cli) -> Result<()> {
     let cfg_path = match cli.config {
-        Some(p) => p,
+        Some(p) => expandrv_core::config::expand_tilde(p),
         None => default_config_path()?,
     };
     let pipe = pipe_name(cli.pipe)?;
@@ -653,6 +673,13 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::List => list(&Config::load(&cfg_path)?, &pipe),
         Command::Check { id } => {
+            let locked = match AgentLink::connect(&pipe)? {
+                Some(mut link) => link.status()?.locked,
+                None => expandrv_secrets::lock::PinStore::new(&cfg_path)?.configured()?,
+            };
+            if locked {
+                return Err(message("드라이브가 잠겨 있습니다. 먼저 잠금을 해제하세요"));
+            }
             let cfg = Config::load(&cfg_path)?;
             let d = cfg
                 .drive(&id)
@@ -669,8 +696,71 @@ fn run(cli: Cli) -> Result<()> {
         Command::Unmount { id } => unmount(&pipe, &id),
         Command::Agent { autostart, .. } => agent::run(cfg_path, &pipe, autostart),
         Command::Stop => stop(&pipe),
+        Command::Lock => {
+            let mut link = AgentLink::start(&pipe, &cfg_path)?;
+            expect_ok(link.call(&Request::Lock)?)?;
+            println!("모든 드라이브를 잠갔습니다");
+            Ok(())
+        }
+        Command::Unlock => {
+            use secrecy::ExposeSecret;
+            let pin = read_secret("잠금 PIN")?;
+            let mut link = AgentLink::start(&pipe, &cfg_path)?;
+            expect_ok(link.call(&Request::Unlock {
+                pin: expandrv_ipc::Pin(pin.expose_secret().to_owned()),
+            })?)?;
+            println!("잠금을 해제했습니다. 필요한 드라이브를 마운트하세요");
+            Ok(())
+        }
+        Command::Pin => {
+            use secrecy::ExposeSecret;
+            let configured = expandrv_secrets::lock::PinStore::new(&cfg_path)?.configured()?;
+            let current = if configured {
+                read_secret("현재 PIN")?
+            } else {
+                SecretString::from(String::new())
+            };
+            let pin = read_secret("새 PIN (숫자 6~12자리)")?;
+            let again = read_secret("새 PIN 확인")?;
+            if pin.expose_secret() != again.expose_secret() {
+                return Err(message("새 PIN 확인이 일치하지 않습니다"));
+            }
+            let mut link = AgentLink::start(&pipe, &cfg_path)?;
+            expect_ok(link.call(&Request::SetPin {
+                current: expandrv_ipc::Pin(current.expose_secret().to_owned()),
+                new: expandrv_ipc::Pin(pin.expose_secret().to_owned()),
+            })?)?;
+            println!("PIN을 저장했습니다");
+            Ok(())
+        }
         Command::Secret { action } => secret(action),
         Command::Autostart { action } => autostart_cmd(action, &cfg_path),
+        Command::Shell { action } => {
+            match action {
+                ShellAction::Enable => {
+                    let gui = std::env::current_exe()?.with_file_name("expandrv-gui.exe");
+                    expandrv_shell::install(&gui, &cfg_path)?;
+                    println!("탐색기 메뉴를 등록했습니다");
+                }
+                ShellAction::Disable => {
+                    expandrv_shell::uninstall()?;
+                    println!("탐색기 메뉴를 해제했습니다");
+                }
+                ShellAction::DisableLocal => {
+                    let gui = std::env::current_exe()?.with_file_name("expandrv-gui.exe");
+                    expandrv_shell::uninstall_for(&gui)?;
+                }
+                ShellAction::Status => println!(
+                    "{}",
+                    if expandrv_shell::enabled()? {
+                        "켜짐"
+                    } else {
+                        "꺼짐"
+                    }
+                ),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -939,5 +1029,14 @@ mod tests {
     fn serial_is_stable() {
         assert_eq!(serial("nas"), serial("nas"));
         assert_ne!(serial("nas"), serial("nas2"));
+    }
+
+    #[test]
+    fn default_config_path_points_to_dot_config() {
+        let path = default_config_path().unwrap();
+        assert!(
+            path.ends_with(".config/ExpanDrv/config.toml")
+                || path.ends_with(r".config\ExpanDrv\config.toml")
+        );
     }
 }

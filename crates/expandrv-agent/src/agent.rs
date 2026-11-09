@@ -2,19 +2,21 @@
 //!
 //! 드라이브마다 독립적으로 마운트와 해제를 처리하므로 한 드라이브의 실패가 다른 드라이브에 번지지 않습니다.
 
+use crate::auto_lock::{self, Reason};
 use crate::{cache_dir, ipc_err, serial};
 use expandrv_core::config::{Config, DriveConfig};
 use expandrv_core::{Error, Result};
 use expandrv_ipc::{
     AgentStatus, DriveState, DriveStatus, ErrorCode, Handler, IpcServer, Request, Response,
 };
+use expandrv_secrets::lock::PinStore;
 use expandrv_secrets::{CredentialStore, Secrets, target_for};
 use expandrv_vfs::{DiskCacheOptions, Vfs, VfsOptions};
 use expandrv_winfsp::{MountOptions, MountedDrive};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
@@ -36,13 +38,23 @@ struct State {
     /// 마운트나 해제가 진행 중인 드라이브. 해제 중이면 남은 업로드 수를 보이도록 VFS를 둡니다.
     busy: HashMap<String, Option<Vfs>>,
     shutting_down: bool,
+    locked: bool,
+    locking: bool,
+    pin_configured: bool,
+    pin_failures: u32,
+    pin_retry: Option<Instant>,
+    activity_anchor: Option<Instant>,
 }
 
 pub struct Agent {
     cfg_path: PathBuf,
     rt: Handle,
     state: Mutex<State>,
-    stop: Notify,
+    stop: Arc<Notify>,
+    lock_requested: Arc<Notify>,
+    session_lock_requested: Arc<Notify>,
+    transitions: tokio::sync::Mutex<()>,
+    tray: Option<crate::tray::Tray>,
 }
 
 fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)> {
@@ -81,6 +93,7 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
             metadata_ttl: Duration::from_secs(d.cache.metadata_ttl_secs),
             block_size: u64::from(d.cache.block_size_mib) << 20,
             memory_cache_bytes: (d.cache.memory_limit_mib as usize) << 20,
+            readahead_blocks: d.cache.readahead_blocks,
             meta_db: Some(dir.join("meta.db")),
             disk_cache,
             ..VfsOptions::new(dir.join("staging"))
@@ -129,13 +142,16 @@ fn cache_key(id: &str) -> Result<[u8; 32]> {
 
 /// 새 쓰기를 막은 뒤(드라이브 먼저 해제) 남은 업로드를 마칩니다.
 /// 끝내지 못한 업로드는 멈추고 저널에 남겨 다음 마운트 때 이어 올립니다.
-fn release(id: &str, m: Mounted) -> Result<()> {
+fn release(id: &str, m: Mounted, tray: Option<crate::tray::Tray>) -> Result<()> {
     drop(m.drive);
     let pending = m.vfs.pending_uploads();
     if pending > 0 {
         tracing::info!(id, pending, "남은 업로드를 마치는 중");
     }
     let drained = m.vfs.sync(UPLOAD_DRAIN_TIMEOUT);
+    if let Some(tray) = tray {
+        tray.transfers(id, &m.vfs);
+    }
     m.vfs.shutdown();
     if let Err(e) = &drained {
         tracing::warn!(id, error = %e, "업로드를 마치지 못해 다음 마운트 때 이어 올립니다");
@@ -152,16 +168,35 @@ fn joined<T>(r: std::result::Result<Result<T>, tokio::task::JoinError>) -> Resul
 }
 
 impl Agent {
-    fn new(cfg_path: PathBuf, config: Config, rt: Handle) -> Self {
-        Self {
+    fn new(cfg_path: PathBuf, config: Config, rt: Handle) -> Result<Self> {
+        let pins = PinStore::new(&cfg_path)?;
+        let pin_configured = pins.configured()?;
+        let stop = Arc::new(Notify::new());
+        let lock_requested = Arc::new(Notify::new());
+        let session_lock_requested = Arc::new(Notify::new());
+        let tray = crate::tray::Tray::start(
+            stop.clone(),
+            lock_requested.clone(),
+            session_lock_requested.clone(),
+        )
+        .map_err(|e| tracing::warn!(error = %e, "트레이 스레드 시작 실패"))
+        .ok();
+        Ok(Self {
             cfg_path,
             rt,
             state: Mutex::new(State {
                 config,
+                pin_configured,
+                locked: pin_configured,
+                activity_anchor: Some(Instant::now()),
                 ..State::default()
             }),
-            stop: Notify::new(),
-        }
+            stop,
+            lock_requested,
+            session_lock_requested,
+            tray,
+            transitions: tokio::sync::Mutex::new(()),
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -204,7 +239,12 @@ impl Agent {
                 }
             })
             .collect();
-        AgentStatus { drives }
+        AgentStatus {
+            drives,
+            locked: st.locked,
+            locking: st.locking,
+            pin_configured: st.pin_configured,
+        }
     }
 
     async fn mount(&self, id: &str) -> Response {
@@ -212,6 +252,12 @@ impl Agent {
             let mut st = self.lock();
             if st.shutting_down {
                 return Response::error(ErrorCode::ShuttingDown, "에이전트가 종료 중입니다");
+            }
+            if st.locked {
+                return Response::error(
+                    ErrorCode::Locked,
+                    "드라이브가 잠겨 있습니다. PIN으로 잠금을 해제하세요",
+                );
             }
             let Some(d) = st.config.drive(id).cloned() else {
                 return Response::error(
@@ -287,7 +333,8 @@ impl Agent {
             m
         };
         let owned = id.to_owned();
-        let r = joined(tokio::task::spawn_blocking(move || release(&owned, m)).await);
+        let tray = self.tray.clone();
+        let r = joined(tokio::task::spawn_blocking(move || release(&owned, m, tray)).await);
         let mut st = self.lock();
         st.busy.remove(id);
         match r {
@@ -310,6 +357,9 @@ impl Agent {
             Ok(cfg) => {
                 let mut st = self.lock();
                 st.failed.retain(|id, _| cfg.drive(id).is_some());
+                if st.config.security != cfg.security {
+                    st.activity_anchor = Some(Instant::now());
+                }
                 st.config = cfg;
                 tracing::info!("설정을 다시 읽었습니다");
                 Response::Ok
@@ -318,9 +368,120 @@ impl Agent {
         }
     }
 
+    async fn lock_drives(&self, reason: Reason) -> Response {
+        let _guard = self.transitions.lock().await;
+        {
+            let mut st = self.lock();
+            if st.shutting_down {
+                return Response::error(ErrorCode::ShuttingDown, "에이전트가 종료 중입니다");
+            }
+            if reason != Reason::Manual
+                && (!st.pin_configured
+                    || st.locked
+                    || !auto_lock::due(
+                        &st.config.security,
+                        reason,
+                        if reason == Reason::Idle {
+                            auto_lock::idle_time()
+                        } else {
+                            None
+                        },
+                        st.activity_anchor.map_or(Duration::ZERO, |at| at.elapsed()),
+                    ))
+            {
+                return Response::Ok;
+            }
+            if !st.pin_configured {
+                return Response::error(ErrorCode::Config, "설정에서 잠금 PIN을 먼저 등록하세요");
+            }
+            st.locked = true;
+            st.locking = true;
+            tracing::info!(?reason, "드라이브 잠금 시작");
+        }
+        let errors = self.drain_all().await;
+        self.lock().locking = false;
+        if errors.is_empty() {
+            Response::Ok
+        } else {
+            Response::error(
+                ErrorCode::UnmountFailed,
+                format!(
+                    "잠금을 완료했습니다. 남은 변경분은 다음 마운트에 이어 올립니다: {}",
+                    errors.join("; ")
+                ),
+            )
+        }
+    }
+
+    async fn pin_action(
+        &self,
+        current: expandrv_ipc::Pin,
+        new: Option<expandrv_ipc::Pin>,
+    ) -> Response {
+        let _guard = self.transitions.lock().await;
+        {
+            let st = self.lock();
+            if st.shutting_down {
+                return Response::error(ErrorCode::ShuttingDown, "에이전트가 종료 중입니다");
+            }
+            if st.pin_retry.is_some_and(|at| at > Instant::now()) {
+                return Response::error(
+                    ErrorCode::Busy,
+                    "PIN을 여러 번 틀렸습니다. 30초 후 다시 입력하세요",
+                );
+            }
+            if new.is_some() && st.locked {
+                return Response::error(ErrorCode::Locked, "PIN을 바꾸려면 먼저 잠금을 해제하세요");
+            }
+            if new.is_none() && !st.pin_configured {
+                return Response::Ok;
+            }
+        }
+        let pins = PinStore::new(&self.cfg_path);
+        let setting = new.is_some();
+        let result = joined(
+            tokio::task::spawn_blocking(move || {
+                let pins = pins?;
+                match new {
+                    Some(new) => pins.set(&current.0, &new.0),
+                    None => pins.verify(&current.0),
+                }
+            })
+            .await,
+        );
+        let mut st = self.lock();
+        match result {
+            Ok(()) => {
+                st.pin_failures = 0;
+                st.pin_retry = None;
+                st.activity_anchor = Some(Instant::now());
+                if setting {
+                    st.pin_configured = true;
+                } else {
+                    st.locked = false;
+                }
+                Response::Ok
+            }
+            Err(e) => {
+                if matches!(e, Error::Auth(_)) {
+                    st.pin_failures += 1;
+                    if st.pin_failures >= 5 {
+                        st.pin_retry = Some(Instant::now() + Duration::from_secs(30));
+                        st.pin_failures = 0;
+                    }
+                }
+                Response::error(ErrorCode::Authentication, e.to_string())
+            }
+        }
+    }
+
     /// 새 작업을 막고 진행 중인 작업을 기다린 뒤 모든 드라이브를 함께 해제합니다.
     async fn unmount_all(&self) -> Vec<String> {
         self.lock().shutting_down = true;
+        self.drain_all().await
+    }
+
+    async fn drain_all(&self) -> Vec<String> {
         while !self.lock().busy.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -331,7 +492,13 @@ impl Agent {
                 .map(|(id, m)| {
                     st.busy.insert(id.clone(), Some(m.vfs.clone()));
                     let owned = id.clone();
-                    (id, tokio::task::spawn_blocking(move || release(&owned, m)))
+                    {
+                        let tray = self.tray.clone();
+                        (
+                            id,
+                            tokio::task::spawn_blocking(move || release(&owned, m, tray)),
+                        )
+                    }
                 })
                 .collect()
         };
@@ -358,14 +525,19 @@ impl Handler for Agent {
     }
 
     async fn handle(&self, req: Request) -> Response {
-        match req {
+        let update = !matches!(&req, Request::Status | Request::Hello { .. });
+        let response = match req {
             // Hello는 IPC 서버가 직접 답합니다.
             Request::Hello { .. } => Response::Ok,
             Request::Status => Response::Status(self.status()),
+            Request::Lock => self.lock_drives(Reason::Manual).await,
+            Request::Unlock { pin } => self.pin_action(pin, None).await,
+            Request::SetPin { current, new } => self.pin_action(current, Some(new)).await,
             Request::Mount { id } => self.mount(&id).await,
             Request::Unmount { id } => self.unmount(&id).await,
             Request::Reload => self.reload(),
             Request::Shutdown => {
+                let _guard = self.transitions.lock().await;
                 let errors = self.unmount_all().await;
                 self.stop.notify_one();
                 if errors.is_empty() {
@@ -374,7 +546,11 @@ impl Handler for Agent {
                     Response::error(ErrorCode::UnmountFailed, errors.join("; "))
                 }
             }
+        };
+        if update && let Some(tray) = &self.tray {
+            tray.status(self.status());
         }
+        response
     }
 }
 
@@ -392,8 +568,75 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
             .filter(|d| autostart && d.auto_mount)
             .map(|d| d.id.clone())
             .collect();
-        let agent = Arc::new(Agent::new(cfg_path, config, Handle::current()));
+        let agent = Arc::new(Agent::new(cfg_path, config, Handle::current())?);
         tracing::info!(pid = std::process::id(), autostart, "에이전트 시작");
+        let lock_agent = agent.clone();
+        let lock_monitor = tokio::spawn(async move {
+            loop {
+                lock_agent.lock_requested.notified().await;
+                let response = lock_agent.lock_drives(Reason::Manual).await;
+                if let Some(tray) = &lock_agent.tray {
+                    tray.status(lock_agent.status());
+                    match response {
+                        Response::Ok => tray.notice("드라이브 잠금", "모든 드라이브를 잠갔습니다"),
+                        Response::Error { message, .. } => tray.notice("드라이브 잠금", &message),
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let auto_agent = agent.clone();
+        let auto_monitor = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let reason = tokio::select! {
+                    _ = auto_agent.session_lock_requested.notified() => Reason::Session,
+                    _ = tick.tick() => Reason::Idle,
+                };
+                if auto_agent.lock().locked {
+                    continue;
+                }
+                let response = auto_agent.lock_drives(reason).await;
+                if let Some(tray) = &auto_agent.tray {
+                    let status = auto_agent.status();
+                    if status.locked {
+                        tray.status(status);
+                        match response {
+                            Response::Error { message, .. } => tray.notice("자동 잠금", &message),
+                            _ => tray.notice(
+                                "자동 잠금",
+                                if reason == Reason::Session {
+                                    "Windows 잠금에 맞춰 드라이브를 잠갔습니다"
+                                } else {
+                                    "유휴 시간이 지나 드라이브를 잠갔습니다"
+                                },
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+        let weak = Arc::downgrade(&agent);
+        let monitor = tokio::spawn(async move {
+            loop {
+                let Some(agent) = weak.upgrade() else { break };
+                if let Some(tray) = &agent.tray {
+                    tray.status(agent.status());
+                    let st = agent.lock();
+                    for (id, mounted) in &st.mounted {
+                        tray.transfers(id, &mounted.vfs);
+                    }
+                    for (id, vfs) in &st.busy {
+                        if let Some(vfs) = vfs {
+                            tray.transfers(id, vfs);
+                        }
+                    }
+                }
+                drop(agent);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
         for id in auto {
             let a = agent.clone();
             tokio::spawn(async move {
@@ -419,6 +662,15 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
         let served = server.serve(agent.clone(), shutdown).await;
         // 서버가 오류로 끝나도 드라이브는 업로드를 마치고 해제합니다.
         let errors = agent.unmount_all().await;
+        if let Some(tray) = &agent.tray {
+            tray.status(agent.status());
+        }
+        monitor.abort();
+        lock_monitor.abort();
+        auto_monitor.abort();
+        if let Some(tray) = &agent.tray {
+            tray.shutdown();
+        }
         tracing::info!("에이전트 종료");
         served.map_err(ipc_err)?;
         if errors.is_empty() {
