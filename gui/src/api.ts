@@ -132,9 +132,18 @@ export interface DrivePatch {
   proxy: ProxyInput | null;
 }
 
+/** 트레이 알림 대분류별 표시 여부 */
+export interface NotificationSettings {
+  mountStatus: boolean;
+  fileTransfers: boolean;
+  lockRecovery: boolean;
+  autoUpdater: boolean;
+}
+
 export interface SettingsView {
   lockOnSessionLock: boolean;
   idleLockMinutes: number;
+  notifications: NotificationSettings;
   explorerMenu: boolean;
   autostart: boolean;
   autostartCommand: string | null;
@@ -180,6 +189,8 @@ export const api = {
   launchDrive: () => call<string | null>('launch_drive'),
   setAutostart: (enabled: boolean) => call<SettingsView>('set_autostart', { enabled }),
   setAutoLock: (sessionLock: boolean, idleMinutes: number) => call<SettingsView>('set_auto_lock', { sessionLock, idleMinutes }),
+  setNotifications: (notifications: NotificationSettings) =>
+    call<SettingsView>('set_notifications', { notifications }),
   stopAgent: () => call<boolean>('stop_agent'),
 };
 

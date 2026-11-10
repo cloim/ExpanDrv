@@ -3,10 +3,12 @@
 use crate::agent::{self, Result};
 use crate::drives::{self, BackendInput, DriveDetail, DrivePatch, NewDrive, ProxyInput, Secret};
 use expandrv_core::RemotePath;
-use expandrv_core::config::{BackendConfig, Config, ProxyConfig, SecretResolver};
+use expandrv_core::config::{
+    BackendConfig, Config, NotificationConfig, ProxyConfig, SecretResolver,
+};
 use expandrv_ipc::{AgentStatus, DriveState, Request};
 use expandrv_secrets::{CredentialStore, Secrets};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -422,11 +424,44 @@ pub fn free_letters(used_mask: u32, cfg: &Config) -> Vec<String> {
         .collect()
 }
 
+/// 화면에 보이는 알림 대분류 설정. 설정 파일의 `[notifications]`와 같습니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NotificationSettings {
+    pub mount_status: bool,
+    pub file_transfers: bool,
+    pub lock_recovery: bool,
+    pub auto_updater: bool,
+}
+
+impl From<NotificationConfig> for NotificationSettings {
+    fn from(c: NotificationConfig) -> Self {
+        Self {
+            mount_status: c.mount_status,
+            file_transfers: c.file_transfers,
+            lock_recovery: c.lock_recovery,
+            auto_updater: c.auto_updater,
+        }
+    }
+}
+
+impl From<NotificationSettings> for NotificationConfig {
+    fn from(s: NotificationSettings) -> Self {
+        Self {
+            mount_status: s.mount_status,
+            file_transfers: s.file_transfers,
+            lock_recovery: s.lock_recovery,
+            auto_updater: s.auto_updater,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub lock_on_session_lock: bool,
     pub idle_lock_minutes: u32,
+    pub notifications: NotificationSettings,
     pub explorer_menu: bool,
     pub autostart: bool,
     pub autostart_command: Option<String>,
@@ -453,6 +488,7 @@ async fn settings_view(state: &AppState) -> Result<SettingsView> {
     Ok(SettingsView {
         lock_on_session_lock: config.security.lock_on_session_lock,
         idle_lock_minutes: config.security.idle_minutes,
+        notifications: config.notifications.into(),
         explorer_menu: expandrv_shell::enabled().map_err(|e| e.to_string())?,
         autostart: command.is_some(),
         autostart_command: command,
@@ -581,4 +617,24 @@ pub async fn set_auto_lock(
     })?;
     state.reload().await?;
     settings_view(&state).await
+}
+
+/// 알림 대분류 표시 여부를 저장하고 실행 중인 에이전트에 바로 반영합니다.
+#[tauri::command]
+pub async fn set_notifications(
+    state: State<'_, AppState>,
+    notifications: NotificationSettings,
+) -> Result<SettingsView> {
+    state.edit(|path| save_notifications(path, notifications))?;
+    state.reload().await?;
+    settings_view(&state).await
+}
+
+pub fn save_notifications(
+    path: &Path,
+    notifications: NotificationSettings,
+) -> expandrv_core::Result<()> {
+    let mut config = Config::load(path)?;
+    config.notifications = notifications.into();
+    config.save(path)
 }

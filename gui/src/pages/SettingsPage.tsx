@@ -1,16 +1,45 @@
 import { PinSettings } from '../LockScreen';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Copy, Power, RefreshCw, Loader2 } from 'lucide-react';
+import type { KeyboardEvent } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { Bell, Copy, Loader2, Power, RefreshCw, Server, ShieldCheck, SlidersHorizontal } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import SelectControl from '../components/SelectControl';
 import { Modal } from '../components/Modal';
 import { api, errorText } from '../api';
-import type { SettingsView } from '../api';
+import type { NotificationSettings, SettingsView } from '../api';
 import { PageFrame } from '../shell/AppShell';
 import { useStatus } from '../status';
 import { useTheme } from '../theme';
 import type { ThemePref } from '../theme';
 import { Field, IconButton, Led, Section, Skeleton, Switch } from '../ui/controls';
 import { useToast } from '../ui/Toast';
+
+type TabId = 'general' | 'security' | 'notifications' | 'agent';
+
+const TABS: { id: TabId; label: string; icon: LucideIcon }[] = [
+  { id: 'general', label: '일반', icon: SlidersHorizontal },
+  { id: 'security', label: '보안/잠금', icon: ShieldCheck },
+  { id: 'notifications', label: '알림', icon: Bell },
+  { id: 'agent', label: '에이전트', icon: Server },
+];
+
+const NOTIFICATION_ITEMS: { key: keyof NotificationSettings; label: string; hint: string }[] = [
+  { key: 'mountStatus', label: '마운트 상태', hint: '드라이브 마운트 완료, 마운트 해제, 작업 실패를 알립니다' },
+  { key: 'fileTransfers', label: '파일 전송', hint: '백그라운드 업로드 완료와 충돌 사본 생성을 알립니다' },
+  {
+    key: 'lockRecovery',
+    label: '잠금 및 복구',
+    hint: '수동 잠금, Windows 세션 잠금, 유휴 자동 잠금과 잠금 해제 뒤 드라이브 복구를 알립니다',
+  },
+  { key: 'autoUpdater', label: '자동 업데이트', hint: '업데이트 확인, 다운로드, 설치 준비와 설치 진행을 알립니다' },
+];
+
+const IDLE_CHOICES = [0, 1, 5, 10, 15, 30, 60, 120, 240, 480, 1440];
+
+function isTab(value: string | null): value is TabId {
+  return TABS.some((t) => t.id === value);
+}
 
 function PathRow({ label, value, note }: { label: string; value?: string; note?: string }) {
   const toast = useToast();
@@ -26,7 +55,7 @@ function PathRow({ label, value, note }: { label: string; value?: string; note?:
   return (
     <div className="flex items-center gap-3">
       <div className="min-w-0 flex-1">
-        <div className="text-xs font-semibold text-ink-2">
+        <div className="text-xs font-semibold break-keep text-ink-2">
           {label}
           {note ? <span className="ml-1.5 font-normal text-danger">{note}</span> : null}
         </div>
@@ -37,15 +66,83 @@ function PathRow({ label, value, note }: { label: string; value?: string; note?:
   );
 }
 
+/** 화살표, Home, End 키로 탭을 옮기는 탭 막대(WAI-ARIA Tabs, 자동 활성화) */
+function TabBar({ active, onSelect }: { active: TabId; onSelect: (id: TabId) => void }) {
+  const refs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    const index = TABS.findIndex((t) => t.id === active);
+    const next =
+      e.key === 'ArrowRight' ? (index + 1) % TABS.length
+      : e.key === 'ArrowLeft' ? (index - 1 + TABS.length) % TABS.length
+      : e.key === 'Home' ? 0
+      : e.key === 'End' ? TABS.length - 1
+      : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    const id = TABS[next].id;
+    onSelect(id);
+    refs.current[id]?.focus();
+  };
+  return (
+    <div className="flex-none border-b border-line bg-surface px-5">
+      <div
+        role="tablist"
+        aria-label="설정 분류"
+        onKeyDown={onKeyDown}
+        className="mx-auto flex w-full max-w-[1100px] gap-1 overflow-x-auto"
+      >
+        {TABS.map(({ id, label, icon: Icon }) => {
+          const selected = id === active;
+          return (
+            <button
+              key={id}
+              ref={(el) => {
+                refs.current[id] = el;
+              }}
+              id={`settings-tab-${id}`}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              aria-controls={selected ? `settings-panel-${id}` : undefined}
+              tabIndex={selected ? 0 : -1}
+              onClick={() => onSelect(id)}
+              className={`-mb-px flex h-11 flex-none items-center gap-2 border-b-2 px-3 text-[13px] font-semibold whitespace-nowrap transition-colors ${
+                selected ? 'border-accent text-ink' : 'border-transparent text-ink-2 hover:text-ink'
+              }`}
+            >
+              <Icon size={15} aria-hidden="true" className={selected ? 'text-accent' : ''} />
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function SavingNote() {
+  return (
+    <p role="status" className="flex items-center gap-2 text-xs text-ink-2">
+      <Loader2 size={14} className="spin" aria-hidden="true" />
+      설정을 저장하는 중
+    </p>
+  );
+}
+
 export function SettingsPage() {
   const toast = useToast();
   const { refresh, status } = useStatus();
+  const [params, setParams] = useSearchParams();
+  const requested = params.get('tab');
+  const tab: TabId = isTab(requested) ? requested : 'general';
   const [view, setView] = useState<SettingsView | null>(null);
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState<'autostart' | 'explorer' | 'security' | 'stop' | 'load' | null>('load');
+  const [busy, setBusy] = useState<'autostart' | 'explorer' | 'security' | 'notifications' | 'stop' | 'load' | null>('load');
   const [confirmStop, setConfirmStop] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const [theme, setTheme] = useTheme();
+
+  const selectTab = (id: TabId) => setParams(id === 'general' ? {} : { tab: id }, { replace: true });
 
   const load = useCallback(async () => {
     setBusy('load');
@@ -93,6 +190,16 @@ export function SettingsPage() {
     finally { setBusy(null); }
   };
 
+  const toggleNotification = async (key: keyof NotificationSettings, label: string, enabled: boolean) => {
+    if (!view) return;
+    setBusy('notifications');
+    try {
+      setView(await api.setNotifications({ ...view.notifications, [key]: enabled }));
+      toast.ok(enabled ? `${label} 알림을 켰습니다` : `${label} 알림을 껐습니다`);
+    } catch (e) { toast.error(errorText(e)); }
+    finally { setBusy(null); }
+  };
+
   const stop = async () => {
     setConfirmStop(false);
     setBusy('stop');
@@ -111,111 +218,160 @@ export function SettingsPage() {
   return (
     <PageFrame
       title="설정"
-      scroll
       actions={<IconButton label="새로 고침" icon={RefreshCw} busy={busy === 'load'} onClick={() => void load()} />}
     >
-      <div className="rise mx-auto grid w-full max-w-[1100px] grid-cols-1 gap-4 p-5 lg:grid-cols-2">
-        {error ? (
-          <div role="alert" className="panel col-span-full px-5 py-3 text-danger">
-            설정을 읽지 못했습니다: {error}
-          </div>
-        ) : null}
-
-        <Section title="에이전트">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 text-[13px]">
-              <Led state={view?.agentRunning ? 'on' : 'off'} busy={busy === 'stop'} />
-              {view ? (
-                view.agentRunning ? (
-                  <span>
-                    실행 중 <span className="kbd-mono text-ink-3">v{view.agentVersion}</span>
-                  </span>
-                ) : (
-                  <span className="text-ink-2">실행 중이 아닙니다</span>
-                )
-              ) : (
-                <Skeleton className="w-28" />
-              )}
+      <TabBar active={tab} onSelect={selectTab} />
+      <div data-ui-audit-scroll-root className="min-h-0 flex-1 overflow-y-auto">
+        <div
+          key={tab}
+          id={`settings-panel-${tab}`}
+          role="tabpanel"
+          aria-labelledby={`settings-tab-${tab}`}
+          className="rise mx-auto grid w-full max-w-[1100px] grid-cols-1 content-start gap-4 p-5 lg:grid-cols-2"
+        >
+          {error ? (
+            <div role="alert" className="panel col-span-full px-5 py-3 break-keep text-danger">
+              설정을 읽지 못했습니다: {error}
             </div>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              disabled={!view?.agentRunning || busy === 'stop'}
-              onClick={() => setConfirmStop(true)}
-            >
-              <Power size={15} aria-hidden="true" className={busy === 'stop' ? 'spin' : ''} />
-              {busy === 'stop' ? '종료하는 중' : '에이전트 종료'}
-            </button>
-          </div>
-          <dl className="grid grid-cols-[110px_1fr] gap-y-2 text-[13px]">
-            <dt className="text-ink-3">GUI 버전</dt>
-            <dd className="kbd-mono">{view ? view.guiVersion : <Skeleton className="w-16" />}</dd>
-          </dl>
-        </Section>
-
-        <Section title="자동 실행">
-          <Switch
-            label="로그인할 때 에이전트 시작"
-            hint="자동 마운트를 켠 드라이브를 함께 마운트합니다"
-            checked={view?.autostart ?? false}
-            disabled={!view || busy === 'autostart' || (!view.cliFound && !view.autostart)}
-            onChange={(v) => void toggleAutostart(v)}
-          />
-          {view?.autostartCommand ? (
-            <p className="kbd-mono rounded-lg bg-surface-2 px-3 py-2 text-[11.5px] break-all text-ink-2">
-              {view.autostartCommand}
-            </p>
           ) : null}
-        </Section>
 
-        <Section title="탐색기 메뉴">
-          <Switch label="탐색기 우클릭 메뉴에 ExpanDrv 표시"
-            hint="드라이브와 폴더에서 앱 또는 드라이브 속성을 엽니다"
-            checked={view?.explorerMenu ?? false} disabled={!view || busy !== null}
-            onChange={(enabled) => void toggleExplorer(enabled)} />
-          <p className="text-xs leading-relaxed text-ink-3">Windows 11에서는 ‘추가 옵션 표시’에서 사용할 수 있습니다</p>
-          {busy === 'explorer' ? <p role="status" className="text-xs text-ink-2">탐색기 메뉴를 변경하는 중</p> : null}
-        </Section>
+          {tab === 'general' ? (
+            <>
+              <Section title="자동 실행">
+                <Switch
+                  label="로그인할 때 에이전트 시작"
+                  hint="자동 마운트를 켠 드라이브를 함께 마운트합니다"
+                  checked={view?.autostart ?? false}
+                  disabled={!view || busy === 'autostart' || (!view.cliFound && !view.autostart)}
+                  onChange={(v) => void toggleAutostart(v)}
+                />
+                {view?.autostartCommand ? (
+                  <p className="kbd-mono rounded-lg bg-surface-2 px-3 py-2 text-[11.5px] break-all text-ink-2">
+                    {view.autostartCommand}
+                  </p>
+                ) : null}
+              </Section>
 
-        <Section title="경로" className="lg:col-span-2">
-          <PathRow label="설정 파일" value={view?.configPath} />
-          <PathRow label="로그 폴더" value={view?.logDir} />
-          <PathRow
-            label="CLI 실행 파일"
-            value={view?.cliPath}
-            note={view && !view.cliFound ? '파일이 없어 에이전트를 시작할 수 없습니다' : undefined}
-          />
-        </Section>
+              <Section title="탐색기 메뉴">
+                <Switch label="탐색기 우클릭 메뉴에 ExpanDrv 표시"
+                  hint="드라이브와 폴더에서 앱 또는 드라이브 속성을 엽니다"
+                  checked={view?.explorerMenu ?? false} disabled={!view || busy !== null}
+                  onChange={(enabled) => void toggleExplorer(enabled)} />
+                <p className="text-xs leading-relaxed break-keep text-ink-3">Windows 11에서는 ‘추가 옵션 표시’에서 사용할 수 있습니다</p>
+                {busy === 'explorer' ? <p role="status" className="text-xs text-ink-2">탐색기 메뉴를 변경하는 중</p> : null}
+              </Section>
 
-        <Section title="드라이브 잠금"><PinSettings /></Section>
+              <Section title="화면">
+                <Field label="테마">
+                  {(p) => (
+                    <SelectControl {...p} value={theme} onChange={(e) => setTheme(e.target.value as ThemePref)}>
+                      <option value="system">시스템 설정 따르기</option>
+                      <option value="light">밝게</option>
+                      <option value="dark">어둡게</option>
+                    </SelectControl>
+                  )}
+                </Field>
+              </Section>
+            </>
+          ) : null}
 
-        <Section title="자동 잠금">
-          <Switch label="Windows를 잠그면 드라이브도 잠금"
-            hint="Windows 잠금 시 드라이브를 잠그고 해제 시 직전 드라이브를 자동 복구합니다 (수동 잠금은 PIN 유지)"
-            checked={view?.lockOnSessionLock ?? true} disabled={!view || busy !== null}
-            onChange={(enabled) => void updateAutoLock(enabled, view?.idleLockMinutes ?? 0)} />
-          <Field label="입력이 없을 때 잠금" hint="마우스와 키보드를 사용하지 않은 시간">
-            {(p) => <SelectControl {...p} value={view?.idleLockMinutes ?? 0} disabled={!view || !status?.pinConfigured || busy !== null}
-              onChange={(e) => void updateAutoLock(view?.lockOnSessionLock ?? true, Number(e.target.value))}>
-              {[0, 1, 5, 10, 15, 30, 60, 120, 240, 480, 1440].map((n) => <option key={n} value={n}>{n === 0 ? '사용 안 함' : `${n}분`}</option>)}
-              {view && ![0, 1, 5, 10, 15, 30, 60, 120, 240, 480, 1440].includes(view.idleLockMinutes) ? <option value={view.idleLockMinutes}>{view.idleLockMinutes}분</option> : null}
-            </SelectControl>}
-          </Field>
-          {!status?.pinConfigured ? <p className="text-xs text-ink-2">PIN을 등록하면 유휴 시간 자동 잠금도 사용할 수 있습니다</p> : null}
-          {busy === 'security' ? <p role="status" className="flex items-center gap-2 text-xs text-ink-2"><Loader2 size={14} className="spin" aria-hidden="true" />설정을 저장하는 중</p> : null}
-        </Section>
+          {tab === 'security' ? (
+            <>
+              <Section title="드라이브 잠금"><PinSettings /></Section>
 
-        <Section title="화면">
-          <Field label="테마">
-            {(p) => (
-              <SelectControl {...p} value={theme} onChange={(e) => setTheme(e.target.value as ThemePref)}>
-                <option value="system">시스템 설정 따르기</option>
-                <option value="light">밝게</option>
-                <option value="dark">어둡게</option>
-              </SelectControl>
-            )}
-          </Field>
-        </Section>
+              <Section title="자동 잠금">
+                <Switch label="Windows를 잠그면 드라이브도 잠금"
+                  hint="Windows 잠금 시 드라이브를 잠그고 해제 시 직전 드라이브를 자동 복구합니다 (수동 잠금은 PIN 유지)"
+                  checked={view?.lockOnSessionLock ?? true} disabled={!view || busy !== null}
+                  onChange={(enabled) => void updateAutoLock(enabled, view?.idleLockMinutes ?? 0)} />
+                <Field label="입력이 없을 때 잠금" hint="마우스와 키보드를 사용하지 않은 시간">
+                  {(p) => <SelectControl {...p} value={view?.idleLockMinutes ?? 0} disabled={!view || !status?.pinConfigured || busy !== null}
+                    onChange={(e) => void updateAutoLock(view?.lockOnSessionLock ?? true, Number(e.target.value))}>
+                    {IDLE_CHOICES.map((n) => <option key={n} value={n}>{n === 0 ? '사용 안 함' : `${n}분`}</option>)}
+                    {view && !IDLE_CHOICES.includes(view.idleLockMinutes) ? <option value={view.idleLockMinutes}>{view.idleLockMinutes}분</option> : null}
+                  </SelectControl>}
+                </Field>
+                {!status?.pinConfigured ? <p className="text-xs break-keep text-ink-2">PIN을 등록하면 유휴 시간 자동 잠금도 사용할 수 있습니다</p> : null}
+                {busy === 'security' ? <SavingNote /> : null}
+              </Section>
+            </>
+          ) : null}
+
+          {tab === 'notifications' ? (
+            <Section title="트레이 알림" className="lg:col-span-2">
+              <p className="text-xs leading-relaxed break-keep text-ink-3">
+                켠 분류만 알림 영역 풍선 알림으로 표시하고, 바꾼 설정은 실행 중인 에이전트에 바로 적용합니다
+              </p>
+              <div className="flex flex-col divide-y divide-line">
+                {NOTIFICATION_ITEMS.map(({ key, label, hint }) => (
+                  <div key={key} className="py-2 first:pt-0 last:pb-0">
+                    <Switch
+                      label={label}
+                      hint={hint}
+                      checked={view?.notifications[key] ?? true}
+                      disabled={!view || busy !== null}
+                      onChange={(enabled) => void toggleNotification(key, label, enabled)}
+                    />
+                  </div>
+                ))}
+              </div>
+              <p className="text-xs leading-relaxed break-keep text-ink-3">
+                Windows 설정에서 알림을 끄거나 방해 금지 모드를 켜면 여기서 켠 분류도 표시되지 않습니다
+              </p>
+              {busy === 'notifications' ? <SavingNote /> : null}
+            </Section>
+          ) : null}
+
+          {tab === 'agent' ? (
+            <>
+              <Section title="에이전트" className="lg:col-span-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 text-[13px]">
+                    <Led state={view?.agentRunning ? 'on' : 'off'} busy={busy === 'stop'} />
+                    {view ? (
+                      view.agentRunning ? (
+                        <span>
+                          실행 중 <span className="kbd-mono text-ink-3">v{view.agentVersion}</span>
+                        </span>
+                      ) : (
+                        <span className="text-ink-2">실행 중이 아닙니다</span>
+                      )
+                    ) : (
+                      <Skeleton className="w-28" />
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    disabled={!view?.agentRunning || busy === 'stop'}
+                    onClick={() => setConfirmStop(true)}
+                  >
+                    {busy === 'stop' ? (
+                      <Loader2 size={15} aria-hidden="true" className="spin" />
+                    ) : (
+                      <Power size={15} aria-hidden="true" />
+                    )}
+                    {busy === 'stop' ? '종료하는 중' : '에이전트 종료'}
+                  </button>
+                </div>
+                <dl className="grid grid-cols-[110px_1fr] gap-y-2 text-[13px]">
+                  <dt className="text-ink-3">GUI 버전</dt>
+                  <dd className="kbd-mono">{view ? view.guiVersion : <Skeleton className="w-16" />}</dd>
+                </dl>
+              </Section>
+
+              <Section title="경로" className="lg:col-span-2">
+                <PathRow label="설정 파일" value={view?.configPath} />
+                <PathRow label="로그 폴더" value={view?.logDir} />
+                <PathRow
+                  label="CLI 실행 파일"
+                  value={view?.cliPath}
+                  note={view && !view.cliFound ? '파일이 없어 에이전트를 시작할 수 없습니다' : undefined}
+                />
+              </Section>
+            </>
+          ) : null}
+        </div>
       </div>
 
       <Modal

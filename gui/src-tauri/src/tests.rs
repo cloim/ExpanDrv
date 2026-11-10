@@ -107,3 +107,34 @@ fn paths_detect_uses_dot_config() {
             || paths.config.ends_with(r".config\ExpanDrv\config.toml")
     );
 }
+
+#[test]
+fn notification_settings_save_keeps_drives_and_uses_camel_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg: Config = toml::from_str(CFG).unwrap();
+    cfg.version = expandrv_core::config::CONFIG_VERSION;
+    cfg.save(&path).unwrap();
+
+    let input: commands::NotificationSettings = serde_json::from_str(
+        r#"{"mountStatus":true,"fileTransfers":false,"lockRecovery":true,"autoUpdater":false}"#,
+    )
+    .unwrap();
+    commands::save_notifications(&path, input).unwrap();
+
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved.drives, cfg.drives);
+    assert!(saved.notifications.mount_status);
+    assert!(!saved.notifications.file_transfers);
+    assert!(saved.notifications.lock_recovery);
+    assert!(!saved.notifications.auto_updater);
+
+    let view =
+        serde_json::to_value(commands::NotificationSettings::from(saved.notifications)).unwrap();
+    assert_eq!(view["fileTransfers"], false);
+    assert_eq!(view["autoUpdater"], false);
+    assert!(
+        serde_json::from_str::<commands::NotificationSettings>(r#"{"mountStatus":true}"#).is_err(),
+        "화면은 네 항목을 모두 보내야 합니다"
+    );
+}

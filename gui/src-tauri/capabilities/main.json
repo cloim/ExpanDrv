@@ -27,6 +27,7 @@
     "allow-set-lock-pin",
     "allow-set-explorer-menu",
     "allow-launch-drive",
-    "allow-set-auto-lock"
+    "allow-set-auto-lock",
+    "allow-set-notifications"
   ]
 }

@@ -52,6 +52,7 @@ fn main() {
             commands::launch_drive,
             commands::set_autostart,
             commands::set_auto_lock,
+            commands::set_notifications,
             commands::stop_agent,
             commands::lock_drives,
             commands::unlock_drives,

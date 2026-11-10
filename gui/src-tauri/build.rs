@@ -18,6 +18,7 @@ const COMMANDS: &[&str] = &[
     "launch_drive",
     "set_autostart",
     "set_auto_lock",
+    "set_notifications",
     "stop_agent",
     "lock_drives",
     "unlock_drives",

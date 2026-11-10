@@ -137,7 +137,7 @@ function LockAction() {
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const lock = async () => {
-    if (!status?.pinConfigured) { navigate('/settings'); return; }
+    if (!status?.pinConfigured) { navigate('/settings?tab=security'); return; }
     setBusy(true);
     try { await api.lock(); }
     catch (e) { toast.error(errorText(e)); }
