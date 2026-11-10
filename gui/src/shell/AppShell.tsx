@@ -7,6 +7,7 @@ import { api, errorText } from '../api';
 import { useToast } from '../ui/Toast';
 import { useStatus } from '../status';
 import { Led, Skeleton, IconButton } from '../ui/controls';
+import logoUrl from '../assets/logo.png';
 
 const NAV = [
   { to: '/drives', label: '드라이브', icon: HardDrive },
@@ -16,13 +17,14 @@ const NAV = [
 
 function BrandMark() {
   return (
-    <svg viewBox="0 0 32 32" width="30" height="30" aria-hidden="true">
-      <rect x="1" y="1" width="30" height="30" rx="8" fill="#1f2226" stroke="#3a3f47" />
-      <rect x="7" y="9" width="18" height="5" rx="1.5" fill="#4a5059" />
-      <rect x="7" y="18" width="18" height="5" rx="1.5" fill="#4a5059" />
-      <circle cx="21.5" cy="11.5" r="1.6" fill="#ff7a33" />
-      <circle cx="21.5" cy="20.5" r="1.6" fill="#3ddc84" />
-    </svg>
+    <img
+      src={logoUrl}
+      width={28}
+      height={28}
+      className="size-[28px] flex-none object-contain drop-shadow-sm select-none"
+      alt=""
+      aria-hidden="true"
+    />
   );
 }
 
@@ -69,7 +71,7 @@ export function AppShell() {
               className={({ isActive }) =>
                 `flex h-10 items-center gap-3 rounded-lg px-3 text-[13px] font-semibold transition-colors ${
                   isActive
-                    ? 'bg-rail-text-strong text-rail shadow-[inset_3px_0_0_var(--accent)]'
+                    ? 'bg-rail-text-strong text-rail'
                     : 'hover:bg-rail-2 hover:text-rail-text-strong'
                 }`
               }
