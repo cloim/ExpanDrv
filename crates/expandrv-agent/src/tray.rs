@@ -1,9 +1,10 @@
 //! 에이전트 수명과 함께 동작하는 Windows 알림 영역.
+use expandrv_core::config::{NotificationConfig, NotificationKind};
 use expandrv_ipc::{AgentStatus, DriveState};
 use expandrv_vfs::{TransferEvent, Vfs};
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -53,9 +54,46 @@ pub fn menu_item_for_update_status(status: &UpdateStatus) -> (String, bool, u32)
     }
 }
 
+/// 대분류별 알림 표시 여부. 설정을 다시 읽으면 즉시 바뀌고, 대기 중인 알림에도 적용합니다.
+pub struct NotificationGate(AtomicU8);
+
+impl NotificationGate {
+    pub fn new(config: NotificationConfig) -> Self {
+        let gate = Self(AtomicU8::new(0));
+        gate.set(config);
+        gate
+    }
+
+    pub fn set(&self, config: NotificationConfig) {
+        let bits = [
+            NotificationKind::MountStatus,
+            NotificationKind::FileTransfers,
+            NotificationKind::LockRecovery,
+            NotificationKind::AutoUpdater,
+        ]
+        .into_iter()
+        .filter(|&kind| config.allows(kind))
+        .fold(0, |bits, kind| bits | Self::bit(kind));
+        self.0.store(bits, Ordering::Relaxed);
+    }
+
+    pub fn allows(&self, kind: NotificationKind) -> bool {
+        self.0.load(Ordering::Relaxed) & Self::bit(kind) != 0
+    }
+
+    fn bit(kind: NotificationKind) -> u8 {
+        match kind {
+            NotificationKind::MountStatus => 1,
+            NotificationKind::FileTransfers => 2,
+            NotificationKind::LockRecovery => 4,
+            NotificationKind::AutoUpdater => 8,
+        }
+    }
+}
+
 enum Update {
     Status(AgentStatus),
-    Notice(String, String),
+    Notice(NotificationKind, String, String),
     Shutdown(mpsc::Sender<()>),
     Updater(UpdateStatus),
     #[cfg(test)]
@@ -63,7 +101,10 @@ enum Update {
 }
 
 #[derive(Clone)]
-pub struct Tray(mpsc::SyncSender<Update>);
+pub struct Tray {
+    tx: mpsc::SyncSender<Update>,
+    gate: Arc<NotificationGate>,
+}
 
 impl Tray {
     pub fn start(
@@ -72,9 +113,12 @@ impl Tray {
         lock: Arc<Notify>,
         session_lock: Arc<Notify>,
         session_unlock: Arc<Notify>,
+        notifications: NotificationConfig,
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(128);
         let tx_clone = tx.clone();
+        let gate = Arc::new(NotificationGate::new(notifications));
+        let thread_gate = gate.clone();
         let notifiers = Arc::new(SessionNotifiers {
             lock: session_lock,
             unlock: session_unlock,
@@ -82,36 +126,50 @@ impl Tray {
         std::thread::Builder::new()
             .name("expandrv-tray".into())
             .spawn(move || {
-                if let Err(e) = unsafe { run(rx, tx_clone, rt, stop, lock, notifiers) } {
+                if let Err(e) = unsafe { run(rx, tx_clone, rt, stop, lock, notifiers, thread_gate) }
+                {
                     tracing::warn!(error = %e, "트레이를 시작하지 못했습니다");
                 }
             })?;
-        Ok(Self(tx))
+        Ok(Self { tx, gate })
     }
 
     pub fn shutdown(&self) -> bool {
         let (tx, rx) = mpsc::channel();
-        self.0.try_send(Update::Shutdown(tx)).is_ok()
+        self.tx.try_send(Update::Shutdown(tx)).is_ok()
             && rx.recv_timeout(Duration::from_secs(1)).is_ok()
     }
 
     pub fn status(&self, status: AgentStatus) {
-        let _ = self.0.try_send(Update::Status(status));
+        let _ = self.tx.try_send(Update::Status(status));
     }
 
-    pub fn notice(&self, title: &str, body: &str) {
-        let _ = self.0.try_send(Update::Notice(title.into(), body.into()));
+    /// 설정을 다시 읽은 뒤 알림 표시 여부를 바꿉니다.
+    pub fn set_notifications(&self, config: NotificationConfig) {
+        self.gate.set(config);
     }
 
+    /// 끈 대분류의 알림은 보내지 않습니다.
+    pub fn notice(&self, kind: NotificationKind, title: &str, body: &str) {
+        if self.gate.allows(kind) {
+            let _ = self
+                .tx
+                .try_send(Update::Notice(kind, title.into(), body.into()));
+        }
+    }
+
+    /// 전송 이벤트는 알림을 꺼도 비워서 쌓이지 않게 합니다.
     pub fn transfers(&self, id: &str, vfs: &Vfs) {
         for event in vfs.take_transfer_events() {
             let (title, path) = match event {
                 TransferEvent::Uploaded(p) => ("업로드 완료", p),
                 TransferEvent::Conflict(p) => ("충돌 사본 생성", p),
             };
-            let _ = self
-                .0
-                .try_send(Update::Notice(title.into(), format!("{id}: {path}")));
+            self.notice(
+                NotificationKind::FileTransfers,
+                title,
+                &format!("{id}: {path}"),
+            );
         }
     }
 }
@@ -201,6 +259,7 @@ unsafe fn run(
     stop: Arc<Notify>,
     lock: Arc<Notify>,
     notifiers: Arc<SessionNotifiers>,
+    gate: Arc<NotificationGate>,
 ) -> windows::core::Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -315,6 +374,8 @@ unsafe fn run(
                                             crate::updater::detect_current_install_kind();
                                         if install_kind == crate::updater::InstallKind::Unknown {
                                             balloon(
+                                                &gate,
+                                                NotificationKind::AutoUpdater,
                                                 &mut icon,
                                                 "업데이트 불가",
                                                 "현재 설치 형식을 식별할 수 없어 자동 업데이트를 지원하지 않습니다 (개발 빌드 또는 미등록 경로).",
@@ -322,6 +383,8 @@ unsafe fn run(
                                         } else {
                                             update_status = UpdateStatus::Checking;
                                             balloon(
+                                                &gate,
+                                                NotificationKind::AutoUpdater,
                                                 &mut icon,
                                                 "업데이트 확인",
                                                 "최신 버전을 확인하고 있습니다...",
@@ -333,6 +396,7 @@ unsafe fn run(
                                                         Ok(c) => c,
                                                         Err(e) => {
                                                             let _ = tx.try_send(Update::Notice(
+                                                                NotificationKind::AutoUpdater,
                                                                 "업데이트 오류".into(),
                                                                 format!(
                                                                     "HTTP 클라이언트 생성 실패: {e}"
@@ -351,6 +415,7 @@ unsafe fn run(
                                                     Some(v) => v,
                                                     None => {
                                                         let _ = tx.try_send(Update::Notice(
+                                                            NotificationKind::AutoUpdater,
                                                             "업데이트 오류".into(),
                                                             "현재 버전 형식을 확인할 수 없습니다"
                                                                 .into(),
@@ -380,6 +445,7 @@ unsafe fn run(
                                                                     candidate.version_str, candidate.install_kind
                                                                 );
                                                                 let _ = tx.try_send(Update::Notice(
+                                                                    NotificationKind::AutoUpdater,
                                                                     "업데이트 가능".into(),
                                                                     body,
                                                                 ));
@@ -395,6 +461,7 @@ unsafe fn run(
                                                                     current_ver_str
                                                                 );
                                                                 let _ = tx.try_send(Update::Notice(
+                                                                    NotificationKind::AutoUpdater,
                                                                     "최신 버전".into(),
                                                                     body,
                                                                 ));
@@ -404,6 +471,7 @@ unsafe fn run(
                                                             }
                                                             Err(e) => {
                                                                 let _ = tx.try_send(Update::Notice(
+                                                                    NotificationKind::AutoUpdater,
                                                                     "업데이트 확인 실패".into(),
                                                                     e.to_string(),
                                                                 ));
@@ -415,6 +483,7 @@ unsafe fn run(
                                                     }
                                                     Err(e) => {
                                                         let _ = tx.try_send(Update::Notice(
+                                                            NotificationKind::AutoUpdater,
                                                             "업데이트 확인 실패".into(),
                                                             e.to_string(),
                                                         ));
@@ -432,6 +501,8 @@ unsafe fn run(
                                         let candidate = candidate.clone();
                                         update_status = UpdateStatus::Downloading;
                                         balloon(
+                                            &gate,
+                                            NotificationKind::AutoUpdater,
                                             &mut icon,
                                             "다운로드 시작",
                                             &format!(
@@ -445,6 +516,7 @@ unsafe fn run(
                                                 Ok(c) => c,
                                                 Err(e) => {
                                                     let _ = tx.try_send(Update::Notice(
+                                                        NotificationKind::AutoUpdater,
                                                         "다운로드 오류".into(),
                                                         e.to_string(),
                                                     ));
@@ -463,6 +535,7 @@ unsafe fn run(
                                                 Ok(m) => m,
                                                 Err(e) => {
                                                     let _ = tx.try_send(Update::Notice(
+                                                        NotificationKind::AutoUpdater,
                                                         "매니페스트 확인 실패".into(),
                                                         e.to_string(),
                                                     ));
@@ -479,6 +552,7 @@ unsafe fn run(
                                                 Ok(a) => a.clone(),
                                                 Err(e) => {
                                                     let _ = tx.try_send(Update::Notice(
+                                                        NotificationKind::AutoUpdater,
                                                         "매니페스트 검증 실패".into(),
                                                         e.to_string(),
                                                     ));
@@ -501,6 +575,7 @@ unsafe fn run(
                                                         candidate.version_str
                                                     );
                                                     let _ = tx.try_send(Update::Notice(
+                                                        NotificationKind::AutoUpdater,
                                                         "다운로드 완료".into(),
                                                         body,
                                                     ));
@@ -514,6 +589,7 @@ unsafe fn run(
                                                 }
                                                 Err(e) => {
                                                     let _ = tx.try_send(Update::Notice(
+                                                        NotificationKind::AutoUpdater,
                                                         "다운로드 검증 실패".into(),
                                                         e.to_string(),
                                                     ));
@@ -566,6 +642,8 @@ unsafe fn run(
                                             ) {
                                                 Ok(safe_handle) => {
                                                     balloon(
+                                                        &gate,
+                                                        NotificationKind::AutoUpdater,
                                                         &mut icon,
                                                         "설치 시작",
                                                         &format!(
@@ -591,6 +669,7 @@ unsafe fn run(
                                                                     Ok(crate::updater::ProcessWaitResult::Exited(exit_code)) => {
                                                                         if exit_code != 0 {
                                                                             let _ = tx.try_send(Update::Notice(
+                                                                                NotificationKind::AutoUpdater,
                                                                                 "설치 중단".into(),
                                                                                 "설치 프로그램이 취소되었거나 정상 완료되지 않았습니다.".into(),
                                                                             ));
@@ -608,6 +687,7 @@ unsafe fn run(
                                                                     Err(e) => {
                                                                         tracing::warn!(error = %e, "설치 프로그램 대기 중 오류 발생");
                                                                         let _ = tx.try_send(Update::Notice(
+                                                                            NotificationKind::AutoUpdater,
                                                                             "설치 오류".into(),
                                                                             format!("설치 프로그램 감시 실패: {e}"),
                                                                         ));
@@ -626,6 +706,8 @@ unsafe fn run(
                                                 }
                                                 Err(e) => {
                                                     balloon(
+                                                        &gate,
+                                                        NotificationKind::AutoUpdater,
                                                         &mut icon,
                                                         "설치 실행 실패",
                                                         &e.to_string(),
@@ -671,6 +753,8 @@ unsafe fn run(
                                 _ => continue,
                             };
                             balloon(
+                                &gate,
+                                NotificationKind::MountStatus,
                                 &mut icon,
                                 "마운트 상태",
                                 &format!("{} ({}): {state}", drive.label, drive.mount_point),
@@ -678,7 +762,9 @@ unsafe fn run(
                         }
                     }
                 }
-                Ok(Update::Notice(title, body)) => balloon(&mut icon, &title, &body),
+                Ok(Update::Notice(kind, title, body)) => {
+                    balloon(&gate, kind, &mut icon, &title, &body)
+                }
                 #[cfg(test)]
                 Ok(Update::SessionEvent(code)) => {
                     SendMessageW(
@@ -735,7 +821,17 @@ impl Drop for SessionNotifications {
     }
 }
 
-unsafe fn balloon(icon: &mut NOTIFYICONDATAW, title: &str, body: &str) {
+/// 끈 대분류의 알림은 표시하지 않습니다.
+unsafe fn balloon(
+    gate: &NotificationGate,
+    kind: NotificationKind,
+    icon: &mut NOTIFYICONDATAW,
+    title: &str,
+    body: &str,
+) {
+    if !gate.allows(kind) {
+        return;
+    }
     wide(&mut icon.szInfoTitle, title);
     wide(&mut icon.szInfo, body);
     icon.uFlags = NIF_INFO;
@@ -760,9 +856,10 @@ mod tests {
             Arc::new(Notify::new()),
             session_lock.clone(),
             session_unlock.clone(),
+            NotificationConfig::default(),
         )
         .unwrap();
-        tray.0
+        tray.tx
             .try_send(Update::SessionEvent(WTS_SESSION_UNLOCK))
             .unwrap();
         rt.block_on(async {
@@ -770,7 +867,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        tray.0
+        tray.tx
             .try_send(Update::SessionEvent(WTS_SESSION_LOCK))
             .unwrap();
         rt.block_on(async {
@@ -784,7 +881,7 @@ mod tests {
             "트레이 초기화와 종료 응답을 확인해야 합니다"
         );
         assert!(
-            tray.0
+            tray.tx
                 .try_send(Update::Status(AgentStatus::default()))
                 .is_err()
         );
@@ -889,6 +986,60 @@ mod tests {
         assert_eq!(label, "v0.1.1 지금 설치");
         assert!(enabled);
         assert_eq!(id, 12);
+    }
+
+    #[test]
+    fn notification_gate_follows_config() {
+        let mut config = NotificationConfig::default();
+        let gate = NotificationGate::new(config);
+        for kind in [
+            NotificationKind::MountStatus,
+            NotificationKind::FileTransfers,
+            NotificationKind::LockRecovery,
+            NotificationKind::AutoUpdater,
+        ] {
+            assert!(gate.allows(kind));
+        }
+        config.mount_status = false;
+        config.auto_updater = false;
+        gate.set(config);
+        assert!(!gate.allows(NotificationKind::MountStatus));
+        assert!(gate.allows(NotificationKind::FileTransfers));
+        assert!(gate.allows(NotificationKind::LockRecovery));
+        assert!(!gate.allows(NotificationKind::AutoUpdater));
+    }
+
+    #[test]
+    fn disabled_category_notice_is_not_queued_and_reload_applies() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let config = NotificationConfig {
+            lock_recovery: false,
+            ..NotificationConfig::default()
+        };
+        let tray = Tray {
+            tx,
+            gate: Arc::new(NotificationGate::new(config)),
+        };
+        tray.notice(NotificationKind::LockRecovery, "자동 잠금", "막혀야 합니다");
+        assert!(
+            rx.try_recv().is_err(),
+            "끈 대분류 알림은 보내지 않아야 합니다"
+        );
+        tray.notice(NotificationKind::FileTransfers, "업로드 완료", "a: /x");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Update::Notice(NotificationKind::FileTransfers, _, _))
+        ));
+
+        // 설정을 다시 읽으면 같은 트레이에 즉시 반영됩니다.
+        tray.set_notifications(NotificationConfig {
+            file_transfers: false,
+            ..NotificationConfig::default()
+        });
+        tray.notice(NotificationKind::FileTransfers, "업로드 완료", "a: /x");
+        assert!(rx.try_recv().is_err());
+        tray.notice(NotificationKind::LockRecovery, "자동 잠금", "보여야 합니다");
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]

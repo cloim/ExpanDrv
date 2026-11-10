@@ -4,7 +4,7 @@
 
 use crate::auto_lock::{self, Reason};
 use crate::{cache_dir, ipc_err, serial};
-use expandrv_core::config::{Config, DriveConfig};
+use expandrv_core::config::{Config, DriveConfig, NotificationKind};
 use expandrv_core::{Error, Result};
 use expandrv_ipc::{
     AgentStatus, DriveState, DriveStatus, ErrorCode, Handler, IpcServer, Request, Response,
@@ -188,6 +188,7 @@ impl Agent {
             lock_requested.clone(),
             session_lock_requested.clone(),
             session_unlock_requested.clone(),
+            config.notifications,
         )
         .map_err(|e| tracing::warn!(error = %e, "트레이 스레드 시작 실패"))
         .ok();
@@ -378,6 +379,9 @@ impl Agent {
                 }
                 let policy_disabled =
                     st.config.security.lock_on_session_lock && !cfg.security.lock_on_session_lock;
+                if let Some(tray) = &self.tray {
+                    tray.set_notifications(cfg.notifications);
+                }
                 st.config = cfg;
                 if policy_disabled && st.locked && st.lock_reason == Some(Reason::Session) {
                     let to_restore = std::mem::take(&mut st.session_restore_drives);
@@ -393,7 +397,11 @@ impl Agent {
                     }
                     if let Some(tray) = &self.tray {
                         tray.status(self.status());
-                        tray.notice("잠금 해제", "세션 잠금 정책 해제로 드라이브를 복구했습니다");
+                        tray.notice(
+                            NotificationKind::LockRecovery,
+                            "잠금 해제",
+                            "세션 잠금 정책 해제로 드라이브를 복구했습니다",
+                        );
                     }
                     tracing::info!("세션 잠금 정책 해제로 드라이브를 복구했습니다");
                     return Response::Ok;
@@ -527,6 +535,7 @@ impl Agent {
         if let Some(tray) = &self.tray {
             tray.status(self.status());
             tray.notice(
+                NotificationKind::LockRecovery,
                 "드라이브 복구",
                 "Windows 잠금 해제에 맞춰 드라이브를 복구했습니다",
             );
@@ -713,8 +722,14 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
                 if let Some(tray) = &lock_agent.tray {
                     tray.status(lock_agent.status());
                     match response {
-                        Response::Ok => tray.notice("드라이브 잠금", "모든 드라이브를 잠갔습니다"),
-                        Response::Error { message, .. } => tray.notice("드라이브 잠금", &message),
+                        Response::Ok => tray.notice(
+                            NotificationKind::LockRecovery,
+                            "드라이브 잠금",
+                            "모든 드라이브를 잠갔습니다",
+                        ),
+                        Response::Error { message, .. } => {
+                            tray.notice(NotificationKind::LockRecovery, "드라이브 잠금", &message)
+                        }
                         _ => {}
                     }
                 }
@@ -746,10 +761,13 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
                             if status.locked {
                                 tray.status(status);
                                 match response {
-                                    Response::Error { message, .. } => {
-                                        tray.notice("자동 잠금", &message)
-                                    }
+                                    Response::Error { message, .. } => tray.notice(
+                                        NotificationKind::LockRecovery,
+                                        "자동 잠금",
+                                        &message,
+                                    ),
                                     _ => tray.notice(
+                                        NotificationKind::LockRecovery,
                                         "자동 잠금",
                                         "Windows 잠금에 맞춰 드라이브를 잠갔습니다",
                                     ),
@@ -767,10 +785,13 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
                             if status.locked {
                                 tray.status(status);
                                 match response {
-                                    Response::Error { message, .. } => {
-                                        tray.notice("자동 잠금", &message)
-                                    }
+                                    Response::Error { message, .. } => tray.notice(
+                                        NotificationKind::LockRecovery,
+                                        "자동 잠금",
+                                        &message,
+                                    ),
                                     _ => tray.notice(
+                                        NotificationKind::LockRecovery,
                                         "자동 잠금",
                                         "유휴 시간이 지나 드라이브를 잠갔습니다",
                                     ),

@@ -18,6 +18,9 @@ pub struct Config {
     pub drives: Vec<DriveConfig>,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// 모두 켠 기본값이면 기록하지 않아 이전 버전과 설정 파일을 함께 쓸 수 있습니다.
+    #[serde(default, skip_serializing_if = "NotificationConfig::is_default")]
+    pub notifications: NotificationConfig,
 }
 
 impl Default for Config {
@@ -26,6 +29,56 @@ impl Default for Config {
             version: CONFIG_VERSION,
             drives: Vec::new(),
             security: SecurityConfig::default(),
+            notifications: NotificationConfig::default(),
+        }
+    }
+}
+
+/// 트레이 알림 대분류
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationKind {
+    /// 드라이브 마운트, 해제, 작업 실패
+    MountStatus,
+    /// 백그라운드 업로드 완료, 충돌 사본 생성
+    FileTransfers,
+    /// 수동, 세션, 유휴 자동 잠금과 잠금 해제 복구
+    LockRecovery,
+    /// 업데이트 확인, 다운로드, 설치
+    AutoUpdater,
+}
+
+/// 대분류별 트레이 알림 표시 여부. 빠진 항목은 켠 것으로 봅니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationConfig {
+    pub mount_status: bool,
+    pub file_transfers: bool,
+    pub lock_recovery: bool,
+    pub auto_updater: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            mount_status: true,
+            file_transfers: true,
+            lock_recovery: true,
+            auto_updater: true,
+        }
+    }
+}
+
+impl NotificationConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn allows(&self, kind: NotificationKind) -> bool {
+        match kind {
+            NotificationKind::MountStatus => self.mount_status,
+            NotificationKind::FileTransfers => self.file_transfers,
+            NotificationKind::LockRecovery => self.lock_recovery,
+            NotificationKind::AutoUpdater => self.auto_updater,
         }
     }
 }
@@ -664,6 +717,50 @@ root = 'C:\tmp'
                 .readahead_blocks,
             0
         );
+    }
+
+    #[test]
+    fn notifications_default_to_enabled_and_roundtrip() {
+        // 알림 표가 없는 기존 설정은 모두 켠 상태로 읽고, 기본값이면 파일에 쓰지 않습니다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let previous = format!("version = {CONFIG_VERSION}\n{SAMPLE}");
+        std::fs::write(&path, &previous).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.notifications, NotificationConfig::default());
+        cfg.save(&path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("notifications")
+        );
+
+        // 일부만 적은 표는 빠진 항목을 켠 것으로 봅니다.
+        let partial: Config = toml::from_str(&format!(
+            "[notifications]\nfile_transfers = false\n{SAMPLE}"
+        ))
+        .unwrap();
+        assert!(!partial.notifications.file_transfers);
+        assert!(partial.notifications.mount_status);
+        assert!(
+            !partial
+                .notifications
+                .allows(NotificationKind::FileTransfers)
+        );
+        assert!(partial.notifications.allows(NotificationKind::AutoUpdater));
+
+        cfg.notifications.lock_recovery = false;
+        cfg.notifications.auto_updater = false;
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.notifications, cfg.notifications);
+        assert!(!loaded.notifications.allows(NotificationKind::LockRecovery));
+        assert!(loaded.notifications.allows(NotificationKind::MountStatus));
+    }
+
+    #[test]
+    fn rejects_unknown_notification_field() {
+        assert!(toml::from_str::<Config>("[notifications]\nsound = true\n").is_err());
     }
 
     #[test]
