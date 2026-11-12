@@ -32,6 +32,16 @@ fn ssh_alias_can_be_saved_without_manual_user_or_key_and_edited() {
         panic!()
     };
     assert!(!c.use_ssh_config);
+    assert!(!c.ssh_shell);
+    fields.insert("useSshConfig".into(), "true".into());
+    fields.insert("sshShell".into(), "true".into());
+    let shell = connection::edited_backend(&backend, &fields).unwrap();
+    let BackendConfig::Sftp(c) = &shell else {
+        panic!()
+    };
+    assert!(c.ssh_shell);
+    let encoded = toml::to_string(&shell).unwrap();
+    assert_eq!(toml::from_str::<BackendConfig>(&encoded).unwrap(), shell);
 }
 
 #[test]

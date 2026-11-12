@@ -81,6 +81,7 @@ export type BackendInput =
   | { type: 'webdav'; url: string; username: string; password: string; pinnedCertSha256: string }
   | {
       type: 'sftp';
+      sshShell: boolean;
       useSshConfig: boolean;
       host: string;
       port: number;
@@ -198,7 +199,7 @@ export const api = {
 export const BACKEND_LABEL: Record<string, string> = {
   local: '로컬 폴더',
   webdav: 'WebDAV',
-  sftp: 'SFTP',
+  sftp: 'SSH / SFTP',
   s3: 'S3 호환',
   ftp: 'FTP',
 };

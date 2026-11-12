@@ -105,6 +105,8 @@ pwsh -NoProfile -File scripts/test-installer.ps1
 
 ## 사용법
 
+SFTP 서비스를 사용할 수 없는 서버는 GUI의 **SSH / SFTP → 연결 방식: SSH 셸**을 선택하세요. **로컬 SSH 설정 사용**을 켜고 `ds920` 같은 별칭을 입력하면 기존 SSH 주소·포트·계정·키로 연결합니다. SSH 명령 실행 권한과 서버의 Python 3.8 이상이 필요합니다. 연결마다 메모리에서 파일 도우미를 실행하며 서버 설치, SFTP 서비스 활성화나 관리자 권한은 필요하지 않습니다. 파일 목록, 부분 읽기, 스트리밍 업로드, 폴더 생성, 이름 변경, 삭제와 수정 시각을 지원합니다. SSH 셸 방식은 Linux 서버를 대상으로 검증하며 기본 연결 방식은 기존 SFTP입니다.
+
 GUI에서 SFTP를 추가할 때 **로컬 SSH 설정 사용**을 켜면 `sfa3` 같은 SSH 별칭만으로 연결할 수 있습니다. 로컬 `ssh -G`로 `HostName`, `User`, `Port`, `IdentityFile`, `UserKnownHostsFile`을 가져오므로 `Include`와 `Host` 패턴도 적용됩니다. 존재하는 개인키들을 순서대로 시도하고 서버 키는 기존 known_hosts로 검증합니다. 암호화된 키는 개인키 암호문을 입력하세요. 별칭을 저장하므로 다음 마운트 때 로컬 설정을 다시 읽습니다. 로컬 OpenSSH가 필요하며 ssh-agent, ProxyJump, ProxyCommand, HostKeyAlias 및 SSH 알고리즘 설정 가져오기는 지원하지 않습니다.
 
 ```powershell

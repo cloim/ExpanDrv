@@ -8,8 +8,8 @@ import { Field } from '../ui/controls';
 import { RecoveryPanel } from '../ui/RecoveryPanel';
 import { useToast } from '../ui/Toast';
 
-const LABELS: Record<string, string> = { useSshConfig: '로컬 SSH 설정 사용', root: '루트 폴더', url: 'URL', host: '호스트', port: '포트', username: '사용자', pinnedCertSha256: '인증서 SHA-256 지문', privateKey: '개인키 파일', knownHosts: 'known_hosts 파일', endpoint: '엔드포인트', region: '리전', bucket: '버킷', prefix: '접두사', accessKeyId: '액세스 키 ID', pathStyle: '주소 방식', tls: 'TLS', encoding: '문자셋' };
-const OPTIONS: Record<string, [string, string][]> = { useSshConfig: [['true', '사용'], ['false', '사용 안 함']], pathStyle: [['true', '경로 방식'], ['false', '가상 호스트']], tls: [['none', '사용 안 함'], ['explicit', '명시적 TLS'], ['implicit', '암묵적 TLS']] };
+const LABELS: Record<string, string> = { sshShell: '연결 방식', useSshConfig: '로컬 SSH 설정 사용', root: '루트 폴더', url: 'URL', host: '호스트', port: '포트', username: '사용자', pinnedCertSha256: '인증서 SHA-256 지문', privateKey: '개인키 파일', knownHosts: 'known_hosts 파일', endpoint: '엔드포인트', region: '리전', bucket: '버킷', prefix: '접두사', accessKeyId: '액세스 키 ID', pathStyle: '주소 방식', tls: 'TLS', encoding: '문자셋' };
+const OPTIONS: Record<string, [string, string][]> = { sshShell: [['false', 'SFTP'], ['true', 'SSH 셸']], useSshConfig: [['true', '사용'], ['false', '사용 안 함']], pathStyle: [['true', '경로 방식'], ['false', '가상 호스트']], tls: [['none', '사용 안 함'], ['explicit', '명시적 TLS'], ['implicit', '암묵적 TLS']] };
 
 export function ConnectionEditor({ detail, onClose, onSaved, onCredentials }: { detail: DriveDetail; onClose: () => void; onSaved: () => Promise<void>; onCredentials: () => void }) {
   const [fields, setFields] = useState(detail.connectionEdit);

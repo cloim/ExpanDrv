@@ -14,4 +14,5 @@ if ($Fix) { Step 'cargo fmt' { cargo fmt --all } }
 else { Step 'cargo fmt --check' { cargo fmt --all -- --check } }
 Step 'cargo clippy' { cargo clippy --workspace --all-targets --all-features -- -D warnings }
 Step 'cargo test' { cargo test --workspace --all-features }
+Step 'SSH 파일 도우미 테스트' { python -B crates/expandrv-backends/src/sftp/ssh_files_tests.py }
 Write-Host 'OK: fmt, clippy, test 통과'

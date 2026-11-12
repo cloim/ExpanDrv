@@ -101,6 +101,7 @@ async fn sftp_via(mode: ProxyMode) {
     };
     let port: u16 = env("EXPANDRV_TEST_SFTP_PORT").map_or(22, |p| p.parse().unwrap());
     let cfg = expandrv_core::config::SftpConfig {
+        ssh_shell: false,
         use_ssh_config: false,
         host: host.clone(),
         port,

@@ -14,6 +14,7 @@ pub fn connection_fields(backend: &BackendConfig) -> BTreeMap<String, String> {
             ),
         ],
         BackendConfig::Sftp(c) => vec![
+            ("sshShell", c.ssh_shell.to_string()),
             ("useSshConfig", c.use_ssh_config.to_string()),
             ("host", c.host.clone()),
             ("port", c.port.to_string()),
@@ -100,6 +101,9 @@ pub fn edited_backend(
             c.pinned_cert_sha256 = normalize_pin(Some(v("pinnedCertSha256")))?;
         }
         BackendConfig::Sftp(c) => {
+            c.ssh_shell = v("sshShell")
+                .parse()
+                .map_err(|_| bad("SSH 셸 사용 값을 확인하세요"))?;
             c.use_ssh_config = v("useSshConfig")
                 .parse()
                 .map_err(|_| bad("SSH 설정 사용 값을 확인하세요"))?;

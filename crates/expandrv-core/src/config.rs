@@ -239,6 +239,9 @@ pub struct WebDavConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SftpConfig {
+    /// SFTP 서비스 대신 SSH exec에서 일회성 Python 3 파일 도우미를 실행합니다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ssh_shell: bool,
     /// OpenSSH의 로컬 설정에서 host 별칭과 인증 키를 해석합니다.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub use_ssh_config: bool,

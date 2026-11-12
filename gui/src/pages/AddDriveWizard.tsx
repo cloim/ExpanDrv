@@ -14,7 +14,7 @@ import { recoveryAdvice } from '../recovery';
 
 const KINDS: { kind: BackendKind; title: string; desc: string; icon: LucideIcon }[] = [
   { kind: 'webdav', title: 'WebDAV', desc: 'Nextcloud, NAS 등 HTTPS 파일 서버', icon: Cloud },
-  { kind: 'sftp', title: 'SFTP', desc: 'SSH 서버의 폴더', icon: Server },
+  { kind: 'sftp', title: 'SSH / SFTP', desc: 'SSH 셸 또는 SFTP로 서버 폴더 연결', icon: Server },
   { kind: 's3', title: 'S3 호환', desc: '버킷과 접두사 단위 객체 저장소', icon: Database },
   { kind: 'ftp', title: 'FTP, FTPS', desc: '명시적, 암묵적 TLS 지원', icon: Network },
   { kind: 'local', title: '로컬 폴더', desc: '테스트와 검증용', icon: Folder },
@@ -39,6 +39,7 @@ const DEFAULTS: Form = {
   remoteRoot: '/',
   knownHosts: '',
   useSshConfig: 'false',
+  sshShell: 'false',
   endpoint: '',
   region: 'us-east-1',
   bucket: '',
@@ -114,6 +115,7 @@ function toBackend(kind: BackendKind, f: Form): BackendInput {
     case 'sftp':
       return {
         type: 'sftp',
+        sshShell: f.sshShell === 'true',
         useSshConfig: f.useSshConfig === 'true',
         host: f.host,
         port: f.useSshConfig === 'true' ? 22 : Number(f.port),
@@ -302,6 +304,12 @@ export function AddDriveWizard() {
     ),
     sftp: (
       <>
+        <Field label="연결 방식" hint={form.sshShell === 'true' ? '서버의 Python 3로 파일을 처리합니다. SFTP 서비스 활성화 없이 SSH 셸 권한으로 연결합니다' : undefined}>
+          {(p) => <SelectControl {...p} value={form.sshShell} onChange={set('sshShell')}>
+            <option value="false">SFTP</option>
+            <option value="true">SSH 셸</option>
+          </SelectControl>}
+        </Field>
         <Switch label="로컬 SSH 설정 사용" hint="ssh sfa3처럼 별칭만 입력합니다. 주소·사용자·포트·개인키를 로컬 SSH 설정에서 가져옵니다"
           checked={form.useSshConfig === 'true'} onChange={(v) => {
             setForm((f) => ({ ...f, useSshConfig: String(v) }));

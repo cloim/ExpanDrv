@@ -165,6 +165,9 @@ enum AddBackend {
     },
     Sftp {
         host: String,
+        /// SSH 셸에서 Python 3로 파일 접근(SFTP 서비스 불필요)
+        #[arg(long)]
+        ssh_shell: bool,
         #[arg(long)]
         user: String,
         #[arg(long, default_value_t = 22)]
@@ -294,6 +297,7 @@ fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<Backen
         }),
         AddBackend::Sftp {
             host,
+            ssh_shell,
             user,
             port,
             password_env,
@@ -304,6 +308,7 @@ fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<Backen
             root,
             known_hosts,
         } => BackendConfig::Sftp(SftpConfig {
+            ssh_shell,
             use_ssh_config: false,
             host,
             port,

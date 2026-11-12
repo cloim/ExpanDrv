@@ -16,13 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PW_VAR: &str = "EXPANDRV_TEST_SFTP_PASSWORD";
 
-/// 로컬 SSH 별칭으로 접속해 목록만 조회합니다. 원격 파일은 변경하지 않습니다.
-#[tokio::test]
-async fn ssh_alias_lists_root_read_only() {
-    let Ok(alias) = std::env::var("EXPANDRV_TEST_SSH_ALIAS") else {
-        return;
-    };
-    let cfg = SftpConfig {
+fn ssh_alias_config() -> Option<SftpConfig> {
+    let alias = std::env::var("EXPANDRV_TEST_SSH_ALIAS").ok()?;
+    Some(SftpConfig {
+        ssh_shell: std::env::var_os("EXPANDRV_TEST_SSH_SHELL").is_some(),
         use_ssh_config: true,
         host: alias,
         port: 22,
@@ -30,12 +27,27 @@ async fn ssh_alias_lists_root_read_only() {
         password: None,
         private_key: None,
         key_passphrase: None,
-        root: "/".into(),
+        root: env("ROOT").unwrap_or_else(|| "/".into()),
         known_hosts: None,
+    })
+}
+
+/// 로컬 SSH 별칭으로 접속해 목록만 조회합니다. 원격 파일은 변경하지 않습니다.
+#[tokio::test]
+async fn ssh_alias_lists_root_read_only() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let Some(cfg) = ssh_alias_config() else {
+        return;
     };
-    let be = SftpBackend::connect(&cfg, &expandrv_core::config::EnvSecrets)
-        .await
-        .unwrap();
+    let be = tokio::time::timeout(
+        Duration::from_secs(30),
+        SftpBackend::connect(&cfg, &expandrv_core::config::EnvSecrets),
+    )
+    .await
+    .expect("SSH/SFTP 연결 준비 30초 초과")
+    .unwrap();
     let entries = be.list(&RemotePath::parse("/").unwrap()).await.unwrap();
     eprintln!("SSH 별칭 연결 및 루트 조회 성공: {}개 항목", entries.len());
 }
@@ -47,11 +59,15 @@ fn env(name: &str) -> Option<String> {
 }
 
 fn base_config() -> Option<SftpConfig> {
+    if std::env::var_os("EXPANDRV_TEST_SSH_SHELL").is_some() {
+        return ssh_alias_config();
+    }
     let (Some(host), Some(user), Some(kh)) = (env("HOST"), env("USER"), env("KNOWN_HOSTS")) else {
         eprintln!("EXPANDRV_TEST_SFTP_HOST/USER/KNOWN_HOSTS가 없어 SFTP 통합 테스트를 건너뜁니다");
         return None;
     };
     Some(SftpConfig {
+        ssh_shell: false,
         use_ssh_config: false,
         host,
         port: env("PORT").map_or(22, |p| p.parse().unwrap()),
@@ -97,6 +113,19 @@ async fn sftp_crud_against_real_server() {
         be.mkdir(&p(&format!("{base}/no/such"))).await,
         Err(Error::NotFound)
     ));
+    // 경로를 셸 명령으로 보간하지 않고, 한글·따옴표·셸 특수문자를 보존합니다.
+    let special = base.join("한글 ' $() & 파일.txt").unwrap();
+    be.write(
+        &special,
+        WriteSource::Bytes(Bytes::from_static(b"literal filename")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        &be.read_range(&special, 0, 32).await.unwrap()[..],
+        b"literal filename"
+    );
+    be.delete(&special, EntryKind::File).await.unwrap();
 
     // 바이트 쓰기와 부분 읽기
     let a = base.join("a.txt").unwrap();

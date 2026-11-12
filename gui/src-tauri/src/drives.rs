@@ -126,6 +126,8 @@ pub enum BackendInput {
     },
     Sftp {
         #[serde(default)]
+        ssh_shell: bool,
+        #[serde(default)]
         use_ssh_config: bool,
         host: String,
         port: u16,
@@ -344,6 +346,7 @@ pub fn build_backend(
             pinned_cert_sha256: normalize_pin(pinned_cert_sha256)?,
         }),
         BackendInput::Sftp {
+            ssh_shell,
             use_ssh_config,
             host,
             port,
@@ -368,6 +371,7 @@ pub fn build_backend(
                 return Err(bad("SFTP는 암호나 개인키 중 하나가 필요합니다"));
             }
             BackendConfig::Sftp(SftpConfig {
+                ssh_shell,
                 use_ssh_config,
                 host: check_host(&host)?,
                 port: check_port(port)?,
@@ -866,6 +870,14 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
                 ));
             }
             vec![
+                f(
+                    "연결 방식",
+                    if c.ssh_shell {
+                        "SSH 셸 (Python 3)"
+                    } else {
+                        "SFTP"
+                    },
+                ),
                 f(
                     "호스트",
                     &if c.use_ssh_config {

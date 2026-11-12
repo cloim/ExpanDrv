@@ -38,6 +38,7 @@ const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 /// 재연결에 필요한 접속 정보. 비밀 값을 담으므로 `Debug`를 구현하지 않습니다.
 struct Target {
+    ssh_shell: bool,
     host: String,
     port: u16,
     username: String,
@@ -130,6 +131,7 @@ impl SftpBackend {
             },
         };
         let target = Target {
+            ssh_shell: cfg.ssh_shell,
             host: resolved
                 .as_ref()
                 .map_or_else(|| cfg.host.clone(), |r| r.host.clone()),
@@ -395,12 +397,15 @@ async fn open_conn(t: &Target) -> Result<Conn> {
         }
     };
 
+    tracing::debug!("SFTP SSH 연결 완료, 인증 시작");
     authenticate(&mut handle, t).await?;
+    tracing::debug!("SFTP 인증 완료, 채널 준비 시작");
 
     let mut sessions = Vec::with_capacity(CHANNELS);
     let mut info = None;
     for i in 0..CHANNELS {
-        match open_channel(&handle).await {
+        tracing::debug!(channel = i, "SFTP 채널 열기");
+        match open_channel(&handle, t.ssh_shell).await {
             Ok((s, ext)) => {
                 sessions.push(s);
                 info.get_or_insert(ext);
@@ -475,15 +480,61 @@ struct ServerExt {
 
 async fn open_channel(
     handle: &client::Handle<HostKeyHandler>,
+    ssh_shell: bool,
 ) -> Result<(RawSftpSession, ServerExt)> {
-    let ch = handle.channel_open_session().await.map_err(map_ssh)?;
-    ch.request_subsystem(true, "sftp").await.map_err(map_ssh)?;
+    let mut ch = handle.channel_open_session().await.map_err(map_ssh)?;
+    tracing::debug!(ssh_shell, "SSH 세션 열림, 파일 접근 요청");
+    if ssh_shell {
+        let script = include_str!("ssh_files.py");
+        let command = format!("python3 -I -u -c '{}'", script.replace('\'', "'\\''"));
+        ch.exec(true, command).await.map_err(map_ssh)?;
+    } else {
+        ch.request_subsystem(true, "sftp").await.map_err(map_ssh)?;
+    }
+    // request_subsystem은 요청 전송만 기다립니다. 거부 응답을 스트림으로 넘기면
+    // SFTP INIT의 응답을 무한히 기다리므로 CHANNEL_SUCCESS를 먼저 확인합니다.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ch.wait().await {
+                Some(russh::ChannelMsg::Success) => return Ok(()),
+                Some(russh::ChannelMsg::Failure) => return Err(Error::Config(if ssh_shell {
+                    "서버가 SSH 명령 실행을 거부했습니다. 계정의 셸 실행 권한을 확인하세요".into()
+                } else {
+                    "서버가 SFTP 요청을 거부했습니다. SSH 셸 연결 방식을 선택하거나 SFTP 서비스를 활성화하고 계정 권한을 확인하세요".into()
+                })),
+                Some(russh::ChannelMsg::Close | russh::ChannelMsg::Eof) | None => {
+                    return Err(Error::Config("파일 전송 시작 전에 서버가 채널을 닫았습니다".into()));
+                }
+                _ => {}
+            }
+        }
+    }).await.map_err(|_| Error::Config("서버가 파일 전송 시작 요청에 응답하지 않습니다. 연결 방식과 서버 설정을 확인하세요".into()))??;
+    tracing::debug!("SFTP 서브시스템 승인, 프로토콜 초기화");
     let cfg = russh_sftp::client::Config {
         request_timeout_secs: REQUEST_TIMEOUT_SECS,
         ..Default::default()
     };
     let mut raw = RawSftpSession::new_with_config(ch.into_stream(), cfg);
-    let version = raw.init().await.map_err(map_sftp)?;
+    let version = tokio::time::timeout(Duration::from_secs(10), raw.init())
+        .await
+        .map_err(|_| {
+            Error::Config(if ssh_shell {
+                "SSH 파일 접근 초기화 시간이 초과되었습니다. 서버의 Python 3 실행 환경을 확인하세요"
+                    .into()
+            } else {
+                "SFTP 초기화 시간이 초과되었습니다".into()
+            })
+        })?
+        .map_err(|e| {
+            if ssh_shell {
+                Error::Config(format!(
+                    "SSH 파일 접근을 시작하지 못했습니다. 서버에 Python 3가 필요합니다: {e}"
+                ))
+            } else {
+                map_sftp(e)
+            }
+        })?;
+    tracing::debug!(extensions = ?version.extensions, "SFTP 프로토콜 초기화 완료");
     let has = |name: &str, ver: &str| version.extensions.get(name).is_some_and(|v| v == ver);
     let mut ext = ServerExt {
         posix_rename: has(POSIX_RENAME, "1"),
@@ -588,6 +639,17 @@ fn map_ssh(e: russh::Error) -> Error {
 fn map_sftp(e: SftpError) -> Error {
     match e {
         SftpError::Status(s) => match s.status_code {
+            StatusCode::Failure if s.error_message.starts_with("expandrv-errno:") => {
+                match s.error_message.trim_start_matches("expandrv-errno:") {
+                    "17" => Error::AlreadyExists,
+                    "20" => Error::NotADirectory,
+                    "21" => Error::IsADirectory,
+                    "28" => Error::StorageFull,
+                    "30" => Error::ReadOnly,
+                    "39" => Error::DirectoryNotEmpty,
+                    _ => Error::Protocol(s.error_message),
+                }
+            }
             StatusCode::NoSuchFile => Error::NotFound,
             StatusCode::PermissionDenied => Error::PermissionDenied,
             StatusCode::OpUnsupported => Error::Unsupported("SFTP 서버가 지원하지 않는 작업"),
@@ -1006,6 +1068,86 @@ async fn quota(c: &Conn, root: &str) -> Result<Quota> {
 mod tests {
     use super::*;
     use russh_sftp::protocol::Status;
+
+    #[tokio::test]
+    async fn rejected_sftp_subsystem_returns_error_without_waiting_for_init() {
+        use russh::{Channel, ChannelId, server};
+        struct RejectSftp;
+        impl server::Handler for RejectSftp {
+            type Error = russh::Error;
+            async fn auth_password(
+                &mut self,
+                _: &str,
+                _: &str,
+            ) -> std::result::Result<server::Auth, Self::Error> {
+                Ok(server::Auth::Accept)
+            }
+            async fn channel_open_session(
+                &mut self,
+                _channel: Channel<server::Msg>,
+                reply: server::ChannelOpenHandle,
+                _: &mut server::Session,
+            ) -> std::result::Result<(), Self::Error> {
+                reply.accept().await;
+                Ok(())
+            }
+            async fn subsystem_request(
+                &mut self,
+                channel: ChannelId,
+                name: &str,
+                session: &mut server::Session,
+            ) -> std::result::Result<(), Self::Error> {
+                assert_eq!(name, "sftp");
+                session.channel_failure(channel)?;
+                Ok(())
+            }
+        }
+        let key = PrivateKey::new(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
+            "test",
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let known_hosts = dir.path().join("known_hosts");
+        std::fs::write(
+            &known_hosts,
+            format!(
+                "[127.0.0.1]:{port} {}\n",
+                key.public_key().to_openssh().unwrap()
+            ),
+        )
+        .unwrap();
+        let config = Arc::new(server::Config {
+            keys: vec![key],
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = server::run_stream(config, socket, RejectSftp)
+                .await
+                .unwrap()
+                .await;
+        });
+        let target = Target {
+            ssh_shell: false,
+            host: "127.0.0.1".into(),
+            port,
+            username: "test".into(),
+            known_hosts: vec![known_hosts],
+            password: Some(SecretString::from("test")),
+            keys: vec![],
+            proxy: None,
+        };
+        let result = tokio::time::timeout(Duration::from_secs(3), open_conn(&target))
+            .await
+            .expect("SFTP 거부가 즉시 반환되어야 합니다");
+        server.abort();
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("서버가 SFTP 요청을 거부"))
+        );
+    }
 
     fn p(s: &str) -> RemotePath {
         RemotePath::parse(s).unwrap()
