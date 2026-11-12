@@ -105,6 +105,8 @@ pwsh -NoProfile -File scripts/test-installer.ps1
 
 ## 사용법
 
+GUI에서 SFTP를 추가할 때 **로컬 SSH 설정 사용**을 켜면 `sfa3` 같은 SSH 별칭만으로 연결할 수 있습니다. 로컬 `ssh -G`로 `HostName`, `User`, `Port`, `IdentityFile`, `UserKnownHostsFile`을 가져오므로 `Include`와 `Host` 패턴도 적용됩니다. 존재하는 개인키들을 순서대로 시도하고 서버 키는 기존 known_hosts로 검증합니다. 암호화된 키는 개인키 암호문을 입력하세요. 별칭을 저장하므로 다음 마운트 때 로컬 설정을 다시 읽습니다. 로컬 OpenSSH가 필요하며 ssh-agent, ProxyJump, ProxyCommand, HostKeyAlias 및 SSH 알고리즘 설정 가져오기는 지원하지 않습니다.
+
 ```powershell
 # WebDAV 드라이브 추가: 암호를 화면에 보이지 않게 입력받아 자격 증명 관리자에 저장
 expandrv add nas W: --label NAS --auto-mount webdav https://dav.example.com/remote.php/dav/files/me/ --user me --ask-password

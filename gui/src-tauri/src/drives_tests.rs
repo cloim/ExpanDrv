@@ -3,6 +3,38 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 #[test]
+fn ssh_alias_can_be_saved_without_manual_user_or_key_and_edited() {
+    let input = |enabled| {
+        json(serde_json::json!({
+            "type": "sftp", "useSshConfig": enabled, "host": "sfa3", "port": 22,
+            "username": "", "password": "", "privateKey": "", "keyPassphrase": "",
+            "root": "/", "knownHosts": ""
+        }))
+    };
+    let mut pending = Vec::new();
+    assert!(build_backend("alias", input(false), &mut pending).is_err());
+    let backend = build_backend("alias", input(true), &mut pending).unwrap();
+    assert!(pending.is_empty());
+    let encoded = toml::to_string(&backend).unwrap();
+    assert_eq!(toml::from_str::<BackendConfig>(&encoded).unwrap(), backend);
+    let mut fields = connection::connection_fields(&backend);
+    fields.insert("host".into(), "other-alias".into());
+    let edited = connection::edited_backend(&backend, &fields).unwrap();
+    let BackendConfig::Sftp(c) = edited else {
+        panic!()
+    };
+    assert!(c.use_ssh_config);
+    assert_eq!(c.host, "other-alias");
+    fields.insert("useSshConfig".into(), "false".into());
+    assert!(connection::edited_backend(&backend, &fields).is_err());
+    let legacy = encoded.replace("use_ssh_config = true\n", "");
+    let BackendConfig::Sftp(c) = toml::from_str::<BackendConfig>(&legacy).unwrap() else {
+        panic!()
+    };
+    assert!(!c.use_ssh_config);
+}
+
+#[test]
 fn ftp_certificate_pin_roundtrips_and_rejects_plaintext() {
     let input = |tls: &str, pin: Option<&str>| -> BackendInput {
         json(serde_json::json!({

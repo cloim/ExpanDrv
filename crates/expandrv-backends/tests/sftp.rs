@@ -16,6 +16,30 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PW_VAR: &str = "EXPANDRV_TEST_SFTP_PASSWORD";
 
+/// 로컬 SSH 별칭으로 접속해 목록만 조회합니다. 원격 파일은 변경하지 않습니다.
+#[tokio::test]
+async fn ssh_alias_lists_root_read_only() {
+    let Ok(alias) = std::env::var("EXPANDRV_TEST_SSH_ALIAS") else {
+        return;
+    };
+    let cfg = SftpConfig {
+        use_ssh_config: true,
+        host: alias,
+        port: 22,
+        username: String::new(),
+        password: None,
+        private_key: None,
+        key_passphrase: None,
+        root: "/".into(),
+        known_hosts: None,
+    };
+    let be = SftpBackend::connect(&cfg, &expandrv_core::config::EnvSecrets)
+        .await
+        .unwrap();
+    let entries = be.list(&RemotePath::parse("/").unwrap()).await.unwrap();
+    eprintln!("SSH 별칭 연결 및 루트 조회 성공: {}개 항목", entries.len());
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(format!("EXPANDRV_TEST_SFTP_{name}"))
         .ok()
@@ -28,6 +52,7 @@ fn base_config() -> Option<SftpConfig> {
         return None;
     };
     Some(SftpConfig {
+        use_ssh_config: false,
         host,
         port: env("PORT").map_or(22, |p| p.parse().unwrap()),
         username: user,

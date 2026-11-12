@@ -38,6 +38,7 @@ const DEFAULTS: Form = {
   keyPassphrase: '',
   remoteRoot: '/',
   knownHosts: '',
+  useSshConfig: 'false',
   endpoint: '',
   region: 'us-east-1',
   bucket: '',
@@ -70,9 +71,11 @@ function validateConnection(kind: BackendKind, f: Form, proxyOn: boolean, proxy:
       break;
     case 'sftp':
       need('host', '호스트를 입력하세요');
-      need('username', '사용자를 입력하세요');
-      port();
-      if (!f.password && !f.privateKey.trim()) e.password = '암호나 개인키 중 하나가 필요합니다';
+      if (f.useSshConfig !== 'true') {
+        need('username', '사용자를 입력하세요');
+        port();
+        if (!f.password && !f.privateKey.trim()) e.password = '암호나 개인키 중 하나가 필요합니다';
+      }
       break;
     case 's3':
       need('endpoint', '엔드포인트를 입력하세요');
@@ -111,14 +114,15 @@ function toBackend(kind: BackendKind, f: Form): BackendInput {
     case 'sftp':
       return {
         type: 'sftp',
+        useSshConfig: f.useSshConfig === 'true',
         host: f.host,
-        port: Number(f.port),
-        username: f.username,
+        port: f.useSshConfig === 'true' ? 22 : Number(f.port),
+        username: f.useSshConfig === 'true' ? '' : f.username,
         password: f.password,
-        privateKey: f.privateKey,
+        privateKey: f.useSshConfig === 'true' ? '' : f.privateKey,
         keyPassphrase: f.keyPassphrase,
         root: f.remoteRoot,
-        knownHosts: f.knownHosts,
+        knownHosts: f.useSshConfig === 'true' ? '' : f.knownHosts,
       };
     case 's3':
       return {
@@ -298,6 +302,21 @@ export function AddDriveWizard() {
     ),
     sftp: (
       <>
+        <Switch label="로컬 SSH 설정 사용" hint="ssh sfa3처럼 별칭만 입력합니다. 주소·사용자·포트·개인키를 로컬 SSH 설정에서 가져옵니다"
+          checked={form.useSshConfig === 'true'} onChange={(v) => {
+            setForm((f) => ({ ...f, useSshConfig: String(v) }));
+            setErrors({});
+            setTest({ phase: 'idle', message: '' });
+          }} />
+        {form.useSshConfig === 'true' ? <>
+          {input('host', 'SSH 호스트 또는 별칭', { placeholder: 'sfa3', first: true })}
+          <div className="grid grid-cols-2 gap-4">
+            {input('password', '암호', { type: 'password', hint: '키 인증이면 비움' })}
+            {input('keyPassphrase', '개인키 암호문', { type: 'password', hint: '선택' })}
+          </div>
+          {input('remoteRoot', '원격 루트', { mono: true })}
+          <p className="text-xs leading-relaxed text-ink-3">디스크에 저장된 개인키와 known_hosts를 사용합니다. ssh-agent, ProxyJump, ProxyCommand는 아직 지원하지 않습니다</p>
+        </> : <>
         <div className="grid grid-cols-[1fr_110px] gap-4">
           {input('host', '호스트', { placeholder: 'sftp.example.com', first: true })}
           {input('port', '포트', { type: 'number' })}
@@ -314,6 +333,7 @@ export function AddDriveWizard() {
           {input('remoteRoot', '원격 루트', { mono: true })}
           {input('knownHosts', 'known_hosts 파일', { hint: '비우면 기본 위치', mono: true })}
         </div>
+        </>}
       </>
     ),
     s3: (

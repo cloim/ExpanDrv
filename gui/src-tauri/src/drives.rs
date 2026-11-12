@@ -125,6 +125,8 @@ pub enum BackendInput {
         pinned_cert_sha256: Option<String>,
     },
     Sftp {
+        #[serde(default)]
+        use_ssh_config: bool,
         host: String,
         port: u16,
         username: String,
@@ -342,6 +344,7 @@ pub fn build_backend(
             pinned_cert_sha256: normalize_pin(pinned_cert_sha256)?,
         }),
         BackendInput::Sftp {
+            use_ssh_config,
             host,
             port,
             username,
@@ -355,19 +358,24 @@ pub fn build_backend(
                 Some(p) => Some(absolute_path("개인키", &p, false)?),
                 None => None,
             };
-            let key_passphrase = if private_key.is_some() {
+            let key_passphrase = if private_key.is_some() || use_ssh_config {
                 secret_ref(id, "key_passphrase", key_passphrase, pending)?
             } else {
                 None
             };
             let password = secret_ref(id, "password", password, pending)?;
-            if password.is_none() && private_key.is_none() {
+            if !use_ssh_config && password.is_none() && private_key.is_none() {
                 return Err(bad("SFTP는 암호나 개인키 중 하나가 필요합니다"));
             }
             BackendConfig::Sftp(SftpConfig {
+                use_ssh_config,
                 host: check_host(&host)?,
                 port: check_port(port)?,
-                username: required("사용자", &username, 256)?,
+                username: if use_ssh_config {
+                    String::new()
+                } else {
+                    required("사용자", &username, 256)?
+                },
                 password,
                 private_key,
                 key_passphrase,
@@ -677,7 +685,9 @@ fn secret_slot<'a>(d: &'a mut DriveConfig, field: &str) -> Result<&'a mut Option
     match (field, &mut d.backend) {
         ("password", BackendConfig::Webdav(c)) => Ok(&mut c.password),
         ("password", BackendConfig::Sftp(c)) => Ok(&mut c.password),
-        ("key_passphrase", BackendConfig::Sftp(c)) if c.private_key.is_some() => {
+        ("key_passphrase", BackendConfig::Sftp(c))
+            if c.private_key.is_some() || c.use_ssh_config =>
+        {
             Ok(&mut c.key_passphrase)
         }
         ("password", BackendConfig::Ftp(c)) => Ok(&mut c.password),
@@ -847,7 +857,7 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
         }
         BackendConfig::Sftp(c) => {
             secrets.push(secret_info("password", "암호", c.password.as_ref(), stored));
-            if c.private_key.is_some() {
+            if c.private_key.is_some() || c.use_ssh_config {
                 secrets.push(secret_info(
                     "key_passphrase",
                     "개인키 암호문",
@@ -856,8 +866,22 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
                 ));
             }
             vec![
-                f("호스트", &format!("{}:{}", c.host, c.port)),
-                f("사용자", &c.username),
+                f(
+                    "호스트",
+                    &if c.use_ssh_config {
+                        format!("{} (로컬 SSH 설정)", c.host)
+                    } else {
+                        format!("{}:{}", c.host, c.port)
+                    },
+                ),
+                f(
+                    "사용자",
+                    if c.use_ssh_config {
+                        "SSH 설정에서 가져옴"
+                    } else {
+                        &c.username
+                    },
+                ),
                 f(
                     "개인키",
                     &c.private_key.as_deref().map(path).unwrap_or("-".into()),

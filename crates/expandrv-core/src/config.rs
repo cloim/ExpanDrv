@@ -239,6 +239,9 @@ pub struct WebDavConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SftpConfig {
+    /// OpenSSH의 로컬 설정에서 host 별칭과 인증 키를 해석합니다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_ssh_config: bool,
     pub host: String,
     #[serde(default = "default_sftp_port")]
     pub port: u16,

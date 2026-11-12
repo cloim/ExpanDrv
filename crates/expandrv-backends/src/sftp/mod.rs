@@ -1,6 +1,7 @@
 //! SFTP 백엔드. SSH 연결 하나에 SFTP 채널 여러 개를 열어 병렬 요청을 나눠 처리합니다.
 
 mod known_hosts;
+mod ssh_config;
 
 use crate::proxy::Proxy;
 use async_trait::async_trait;
@@ -40,9 +41,9 @@ struct Target {
     host: String,
     port: u16,
     username: String,
-    known_hosts: PathBuf,
+    known_hosts: Vec<PathBuf>,
     password: Option<SecretString>,
-    key: Option<Arc<PrivateKey>>,
+    keys: Vec<Arc<PrivateKey>>,
     proxy: Option<Arc<Proxy>>,
 }
 
@@ -81,38 +82,64 @@ impl SftpBackend {
         secrets: &dyn SecretResolver,
         proxy: Option<Arc<Proxy>>,
     ) -> Result<SftpBackend> {
+        let resolved = if cfg.use_ssh_config {
+            Some(ssh_config::resolve(&cfg.host).await?)
+        } else {
+            None
+        };
         let password = cfg
             .password
             .as_ref()
             .map(|s| secrets.resolve(s))
             .transpose()?;
-        let key = match &cfg.private_key {
-            Some(path) => {
-                let passphrase = cfg
-                    .key_passphrase
-                    .as_ref()
-                    .map(|s| secrets.resolve(s))
-                    .transpose()?;
-                Some(Arc::new(load_key(path, passphrase.as_ref())?))
-            }
-            None => None,
+        let passphrase = cfg
+            .key_passphrase
+            .as_ref()
+            .map(|s| secrets.resolve(s))
+            .transpose()?;
+        let mut keys = Vec::new();
+        let mut key_error = None;
+        let paths = if let Some(r) = &resolved {
+            r.identities.clone()
+        } else {
+            cfg.private_key.iter().cloned().collect()
         };
-        if password.is_none() && key.is_none() {
+        for path in paths {
+            if resolved.is_some() && !path.is_file() {
+                continue;
+            }
+            match load_key(&path, passphrase.as_ref()) {
+                Ok(key) => keys.push(Arc::new(key)),
+                Err(e) if resolved.is_some() => key_error = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        if password.is_none() && keys.is_empty() {
+            if let Some(e) = key_error {
+                return Err(e);
+            }
             return Err(Error::Config(
-                "SFTP 인증 수단(password 또는 private_key)이 없습니다".into(),
+                "SFTP 인증 수단이 없습니다. 암호나 개인키를 지정하세요. SSH 설정 사용 시 디스크의 IdentityFile이 필요합니다(ssh-agent 미지원)".into(),
             ));
         }
         let known_hosts = match &cfg.known_hosts {
-            Some(p) => p.clone(),
-            None => default_known_hosts()?,
+            Some(p) => vec![p.clone()],
+            None => match &resolved {
+                Some(r) => r.known_hosts.clone(),
+                None => vec![default_known_hosts()?],
+            },
         };
         let target = Target {
-            host: cfg.host.clone(),
-            port: cfg.port,
-            username: cfg.username.clone(),
+            host: resolved
+                .as_ref()
+                .map_or_else(|| cfg.host.clone(), |r| r.host.clone()),
+            port: resolved.as_ref().map_or(cfg.port, |r| r.port),
+            username: resolved
+                .as_ref()
+                .map_or_else(|| cfg.username.clone(), |r| r.user.clone()),
             known_hosts,
             password,
-            key,
+            keys,
             proxy,
         };
 
@@ -245,7 +272,7 @@ impl Backend for SftpBackend {
 struct HostKeyHandler {
     host: String,
     port: u16,
-    known_hosts: PathBuf,
+    known_hosts: Vec<PathBuf>,
     /// 거부 사유. 연결 실패 후 `Error::Auth` 메시지로 씁니다.
     rejection: Arc<StdMutex<Option<String>>>,
 }
@@ -260,22 +287,33 @@ impl client::Handler for HostKeyHandler {
         let key = server_key.public_key();
         let fp = key.fingerprint(HashAlg::Sha256);
         let who = format!("{}:{}", self.host, self.port);
-        let file = self.known_hosts.display();
+        let file = self
+            .known_hosts
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let verdict = if server_key.certificate().is_some() {
             Err(format!(
                 "호스트 키를 신뢰할 수 없습니다: {who}가 호스트 인증서를 보냈지만 지원하지 않습니다(키 지문 {fp})"
             ))
         } else {
-            let text = match std::fs::read_to_string(&self.known_hosts) {
-                Ok(t) => t,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(e) => {
-                    *self.rejection.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!(
-                        "호스트 키를 확인할 수 없습니다: known_hosts({file})를 읽지 못했습니다: {e}"
-                    ));
-                    return Ok(false);
+            let mut text = String::new();
+            for path in &self.known_hosts {
+                match std::fs::read_to_string(path) {
+                    Ok(t) => {
+                        text.push_str(&t);
+                        text.push('\n');
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        *self.rejection.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!(
+                            "호스트 키를 확인할 수 없습니다: known_hosts({file})를 읽지 못했습니다: {e}"
+                        ));
+                        return Ok(false);
+                    }
                 }
-            };
+            }
             let algo = key.algorithm();
             match known_hosts::check(&text, &self.host, self.port, &key) {
                 HostKeyCheck::Trusted => Ok(()),
@@ -392,7 +430,7 @@ async fn open_conn(t: &Target) -> Result<Conn> {
 /// 키를 먼저, 실패하면 암호를 시도합니다.
 async fn authenticate(handle: &mut client::Handle<HostKeyHandler>, t: &Target) -> Result<()> {
     let user = t.username.as_str();
-    if let Some(key) = &t.key {
+    for key in &t.keys {
         let hash = if key.algorithm().is_rsa() {
             // 서버가 ext-info를 보내지 않으면 rsa-sha2-256을 씁니다.
             handle

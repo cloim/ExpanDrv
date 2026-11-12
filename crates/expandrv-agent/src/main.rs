@@ -304,6 +304,7 @@ fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<Backen
             root,
             known_hosts,
         } => BackendConfig::Sftp(SftpConfig {
+            use_ssh_config: false,
             host,
             port,
             username: user,

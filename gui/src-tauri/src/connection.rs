@@ -14,6 +14,7 @@ pub fn connection_fields(backend: &BackendConfig) -> BTreeMap<String, String> {
             ),
         ],
         BackendConfig::Sftp(c) => vec![
+            ("useSshConfig", c.use_ssh_config.to_string()),
             ("host", c.host.clone()),
             ("port", c.port.to_string()),
             ("username", c.username.clone()),
@@ -99,13 +100,28 @@ pub fn edited_backend(
             c.pinned_cert_sha256 = normalize_pin(Some(v("pinnedCertSha256")))?;
         }
         BackendConfig::Sftp(c) => {
+            c.use_ssh_config = v("useSshConfig")
+                .parse()
+                .map_err(|_| bad("SSH 설정 사용 값을 확인하세요"))?;
             c.host = check_host(&v("host"))?;
-            c.port = port()?;
-            c.username = required("사용자", &v("username"), 256)?;
+            c.port = if c.use_ssh_config { 22 } else { port()? };
+            c.username = if c.use_ssh_config {
+                String::new()
+            } else {
+                required("사용자", &v("username"), 256)?
+            };
             c.root = remote_root(&v("root"))?;
-            c.private_key = path("privateKey")?;
-            c.known_hosts = path("knownHosts")?;
-            if c.private_key.is_none() {
+            c.private_key = if c.use_ssh_config {
+                None
+            } else {
+                path("privateKey")?
+            };
+            c.known_hosts = if c.use_ssh_config {
+                None
+            } else {
+                path("knownHosts")?
+            };
+            if !c.use_ssh_config && c.private_key.is_none() {
                 c.key_passphrase = None;
                 if c.password.is_none() {
                     return Err(bad("SFTP는 암호나 개인키 중 하나가 필요합니다"));

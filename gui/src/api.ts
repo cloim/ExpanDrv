@@ -81,6 +81,7 @@ export type BackendInput =
   | { type: 'webdav'; url: string; username: string; password: string; pinnedCertSha256: string }
   | {
       type: 'sftp';
+      useSshConfig: boolean;
       host: string;
       port: number;
       username: string;
