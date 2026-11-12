@@ -843,6 +843,43 @@ fn offline_cooldown_skips_remote_and_recovers_after_deadline() {
 }
 
 #[test]
+fn local_changes_survive_offline_cooldown_listing() {
+    let f = fixture_with(|o| o.meta_db = Some(o.staging_dir.with_file_name("meta.db")));
+    std::fs::create_dir(f.root.path().join("Krea2")).unwrap();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    // 원격 확인 대기 중에도 쓰기는 원격으로 바로 갑니다. 목록만 저장본으로 폴백합니다.
+    *f.vfs.s.offline_until.lock() = Some(Instant::now() + Duration::from_secs(60));
+    let names = |f: &Fixture| -> Vec<String> {
+        f.vfs.refresh();
+        let mut v: Vec<String> = f
+            .vfs
+            .list(&RemotePath::root())
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let h = f.vfs.create(&p("/새 폴더"), EntryKind::Dir).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(names(&f), ["Krea2", "새 폴더"]);
+
+    let h = f.vfs.open(&p("/새 폴더")).unwrap();
+    f.vfs.rename(&h, &p("/Flux1.D"), false).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(names(&f), ["Flux1.D", "Krea2"]);
+
+    let h = f.vfs.open(&p("/Flux1.D")).unwrap();
+    f.vfs.cleanup(&h, true).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(names(&f), ["Krea2"]);
+}
+
+#[test]
 fn authentication_and_not_found_do_not_trigger_offline_cooldown() {
     let f = fixture(false);
     let result: Result<()> = f._rt.block_on(

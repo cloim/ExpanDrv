@@ -406,6 +406,16 @@ impl Shared {
         Ok(b)
     }
 
+    /// 로컬에서 만들거나 바꾼 항목을 저장된 부모 목록에 반영합니다.
+    /// 원격 확인 대기 중 오프라인 목록으로 폴백해도 새 항목을 찾을 수 있게 합니다.
+    fn persist_entry(&self, path: &RemotePath, entry: &Entry) {
+        if let Some(store) = &self.store
+            && let Err(e) = store.save_entry(path, entry)
+        {
+            tracing::debug!(%path, error = %e, "항목 저장 실패");
+        }
+    }
+
     fn forget(&self, path: &RemotePath) {
         self.meta.invalidate_tree(path);
         self.drop_blocks(path);
@@ -532,6 +542,7 @@ impl Shared {
                     tracing::warn!(%path, error = %e, "업로드 저널 정리 실패");
                 }
                 self.meta.invalidate(&path);
+                self.persist_entry(&path, &entry);
                 self.meta.put_entry(&path, entry);
                 self.drop_blocks(&path);
             }
@@ -1191,6 +1202,7 @@ impl Vfs {
         };
         s.meta.invalidate(path);
         s.meta.put_entry(path, entry.clone());
+        s.persist_entry(path, &entry);
         Ok(self.attach(path.clone(), entry))
     }
 
@@ -1457,6 +1469,9 @@ impl Vfs {
         }
         s.forget(&from);
         s.forget(to);
+        let mut moved_entry = h.node.state.lock().entry.clone();
+        moved_entry.name = to.name().unwrap_or_default().to_owned();
+        s.persist_entry(to, &moved_entry);
         for node in requeue {
             if node.opens.load(Ordering::SeqCst) == 0 {
                 s.schedule_upload(&node, Duration::ZERO);

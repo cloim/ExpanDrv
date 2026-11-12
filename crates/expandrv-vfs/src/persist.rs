@@ -294,6 +294,14 @@ impl MetaStore {
             )
             .map_err(db_err)?;
         }
+        // 부모 목록에 남은 자기 항목도 지워 옛 이름이 오프라인 목록에 다시 나타나지 않게 합니다.
+        if let (Some(dir), Some(name)) = (path.parent(), path.name()) {
+            conn.execute(
+                "DELETE FROM entries WHERE dir = ?1 AND name = ?2",
+                params![dir.as_str(), name],
+            )
+            .map_err(db_err)?;
+        }
         Ok(())
     }
 }
@@ -332,6 +340,8 @@ mod tests {
             .unwrap();
         store.forget_tree(&sub).unwrap();
         assert!(store.load_dir(&sub).unwrap().is_none());
+        // 부모 목록에서도 빠집니다.
+        assert_eq!(store.load_dir(&root).unwrap().unwrap(), vec![f.clone()]);
         assert!(
             store
                 .load_dir(&RemotePath::parse("/aXb").unwrap())
