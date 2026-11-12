@@ -64,9 +64,17 @@ fn network_share_mounts_as_remote_drive() {
         b"network"
     );
     fs::write(format!("{mount_point}\\new.txt"), b"x").unwrap();
+    // 네트워크 드라이브에서도 새 폴더를 만든 직후 이름을 바꿀 수 있어야 합니다.
+    fs::create_dir(format!("{mount_point}\\새 폴더")).unwrap();
+    fs::rename(
+        format!("{mount_point}\\새 폴더"),
+        format!("{mount_point}\\Flux1.D"),
+    )
+    .unwrap();
     drop(drive);
     vfs.sync(Duration::from_secs(10)).unwrap();
     assert_eq!(fs::read(root.path().join("new.txt")).unwrap(), b"x");
+    assert!(root.path().join("Flux1.D").is_dir() && !root.path().join("새 폴더").exists());
 }
 
 #[test]

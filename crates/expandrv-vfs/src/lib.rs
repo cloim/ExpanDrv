@@ -1420,6 +1420,9 @@ impl Vfs {
         if from.is_root() || to.is_root() {
             return Err(Error::PermissionDenied);
         }
+        // 대소문자를 구분하지 않는 볼륨에서 WinFsp는 대상의 상위 경로를 대문자로 넘깁니다.
+        // 대소문자를 구분하는 원격(SFTP 등)에서도 찾을 수 있게 실제 상위 경로로 바꿉니다.
+        let to = &self.real_target(to)?;
         if h.is_dir() && to.starts_with(&from) && !to.as_str().eq_ignore_ascii_case(from.as_str()) {
             return Err(Error::InvalidPath(
                 "디렉터리를 자기 하위로 옮길 수 없습니다".into(),
@@ -1478,6 +1481,18 @@ impl Vfs {
             }
         }
         Ok(())
+    }
+
+    /// 상위 경로를 원격의 실제 대소문자로 맞춘 대상 경로. 마지막 이름은 요청 그대로 둡니다.
+    fn real_target(&self, to: &RemotePath) -> Result<RemotePath> {
+        let (Some(parent), Some(name)) = (to.parent(), to.name()) else {
+            return Ok(to.clone());
+        };
+        let (real, entry) = self.stat(&parent)?;
+        if !entry.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        real.join(name)
     }
 
     /// 핸들 정리. `delete`면 원격에서 삭제하고, 마지막 핸들이면 변경분 업로드를 예약합니다.

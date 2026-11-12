@@ -880,6 +880,21 @@ fn local_changes_survive_offline_cooldown_listing() {
 }
 
 #[test]
+fn rename_target_parent_uses_real_case() {
+    let f = fixture(false);
+    std::fs::create_dir(f.root.path().join("loras")).unwrap();
+    std::fs::create_dir(f.root.path().join("loras/새 폴더")).unwrap();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    let h = f.vfs.open(&p("/loras/새 폴더")).unwrap();
+    // WinFsp가 넘기는 형태: 상위 경로만 대문자
+    f.vfs.rename(&h, &p("/LORAS/Flux1.D"), false).unwrap();
+    assert_eq!(h.path().as_str(), "/loras/Flux1.D");
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert!(f.root.path().join("loras/Flux1.D").is_dir());
+}
+
+#[test]
 fn authentication_and_not_found_do_not_trigger_offline_cooldown() {
     let f = fixture(false);
     let result: Result<()> = f._rt.block_on(
