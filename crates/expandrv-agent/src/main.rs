@@ -63,7 +63,7 @@ enum Command {
         /// 분리 실행용: 로그를 파일로 남깁니다
         #[arg(long, hide = true)]
         background: bool,
-        /// 시작하자마자 auto_mount 드라이브를 마운트합니다
+        /// 로그인 자동 실행으로 시작했음을 표시합니다(auto_mount 드라이브는 항상 마운트합니다)
         #[arg(long)]
         autostart: bool,
     },

@@ -771,6 +771,57 @@ fn scopeguard(target: &str) -> impl Drop + '_ {
     G(target)
 }
 
+/// GUI나 CLI가 띄운 에이전트(`agent --background`)도 auto_mount 드라이브를 마운트합니다.
+/// 같은 드라이브의 마운트 요청이 자동 마운트와 겹쳐도 작업 중 오류 없이 성공해야 합니다.
+#[test]
+fn background_agent_also_mounts_auto_mount_drives() {
+    if expandrv_winfsp::runtime::runtime_dll().is_none() {
+        eprintln!("WinFsp 런타임 미설치: 건너뜀");
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let env = Env::new("bgauto");
+    let _keys = CacheKeys::new(&["auto1", "auto2", "manual"]);
+    let letters = free_drives(3);
+    let (auto1, auto2, manual) = (
+        letters[0].as_str(),
+        letters[1].as_str(),
+        letters[2].as_str(),
+    );
+    let root = env.path("remote");
+    std::fs::create_dir(&root).unwrap();
+    let root_s = root.to_str().unwrap();
+    for (id, mp, auto) in [
+        ("auto1", auto1, true),
+        ("auto2", auto2, true),
+        ("manual", manual, false),
+    ] {
+        let mut args = vec!["add", id, mp];
+        if auto {
+            args.push("--auto-mount");
+        }
+        args.extend(["local", root_s]);
+        assert!(env.run(&args).ok);
+    }
+
+    // mount가 에이전트를 띄우고, 그 사이 시작된 auto1 자동 마운트와 겹칩니다.
+    let r = env.run(&["mount", "auto1"]);
+    assert!(r.ok, "{}", r.stderr);
+    let pid = env.agent_pid().expect("에이전트가 응답하지 않습니다");
+    let _guard = AgentGuard { env: &env, pid };
+    let drive = PathBuf::from(format!("{auto2}\\"));
+    for _ in 0..100 {
+        if drive.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(drive.exists(), "자동 마운트 드라이브가 나타나지 않았습니다");
+    assert!(Path::new(&format!("{auto1}\\")).exists());
+    assert!(!Path::new(&format!("{manual}\\")).exists());
+    assert!(env.run(&["stop"]).ok);
+}
+
 #[test]
 fn autostart_agent_mounts_only_auto_mount_drives() {
     if expandrv_winfsp::runtime::runtime_dll().is_none() {

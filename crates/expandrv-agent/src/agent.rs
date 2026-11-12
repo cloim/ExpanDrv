@@ -265,50 +265,20 @@ impl Agent {
     }
 
     async fn mount(&self, id: &str) -> Response {
-        let d = {
-            let mut st = self.lock();
-            if st.shutting_down {
-                return Response::error(ErrorCode::ShuttingDown, "에이전트가 종료 중입니다");
-            }
-            if st.locked {
-                return Response::error(
-                    ErrorCode::Locked,
-                    "드라이브가 잠겨 있습니다. PIN으로 잠금을 해제하세요",
-                );
-            }
-            let Some(d) = st.config.drive(id).cloned() else {
-                return Response::error(
-                    ErrorCode::UnknownDrive,
-                    format!("드라이브 {id}가 없습니다"),
-                );
+        let d = loop {
+            let ready = {
+                let st = self.lock();
+                // 시작 시 자동 마운트처럼 같은 드라이브를 마운트하는 중이면 끝난 뒤 결과를 따릅니다.
+                st.shutting_down || !matches!(st.busy.get(id), Some(None))
             };
-            if st.busy.contains_key(id) {
-                return Response::error(
-                    ErrorCode::Busy,
-                    format!("{id}에 다른 작업이 진행 중입니다"),
-                );
+            if ready {
+                break self.begin_mount(id);
             }
-            if st.mounted.contains_key(id) {
-                return Response::error(
-                    ErrorCode::AlreadyMounted,
-                    format!("{id}는 이미 마운트되어 있습니다"),
-                );
-            }
-            if let Some(other) = st
-                .mounted
-                .values()
-                .find(|m| m.cfg.mount_point.eq_ignore_ascii_case(&d.mount_point))
-            {
-                return Response::error(
-                    ErrorCode::MountFailed,
-                    format!(
-                        "{}을 드라이브 {}가 쓰고 있습니다",
-                        d.mount_point, other.cfg.id
-                    ),
-                );
-            }
-            st.busy.insert(id.to_owned(), None);
-            d
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let d = match d {
+            Ok(d) => d,
+            Err(response) => return response,
         };
         let (rt, cfg) = (self.rt.clone(), d.clone());
         let r = joined(tokio::task::spawn_blocking(move || connect_and_mount(&cfg, &rt)).await);
@@ -329,6 +299,56 @@ impl Agent {
                 Response::error(ErrorCode::MountFailed, msg)
             }
         }
+    }
+
+    /// 마운트할 수 있는지 확인하고 작업 중으로 표시합니다.
+    fn begin_mount(&self, id: &str) -> std::result::Result<DriveConfig, Response> {
+        let mut st = self.lock();
+        if st.shutting_down {
+            return Err(Response::error(
+                ErrorCode::ShuttingDown,
+                "에이전트가 종료 중입니다",
+            ));
+        }
+        if st.locked {
+            return Err(Response::error(
+                ErrorCode::Locked,
+                "드라이브가 잠겨 있습니다. PIN으로 잠금을 해제하세요",
+            ));
+        }
+        let Some(d) = st.config.drive(id).cloned() else {
+            return Err(Response::error(
+                ErrorCode::UnknownDrive,
+                format!("드라이브 {id}가 없습니다"),
+            ));
+        };
+        if st.busy.contains_key(id) {
+            return Err(Response::error(
+                ErrorCode::Busy,
+                format!("{id}에 다른 작업이 진행 중입니다"),
+            ));
+        }
+        if st.mounted.contains_key(id) {
+            return Err(Response::error(
+                ErrorCode::AlreadyMounted,
+                format!("{id}는 이미 마운트되어 있습니다"),
+            ));
+        }
+        if let Some(other) = st
+            .mounted
+            .values()
+            .find(|m| m.cfg.mount_point.eq_ignore_ascii_case(&d.mount_point))
+        {
+            return Err(Response::error(
+                ErrorCode::MountFailed,
+                format!(
+                    "{}을 드라이브 {}가 쓰고 있습니다",
+                    d.mount_point, other.cfg.id
+                ),
+            ));
+        }
+        st.busy.insert(id.to_owned(), None);
+        Ok(d)
     }
 
     async fn unmount(&self, id: &str) -> Response {
@@ -699,7 +719,8 @@ impl Handler for Agent {
 }
 
 /// `expandrv agent`: 사용자당 하나만 실행합니다. Shutdown 요청이나 Ctrl+C로 끝납니다.
-/// `autostart`면 시작 직후 `auto_mount` 드라이브를 마운트합니다(로그인 자동 실행용).
+/// 어떻게 시작했든(로그인 자동 실행, GUI, CLI) 시작 직후 `auto_mount` 드라이브를 마운트합니다.
+/// `autostart`는 로그인 자동 실행 여부로 로그에만 남깁니다.
 pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -709,7 +730,7 @@ pub fn run(cfg_path: PathBuf, pipe: &str, autostart: bool) -> Result<()> {
         let auto: Vec<String> = config
             .drives
             .iter()
-            .filter(|d| autostart && d.auto_mount)
+            .filter(|d| d.auto_mount)
             .map(|d| d.id.clone())
             .collect();
         let agent = Arc::new(Agent::new(cfg_path, config, Handle::current())?);

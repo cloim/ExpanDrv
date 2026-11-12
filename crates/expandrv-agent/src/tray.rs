@@ -4,8 +4,8 @@ use expandrv_ipc::{AgentStatus, DriveState};
 use expandrv_vfs::{TransferEvent, Vfs};
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -19,6 +19,16 @@ use windows::core::w;
 const CALLBACK: u32 = WM_APP + 1;
 const ACTION: u32 = WM_APP + 2;
 const RESET: u32 = WM_APP + 3;
+/// 업데이트 상태가 바뀌면 열려 있는 트레이 메뉴의 업데이트 항목을 고칩니다.
+const REFRESH_MENU: u32 = WM_APP + 4;
+
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 에이전트 시작 뒤 첫 업데이트 확인까지 기다리는 시간
+const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(10);
+/// 주기적 업데이트 확인 간격
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// 트레이 메뉴를 열 때 다시 확인하기까지의 최소 간격. GitHub API 호출 한도를 아낍니다.
+const MENU_CHECK_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct SessionNotifiers {
@@ -28,10 +38,19 @@ pub struct SessionNotifiers {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateStatus {
+    /// 아직 확인하지 않았습니다.
     Idle,
     Checking,
+    /// 현재 버전이 최신입니다.
+    UpToDate,
+    /// 개발 빌드처럼 설치 형식을 알 수 없어 자동 업데이트를 지원하지 않습니다.
+    Unsupported,
+    /// 확인에 실패했습니다. 메뉴를 누르면 다시 확인합니다.
+    Failed,
     Available(crate::updater::UpdateCandidate),
-    Downloading,
+    Downloading {
+        version: String,
+    },
     ReadyToInstall {
         installer_path: std::path::PathBuf,
         version: String,
@@ -42,15 +61,75 @@ pub enum UpdateStatus {
     },
 }
 
+impl UpdateStatus {
+    /// 다운로드부터 설치까지 진행 중이면 확인 결과로 덮지 않습니다.
+    fn in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Downloading { .. } | Self::ReadyToInstall { .. } | Self::Installing { .. }
+        )
+    }
+}
+
 /// 업데이트 상태에 따른 트레이 메뉴 라벨, 활성화 여부(클릭 가능 여부) 및 메뉴 ID를 반환합니다.
 pub fn menu_item_for_update_status(status: &UpdateStatus) -> (String, bool, u32) {
     match status {
         UpdateStatus::Idle => ("업데이트 확인".into(), true, 10),
         UpdateStatus::Checking => ("업데이트 확인 중...".into(), false, 10),
-        UpdateStatus::Available(c) => (format!("v{} 다운로드 및 설치", c.version_str), true, 11),
-        UpdateStatus::Downloading => ("업데이트 다운로드 중...".into(), false, 10),
-        UpdateStatus::ReadyToInstall { version, .. } => (format!("v{version} 지금 설치"), true, 12),
-        UpdateStatus::Installing { version } => (format!("v{version} 설치 진행 중..."), false, 10),
+        UpdateStatus::UpToDate => (format!("최신 버전 (v{CURRENT_VERSION})"), false, 10),
+        UpdateStatus::Unsupported => (format!("업데이트 미지원 (v{CURRENT_VERSION})"), false, 10),
+        UpdateStatus::Failed => (format!("업데이트 확인 실패 (v{CURRENT_VERSION})"), true, 10),
+        UpdateStatus::Available(c) => (format!("업데이트 하기 (v{})", c.version_str), true, 11),
+        UpdateStatus::Downloading { version } => {
+            (format!("업데이트 다운로드 중 (v{version})"), false, 11)
+        }
+        UpdateStatus::ReadyToInstall { version, .. } => {
+            (format!("업데이트 하기 (v{version})"), true, 12)
+        }
+        UpdateStatus::Installing { version } => {
+            (format!("업데이트 설치 중 (v{version})"), false, 12)
+        }
+    }
+}
+
+/// 트레이 스레드, 창 프로시저와 업데이트 작업이 함께 쓰는 상태
+struct Shared {
+    notifiers: Arc<SessionNotifiers>,
+    update: Mutex<UpdateStatus>,
+    checking: AtomicBool,
+    last_check: Mutex<Option<Instant>>,
+    /// 열려 있는 트레이 메뉴 핸들(없으면 0)
+    menu: AtomicIsize,
+    /// 트레이 창 핸들(종료 뒤 0)
+    hwnd: AtomicIsize,
+}
+
+impl Shared {
+    fn update_status(&self) -> UpdateStatus {
+        self.update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_update(&self, status: UpdateStatus) {
+        *self.update.lock().unwrap_or_else(|e| e.into_inner()) = status;
+        self.refresh_menu();
+    }
+
+    /// 열려 있는 메뉴가 있으면 창 프로시저가 업데이트 항목을 고치게 합니다.
+    fn refresh_menu(&self) {
+        let hwnd = self.hwnd.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    REFRESH_MENU,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
     }
 }
 
@@ -95,7 +174,8 @@ enum Update {
     Status(AgentStatus),
     Notice(NotificationKind, String, String),
     Shutdown(mpsc::Sender<()>),
-    Updater(UpdateStatus),
+    /// 다운로드를 마친 설치 패키지를 트레이 스레드에서 실행합니다.
+    Install(UpdateStatus),
     #[cfg(test)]
     SessionEvent(u32),
 }
@@ -227,12 +307,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe {
         if msg == WM_WTSSESSION_CHANGE {
             let code = wp.0 as u32;
-            let notifiers = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SessionNotifiers;
-            if let Some(notifiers) = notifiers.as_ref() {
+            let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
+            if let Some(shared) = shared.as_ref() {
                 if code == WTS_SESSION_LOCK {
-                    notifiers.lock.notify_one();
+                    shared.notifiers.lock.notify_one();
                 } else if code == WTS_SESSION_UNLOCK {
-                    notifiers.unlock.notify_one();
+                    shared.notifiers.unlock.notify_one();
+                }
+            }
+            return LRESULT(0);
+        }
+        if msg == REFRESH_MENU {
+            // 메뉴가 열려 있는 동안에도 메뉴 모달 루프가 이 메시지를 전달합니다.
+            let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
+            if let Some(shared) = shared.as_ref() {
+                let menu = shared.menu.load(Ordering::SeqCst);
+                if menu != 0 {
+                    put_update_item(HMENU(menu as *mut _), &shared.update_status(), false);
+                    if let Ok(popup) = FindWindowW(w!("#32768"), None) {
+                        let _ =
+                            windows::Win32::Graphics::Gdi::InvalidateRect(Some(popup), None, true);
+                    }
                 }
             }
             return LRESULT(0);
@@ -249,6 +344,245 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return LRESULT(0);
         }
         DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
+/// 업데이트 항목은 메뉴의 첫 번째 자리에 둡니다. `append`가 아니면 그 자리를 고칩니다.
+unsafe fn put_update_item(menu: HMENU, status: &UpdateStatus, append: bool) {
+    let (label, enabled, id) = menu_item_for_update_status(status);
+    let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+    let flags = if enabled {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
+    let text = windows::core::PCWSTR(text.as_ptr());
+    unsafe {
+        let _ = if append {
+            AppendMenuW(menu, flags, id as usize, text)
+        } else {
+            ModifyMenuW(menu, 0, flags | MF_BYPOSITION, id as usize, text)
+        };
+    }
+}
+
+async fn check_latest(
+    install_kind: crate::updater::InstallKind,
+) -> Result<Option<crate::updater::UpdateCandidate>, String> {
+    let client = crate::updater::build_http_client().map_err(|e| e.to_string())?;
+    let current = crate::updater::parse_version(CURRENT_VERSION)
+        .ok_or_else(|| "현재 버전 형식을 확인할 수 없습니다".to_owned())?;
+    let releases = crate::updater::fetch_releases(
+        &client,
+        crate::updater::DEFAULT_REPO_OWNER,
+        crate::updater::DEFAULT_REPO_NAME,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    crate::updater::find_latest_update(&releases, &current, install_kind).map_err(|e| e.to_string())
+}
+
+/// 업데이트 확인을 백그라운드로 시작합니다.
+/// 이미 확인 중이거나, 다운로드부터 설치까지 진행 중이거나, `min_interval` 안에 확인했다면 건너뜁니다.
+fn start_update_check(
+    shared: &Arc<Shared>,
+    rt: &tokio::runtime::Handle,
+    tx: &mpsc::SyncSender<Update>,
+    min_interval: Duration,
+) {
+    let status = shared.update_status();
+    if status.in_progress() {
+        return;
+    }
+    {
+        let mut last = shared.last_check.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| at.elapsed() < min_interval)
+            || shared.checking.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let install_kind = crate::updater::detect_current_install_kind();
+    if install_kind == crate::updater::InstallKind::Unknown {
+        shared.set_update(UpdateStatus::Unsupported);
+        shared.checking.store(false, Ordering::SeqCst);
+        return;
+    }
+    // 이미 알고 있는 결과(최신 버전, 새 버전)는 확인하는 동안 그대로 보여 줍니다.
+    if matches!(status, UpdateStatus::Idle | UpdateStatus::Failed) {
+        shared.set_update(UpdateStatus::Checking);
+    }
+    let (shared, tx) = (shared.clone(), tx.clone());
+    rt.spawn(async move {
+        let result = check_latest(install_kind).await;
+        let found = {
+            let mut st = shared.update.lock().unwrap_or_else(|e| e.into_inner());
+            match result {
+                // 확인하는 동안 다운로드를 시작했다면 그 진행 상태를 지킵니다.
+                _ if st.in_progress() => None,
+                Ok(Some(candidate)) => {
+                    let known = matches!(&*st, UpdateStatus::Available(c) if c.version == candidate.version);
+                    let version = candidate.version_str.clone();
+                    *st = UpdateStatus::Available(candidate);
+                    (!known).then_some(version)
+                }
+                Ok(None) => {
+                    *st = UpdateStatus::UpToDate;
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "업데이트 확인 실패");
+                    if matches!(*st, UpdateStatus::Idle | UpdateStatus::Checking) {
+                        *st = UpdateStatus::Failed;
+                    }
+                    None
+                }
+            }
+        };
+        shared.checking.store(false, Ordering::SeqCst);
+        shared.refresh_menu();
+        if let Some(version) = found {
+            let _ = tx.try_send(Update::Notice(
+                NotificationKind::AutoUpdater,
+                "업데이트 가능".into(),
+                format!("ExpanDrv v{version}을 설치할 수 있습니다. 트레이 메뉴의 `업데이트 하기`를 누르면 바로 설치합니다."),
+            ));
+        }
+    });
+}
+
+async fn download_update(
+    candidate: &crate::updater::UpdateCandidate,
+) -> Result<std::path::PathBuf, String> {
+    let client = crate::updater::build_http_client().map_err(|e| e.to_string())?;
+    let manifest = crate::updater::fetch_manifest(&client, &candidate.manifest_asset.url)
+        .await
+        .map_err(|e| format!("매니페스트 확인 실패: {e}"))?;
+    let artifact = crate::updater::verify_manifest(&manifest, candidate)
+        .map_err(|e| format!("매니페스트 검증 실패: {e}"))?
+        .clone();
+    crate::updater::download_and_verify_setup(&client, candidate, &artifact)
+        .await
+        .map_err(|e| format!("다운로드 검증 실패: {e}"))
+}
+
+/// 설치 패키지를 받아 검증한 뒤 트레이 스레드에 설치 실행을 요청합니다.
+fn start_download(
+    shared: &Arc<Shared>,
+    rt: &tokio::runtime::Handle,
+    tx: &mpsc::SyncSender<Update>,
+    candidate: crate::updater::UpdateCandidate,
+) {
+    shared.set_update(UpdateStatus::Downloading {
+        version: candidate.version_str.clone(),
+    });
+    let (shared, tx) = (shared.clone(), tx.clone());
+    rt.spawn(async move {
+        match download_update(&candidate).await {
+            Ok(installer_path) => {
+                let ready = UpdateStatus::ReadyToInstall {
+                    installer_path,
+                    version: candidate.version_str,
+                    install_kind: candidate.install_kind,
+                };
+                shared.set_update(ready.clone());
+                // 설치 프로그램은 트레이 스레드에서 실행합니다. 보내지 못하면 메뉴에서 다시 누를 수 있습니다.
+                let _ = tx.try_send(Update::Install(ready));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "업데이트 다운로드 실패");
+                shared.set_update(UpdateStatus::Available(candidate));
+                let _ = tx.try_send(Update::Notice(
+                    NotificationKind::AutoUpdater,
+                    "업데이트 실패".into(),
+                    e,
+                ));
+            }
+        }
+    });
+}
+
+/// 설치 프로그램을 실행하고 끝날 때까지 감시합니다.
+/// 인스톨러의 사전 실행 훅이 스스로 `expandrv.exe stop`을 호출하여 미완료 업로드 대기와 드라이브 해제를
+/// 검증하므로, 에이전트가 먼저 종료해 경합하거나 관측을 방해하지 않습니다.
+unsafe fn start_install(
+    shared: &Arc<Shared>,
+    tx: &mpsc::SyncSender<Update>,
+    shutdown_requested: &Arc<AtomicBool>,
+    gate: &NotificationGate,
+    icon: &mut NOTIFYICONDATAW,
+    ready: UpdateStatus,
+) {
+    let UpdateStatus::ReadyToInstall {
+        installer_path,
+        version,
+        install_kind,
+    } = &ready
+    else {
+        return;
+    };
+    // 중복 실행을 막기 위해 먼저 설치 중으로 바꿉니다.
+    shared.set_update(UpdateStatus::Installing {
+        version: version.clone(),
+    });
+    match crate::updater::launch_installer(installer_path, *install_kind) {
+        Ok(handle) => {
+            unsafe {
+                balloon(
+                    gate,
+                    NotificationKind::AutoUpdater,
+                    icon,
+                    "업데이트 설치",
+                    &format!("v{version} 설치 프로그램을 시작했습니다."),
+                );
+            }
+            // 사용자가 마법사에서 취소하거나 설치가 중단되어 에이전트가 살아 있으면 다시 설치할 수 있게 되돌립니다.
+            // Tokio 런타임 종료를 막지 않도록 별도 스레드에서 200ms씩 기다리고, 에이전트 종료 시 바로 빠져나옵니다.
+            // 소유 핸들은 어떤 경로로 끝나도 스레드 종료 시 Drop되어 닫힙니다.
+            let (shared, tx, shutdown) = (shared.clone(), tx.clone(), shutdown_requested.clone());
+            let _ = std::thread::Builder::new()
+                .name("installer-monitor".into())
+                .spawn(move || {
+                    while !shutdown.load(Ordering::Relaxed) {
+                        match handle.wait_timeout(200) {
+                            Ok(crate::updater::ProcessWaitResult::Timeout) => continue,
+                            Ok(crate::updater::ProcessWaitResult::Exited(code)) => {
+                                if code != 0 {
+                                    let _ = tx.try_send(Update::Notice(
+                                        NotificationKind::AutoUpdater,
+                                        "설치 중단".into(),
+                                        "설치 프로그램이 취소되었거나 정상 완료되지 않았습니다."
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "설치 프로그램 대기 중 오류 발생");
+                                let _ = tx.try_send(Update::Notice(
+                                    NotificationKind::AutoUpdater,
+                                    "설치 오류".into(),
+                                    format!("설치 프로그램 감시 실패: {e}"),
+                                ));
+                            }
+                        }
+                        shared.set_update(ready);
+                        break;
+                    }
+                });
+        }
+        Err(e) => {
+            unsafe {
+                balloon(
+                    gate,
+                    NotificationKind::AutoUpdater,
+                    icon,
+                    "설치 실행 실패",
+                    &e.to_string(),
+                );
+            }
+            shared.set_update(ready.clone());
+        }
     }
 }
 
@@ -285,8 +619,16 @@ unsafe fn run(
             Some(instance.into()),
             None,
         )?;
-        // Notifiers의 Arc는 창 파괴까지 살아 있으므로 WindowProc의 포인터도 유효합니다.
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&notifiers) as isize);
+        let shared = Arc::new(Shared {
+            notifiers,
+            update: Mutex::new(UpdateStatus::Idle),
+            checking: AtomicBool::new(false),
+            last_check: Mutex::new(None),
+            menu: AtomicIsize::new(0),
+            hwnd: AtomicIsize::new(hwnd.0 as isize),
+        });
+        // Shared의 Arc는 창 파괴까지 살아 있으므로 WindowProc의 포인터도 유효합니다.
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&shared) as isize);
         let mut session_events = SessionNotifications {
             hwnd,
             registered: false,
@@ -316,13 +658,25 @@ unsafe fn run(
         wide(&mut icon.szTip, "ExpanDrv | 에이전트 실행 중");
         let _ = Shell_NotifyIconW(NIM_ADD, &icon);
         let mut states = HashMap::new();
-        let mut update_status = UpdateStatus::Idle;
         let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut next_update_check = Instant::now() + FIRST_UPDATE_CHECK;
+        let cleanup = |icon: &NOTIFYICONDATAW, session_events: SessionNotifications| {
+            shutdown_requested.store(true, Ordering::SeqCst);
+            shared.hwnd.store(0, Ordering::SeqCst);
+            let _ = Shell_NotifyIconW(NIM_DELETE, icon);
+            let _ = DestroyIcon(app_icon);
+            drop(session_events);
+            let _ = DestroyWindow(hwnd);
+        };
         loop {
             if !session_events.registered
                 && session_events.retry_at.elapsed() >= Duration::from_secs(5)
             {
                 session_events.register();
+            }
+            if Instant::now() >= next_update_check {
+                next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+                start_update_check(&shared, &rt, &tx_self, Duration::ZERO);
             }
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -330,25 +684,15 @@ unsafe fn run(
                     match msg.lParam.0 as u32 {
                         WM_LBUTTONDBLCLK => open_gui(),
                         WM_RBUTTONUP | WM_CONTEXTMENU => {
+                            // 메뉴를 여는 동시에 확인을 시작하고, 결과는 열린 메뉴에 바로 반영합니다.
+                            start_update_check(&shared, &rt, &tx_self, MENU_CHECK_MIN_INTERVAL);
                             let menu = CreatePopupMenu()?;
-                            let mut menu_text_buf = [0u16; 64];
-                            let (label, enabled, item_id) =
-                                menu_item_for_update_status(&update_status);
-                            wide(&mut menu_text_buf, &label);
-                            let flags = if enabled {
-                                MF_STRING
-                            } else {
-                                MF_STRING | MF_GRAYED
-                            };
-                            let _ = AppendMenuW(
-                                menu,
-                                flags,
-                                item_id as usize,
-                                windows::core::PCWSTR(menu_text_buf.as_ptr()),
-                            );
+                            put_update_item(menu, &shared.update_status(), true);
+                            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
                             let _ = AppendMenuW(menu, MF_STRING, 1, w!("열기"));
                             let _ = AppendMenuW(menu, MF_STRING, 3, w!("잠금"));
                             let _ = AppendMenuW(menu, MF_STRING, 2, w!("종료"));
+                            shared.menu.store(menu.0 as isize, Ordering::SeqCst);
 
                             let mut point = POINT::default();
                             let _ = GetCursorPos(&mut point);
@@ -363,365 +707,36 @@ unsafe fn run(
                                 None,
                             )
                             .0;
+                            shared.menu.store(0, Ordering::SeqCst);
                             let _ = DestroyMenu(menu);
-                            match choice {
-                                1 => open_gui(),
-                                2 => stop.notify_one(),
-                                3 => lock.notify_one(),
-                                10 => {
-                                    if update_status == UpdateStatus::Idle {
-                                        let install_kind =
-                                            crate::updater::detect_current_install_kind();
-                                        if install_kind == crate::updater::InstallKind::Unknown {
-                                            balloon(
-                                                &gate,
-                                                NotificationKind::AutoUpdater,
-                                                &mut icon,
-                                                "업데이트 불가",
-                                                "현재 설치 형식을 식별할 수 없어 자동 업데이트를 지원하지 않습니다 (개발 빌드 또는 미등록 경로).",
-                                            );
-                                        } else {
-                                            update_status = UpdateStatus::Checking;
-                                            balloon(
-                                                &gate,
-                                                NotificationKind::AutoUpdater,
-                                                &mut icon,
-                                                "업데이트 확인",
-                                                "최신 버전을 확인하고 있습니다...",
-                                            );
-                                            let tx = tx_self.clone();
-                                            rt.spawn(async move {
-                                                let client =
-                                                    match crate::updater::build_http_client() {
-                                                        Ok(c) => c,
-                                                        Err(e) => {
-                                                            let _ = tx.try_send(Update::Notice(
-                                                                NotificationKind::AutoUpdater,
-                                                                "업데이트 오류".into(),
-                                                                format!(
-                                                                    "HTTP 클라이언트 생성 실패: {e}"
-                                                                ),
-                                                            ));
-                                                            let _ = tx.try_send(Update::Updater(
-                                                                UpdateStatus::Idle,
-                                                            ));
-                                                            return;
-                                                        }
-                                                    };
-                                                let current_ver_str = env!("CARGO_PKG_VERSION");
-                                                let current_ver = match crate::updater::parse_version(
-                                                    current_ver_str,
-                                                ) {
-                                                    Some(v) => v,
-                                                    None => {
-                                                        let _ = tx.try_send(Update::Notice(
-                                                            NotificationKind::AutoUpdater,
-                                                            "업데이트 오류".into(),
-                                                            "현재 버전 형식을 확인할 수 없습니다"
-                                                                .into(),
-                                                        ));
-                                                        let _ = tx.try_send(Update::Updater(
-                                                            UpdateStatus::Idle,
-                                                        ));
-                                                        return;
-                                                    }
-                                                };
-                                                match crate::updater::fetch_releases(
-                                                    &client,
-                                                    crate::updater::DEFAULT_REPO_OWNER,
-                                                    crate::updater::DEFAULT_REPO_NAME,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(releases) => {
-                                                        match crate::updater::find_latest_update(
-                                                            &releases,
-                                                            &current_ver,
-                                                            install_kind,
-                                                        ) {
-                                                            Ok(Some(candidate)) => {
-                                                                let body = format!(
-                                                                    "새 버전 v{} ({:?})을 사용할 수 있습니다. 트레이 메뉴에서 다운로드하세요.",
-                                                                    candidate.version_str, candidate.install_kind
-                                                                );
-                                                                let _ = tx.try_send(Update::Notice(
-                                                                    NotificationKind::AutoUpdater,
-                                                                    "업데이트 가능".into(),
-                                                                    body,
-                                                                ));
-                                                                let _ = tx.try_send(Update::Updater(
-                                                                    UpdateStatus::Available(
-                                                                        candidate,
-                                                                    ),
-                                                                ));
-                                                            }
-                                                            Ok(None) => {
-                                                                let body = format!(
-                                                                    "현재 최신 버전(v{})을 사용하고 있습니다",
-                                                                    current_ver_str
-                                                                );
-                                                                let _ = tx.try_send(Update::Notice(
-                                                                    NotificationKind::AutoUpdater,
-                                                                    "최신 버전".into(),
-                                                                    body,
-                                                                ));
-                                                                let _ = tx.try_send(Update::Updater(
-                                                                    UpdateStatus::Idle,
-                                                                ));
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = tx.try_send(Update::Notice(
-                                                                    NotificationKind::AutoUpdater,
-                                                                    "업데이트 확인 실패".into(),
-                                                                    e.to_string(),
-                                                                ));
-                                                                let _ = tx.try_send(Update::Updater(
-                                                                    UpdateStatus::Idle,
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx.try_send(Update::Notice(
-                                                            NotificationKind::AutoUpdater,
-                                                            "업데이트 확인 실패".into(),
-                                                            e.to_string(),
-                                                        ));
-                                                        let _ = tx.try_send(Update::Updater(
-                                                            UpdateStatus::Idle,
-                                                        ));
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
+                            match (choice, shared.update_status()) {
+                                (1, _) => open_gui(),
+                                (2, _) => stop.notify_one(),
+                                (3, _) => lock.notify_one(),
+                                (10, UpdateStatus::Idle | UpdateStatus::Failed) => {
+                                    start_update_check(&shared, &rt, &tx_self, Duration::ZERO)
                                 }
-                                11 => {
-                                    if let UpdateStatus::Available(candidate) = &update_status {
-                                        let candidate = candidate.clone();
-                                        update_status = UpdateStatus::Downloading;
-                                        balloon(
-                                            &gate,
-                                            NotificationKind::AutoUpdater,
-                                            &mut icon,
-                                            "다운로드 시작",
-                                            &format!(
-                                                "ExpanDrv v{} 설치 패키지를 다운로드하고 있습니다...",
-                                                candidate.version_str
-                                            ),
-                                        );
-                                        let tx = tx_self.clone();
-                                        rt.spawn(async move {
-                                            let client = match crate::updater::build_http_client() {
-                                                Ok(c) => c,
-                                                Err(e) => {
-                                                    let _ = tx.try_send(Update::Notice(
-                                                        NotificationKind::AutoUpdater,
-                                                        "다운로드 오류".into(),
-                                                        e.to_string(),
-                                                    ));
-                                                    let _ = tx.try_send(Update::Updater(
-                                                        UpdateStatus::Idle,
-                                                    ));
-                                                    return;
-                                                }
-                                            };
-                                            let manifest = match crate::updater::fetch_manifest(
-                                                &client,
-                                                &candidate.manifest_asset.url,
-                                            )
-                                            .await
-                                            {
-                                                Ok(m) => m,
-                                                Err(e) => {
-                                                    let _ = tx.try_send(Update::Notice(
-                                                        NotificationKind::AutoUpdater,
-                                                        "매니페스트 확인 실패".into(),
-                                                        e.to_string(),
-                                                    ));
-                                                    let _ = tx.try_send(Update::Updater(
-                                                        UpdateStatus::Idle,
-                                                    ));
-                                                    return;
-                                                }
-                                            };
-                                            let artifact = match crate::updater::verify_manifest(
-                                                &manifest,
-                                                &candidate,
-                                            ) {
-                                                Ok(a) => a.clone(),
-                                                Err(e) => {
-                                                    let _ = tx.try_send(Update::Notice(
-                                                        NotificationKind::AutoUpdater,
-                                                        "매니페스트 검증 실패".into(),
-                                                        e.to_string(),
-                                                    ));
-                                                    let _ = tx.try_send(Update::Updater(
-                                                        UpdateStatus::Idle,
-                                                    ));
-                                                    return;
-                                                }
-                                            };
-                                            match crate::updater::download_and_verify_setup(
-                                                &client,
-                                                &candidate,
-                                                &artifact,
-                                            )
-                                            .await
-                                            {
-                                                Ok(path) => {
-                                                    let body = format!(
-                                                        "v{} 설치 패키지가 준비되었습니다. 메뉴에서 설치를 진행하세요.",
-                                                        candidate.version_str
-                                                    );
-                                                    let _ = tx.try_send(Update::Notice(
-                                                        NotificationKind::AutoUpdater,
-                                                        "다운로드 완료".into(),
-                                                        body,
-                                                    ));
-                                                    let _ = tx.try_send(Update::Updater(
-                                                        UpdateStatus::ReadyToInstall {
-                                                            installer_path: path,
-                                                            version: candidate.version_str,
-                                                            install_kind: candidate.install_kind,
-                                                        },
-                                                    ));
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx.try_send(Update::Notice(
-                                                        NotificationKind::AutoUpdater,
-                                                        "다운로드 검증 실패".into(),
-                                                        e.to_string(),
-                                                    ));
-                                                    let _ = tx.try_send(Update::Updater(
-                                                        UpdateStatus::Idle,
-                                                    ));
-                                                }
-                                            }
-                                        });
-                                    }
+                                (11, UpdateStatus::Available(candidate)) => {
+                                    balloon(
+                                        &gate,
+                                        NotificationKind::AutoUpdater,
+                                        &mut icon,
+                                        "업데이트 다운로드",
+                                        &format!(
+                                            "ExpanDrv v{} 설치 패키지를 받은 뒤 바로 설치합니다.",
+                                            candidate.version_str
+                                        ),
+                                    );
+                                    start_download(&shared, &rt, &tx_self, candidate);
                                 }
-                                12 => {
-                                    if let UpdateStatus::ReadyToInstall {
-                                        installer_path,
-                                        version,
-                                        install_kind,
-                                    } = &update_status
-                                    {
-                                        let mut title_buf = [0u16; 64];
-                                        wide(&mut title_buf, "ExpanDrv 업데이트");
-                                        let prompt = format!(
-                                            "ExpanDrv v{} 업데이트 설치 프로그램을 시작합니다.\n인스톨러가 시작되면 기존 에이전트와 미완료 업로드를 정상 정리한 뒤 설치를 진행합니다.\n계속하시겠습니까?",
-                                            version
-                                        );
-                                        let mut prompt_buf = [0u16; 256];
-                                        wide(&mut prompt_buf, &prompt);
-                                        let ret = MessageBoxW(
-                                            Some(hwnd),
-                                            windows::core::PCWSTR(prompt_buf.as_ptr()),
-                                            windows::core::PCWSTR(title_buf.as_ptr()),
-                                            MB_YESNO | MB_ICONINFORMATION,
-                                        );
-                                        if ret == IDYES {
-                                            let installer_path_clone = installer_path.clone();
-                                            let version_clone = version.clone();
-                                            let install_kind_val = *install_kind;
-
-                                            // 1. 중복 실행 차단을 위해 즉시 Installing 상태로 전이합니다.
-                                            update_status = UpdateStatus::Installing {
-                                                version: version_clone.clone(),
-                                            };
-
-                                            // 2. 인스톨러 프로세스를 시작합니다.
-                                            // 인스톨러의 사전 실행 훅이 스스로 `expandrv.exe stop`을 호출하여
-                                            // 미완료 업로드 대기와 드라이브 해제 결과를 검증하도록 보존하며,
-                                            // 에이전트가 사전에 프로세스를 닫아버려 경합하거나 관측을 방해하지 않습니다.
-                                            match crate::updater::launch_installer(
-                                                &installer_path_clone,
-                                                install_kind_val,
-                                            ) {
-                                                Ok(safe_handle) => {
-                                                    balloon(
-                                                        &gate,
-                                                        NotificationKind::AutoUpdater,
-                                                        &mut icon,
-                                                        "설치 시작",
-                                                        &format!(
-                                                            "v{} 설치 프로그램을 시작했습니다.",
-                                                            version_clone
-                                                        ),
-                                                    );
-                                                    // 3. 인스톨러 프로세스 종료를 비동기 감시하여, 사용자가 마법사에서 취소하거나
-                                                    // 설치가 중단되어 에이전트가 살아있는 경우 ReadyToInstall 상태로 복구합니다.
-                                                    // Tokio 런타임 종료를 블로킹하지 않도록 독립 감시 스레드에서 유한 대기(200ms) 루프로 감시하며,
-                                                    // 에이전트 종료 시(shutdown_flag) 루프를 즉시 탈출합니다.
-                                                    // 소유 핸들은 정상 종료/취소/오류 등 어떤 경로에서도 스레드 종료 시 Drop되어 안전하게 닫힙니다.
-                                                    let tx = tx_self.clone();
-                                                    let shutdown_flag = shutdown_requested.clone();
-                                                    let _ = std::thread::Builder::new()
-                                                        .name("installer-monitor".into())
-                                                        .spawn(move || {
-                                                            loop {
-                                                                if shutdown_flag.load(Ordering::Relaxed) {
-                                                                    break;
-                                                                }
-                                                                match safe_handle.wait_timeout(200) {
-                                                                    Ok(crate::updater::ProcessWaitResult::Exited(exit_code)) => {
-                                                                        if exit_code != 0 {
-                                                                            let _ = tx.try_send(Update::Notice(
-                                                                                NotificationKind::AutoUpdater,
-                                                                                "설치 중단".into(),
-                                                                                "설치 프로그램이 취소되었거나 정상 완료되지 않았습니다.".into(),
-                                                                            ));
-                                                                        }
-                                                                        let _ = tx.try_send(Update::Updater(
-                                                                            UpdateStatus::ReadyToInstall {
-                                                                                installer_path: installer_path_clone,
-                                                                                version: version_clone,
-                                                                                install_kind: install_kind_val,
-                                                                            },
-                                                                        ));
-                                                                        break;
-                                                                    }
-                                                                    Ok(crate::updater::ProcessWaitResult::Timeout) => {}
-                                                                    Err(e) => {
-                                                                        tracing::warn!(error = %e, "설치 프로그램 대기 중 오류 발생");
-                                                                        let _ = tx.try_send(Update::Notice(
-                                                                            NotificationKind::AutoUpdater,
-                                                                            "설치 오류".into(),
-                                                                            format!("설치 프로그램 감시 실패: {e}"),
-                                                                        ));
-                                                                        let _ = tx.try_send(Update::Updater(
-                                                                            UpdateStatus::ReadyToInstall {
-                                                                                installer_path: installer_path_clone,
-                                                                                version: version_clone,
-                                                                                install_kind: install_kind_val,
-                                                                            },
-                                                                        ));
-                                                                        break;
-                                                                    }
-                                                                }
-                                                            }
-                                                        });
-                                                }
-                                                Err(e) => {
-                                                    balloon(
-                                                        &gate,
-                                                        NotificationKind::AutoUpdater,
-                                                        &mut icon,
-                                                        "설치 실행 실패",
-                                                        &e.to_string(),
-                                                    );
-                                                    update_status = UpdateStatus::ReadyToInstall {
-                                                        installer_path: installer_path_clone,
-                                                        version: version_clone,
-                                                        install_kind: install_kind_val,
-                                                    };
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                (12, ready @ UpdateStatus::ReadyToInstall { .. }) => start_install(
+                                    &shared,
+                                    &tx_self,
+                                    &shutdown_requested,
+                                    &gate,
+                                    &mut icon,
+                                    ready,
+                                ),
                                 _ => {}
                             }
                         }
@@ -736,8 +751,18 @@ unsafe fn run(
                 }
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Update::Updater(st)) => {
-                    update_status = st;
+                Ok(Update::Install(ready)) => {
+                    // 다운로드를 마친 뒤 그 사이 다른 설치가 시작되지 않았을 때만 실행합니다.
+                    if shared.update_status() == ready {
+                        start_install(
+                            &shared,
+                            &tx_self,
+                            &shutdown_requested,
+                            &gate,
+                            &mut icon,
+                            ready,
+                        );
+                    }
                 }
                 Ok(Update::Status(status)) => {
                     wide(&mut icon.szTip, &tooltip(&status));
@@ -775,11 +800,7 @@ unsafe fn run(
                     );
                 }
                 Ok(Update::Shutdown(done)) => {
-                    shutdown_requested.store(true, Ordering::SeqCst);
-                    let _ = Shell_NotifyIconW(NIM_DELETE, &icon);
-                    let _ = DestroyIcon(app_icon);
-                    drop(session_events);
-                    let _ = DestroyWindow(hwnd);
+                    cleanup(&icon, session_events);
                     drop(rx);
                     let _ = done.send(());
                     return Ok(());
@@ -788,11 +809,7 @@ unsafe fn run(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        shutdown_requested.store(true, Ordering::SeqCst);
-        let _ = Shell_NotifyIconW(NIM_DELETE, &icon);
-        let _ = DestroyIcon(app_icon);
-        drop(session_events);
-        let _ = DestroyWindow(hwnd);
+        cleanup(&icon, session_events);
         Ok(())
     }
 }
@@ -907,85 +924,81 @@ mod tests {
             },
         };
 
-        // 1. Idle 상태
-        let idle = UpdateStatus::Idle;
-        let (label, enabled, id) = menu_item_for_update_status(&idle);
-        assert_eq!(label, "업데이트 확인");
+        let cur = env!("CARGO_PKG_VERSION");
+        let cases = [
+            (UpdateStatus::Idle, "업데이트 확인".to_owned(), true, 10),
+            (
+                UpdateStatus::Checking,
+                "업데이트 확인 중...".to_owned(),
+                false,
+                10,
+            ),
+            (
+                UpdateStatus::UpToDate,
+                format!("최신 버전 (v{cur})"),
+                false,
+                10,
+            ),
+            (
+                UpdateStatus::Unsupported,
+                format!("업데이트 미지원 (v{cur})"),
+                false,
+                10,
+            ),
+            (
+                UpdateStatus::Failed,
+                format!("업데이트 확인 실패 (v{cur})"),
+                true,
+                10,
+            ),
+            (
+                UpdateStatus::Available(candidate.clone()),
+                "업데이트 하기 (v0.1.1)".to_owned(),
+                true,
+                11,
+            ),
+            (
+                UpdateStatus::Downloading {
+                    version: "0.1.1".into(),
+                },
+                "업데이트 다운로드 중 (v0.1.1)".to_owned(),
+                false,
+                11,
+            ),
+            (
+                UpdateStatus::ReadyToInstall {
+                    installer_path: std::path::PathBuf::from(r"C:\temp\setup.exe"),
+                    version: "0.1.1".into(),
+                    install_kind: crate::updater::InstallKind::Nsis,
+                },
+                "업데이트 하기 (v0.1.1)".to_owned(),
+                true,
+                12,
+            ),
+            (
+                UpdateStatus::Installing {
+                    version: "0.1.1".into(),
+                },
+                "업데이트 설치 중 (v0.1.1)".to_owned(),
+                false,
+                12,
+            ),
+        ];
+        for (status, label, enabled, id) in cases {
+            assert_eq!(
+                menu_item_for_update_status(&status),
+                (label, enabled, id),
+                "{status:?}"
+            );
+        }
+        // 다운로드부터 설치까지는 확인 결과로 덮지 않습니다.
+        assert!(!UpdateStatus::Available(candidate).in_progress());
         assert!(
-            enabled,
-            "Idle 상태에서는 업데이트 확인 메뉴가 활성화되어야 합니다"
-        );
-        assert_eq!(id, 10);
-
-        // 2. Checking 상태 (중복 실행 방지: 메뉴 비활성화)
-        let checking = UpdateStatus::Checking;
-        let (label, enabled, id) = menu_item_for_update_status(&checking);
-        assert_eq!(label, "업데이트 확인 중...");
-        assert!(
-            !enabled,
-            "Checking 상태에서는 중복 실행 방지를 위해 비활성화되어야 합니다"
-        );
-        assert_eq!(id, 10);
-
-        // 3. Available 상태
-        let available = UpdateStatus::Available(candidate.clone());
-        let (label, enabled, id) = menu_item_for_update_status(&available);
-        assert_eq!(label, "v0.1.1 다운로드 및 설치");
-        assert!(
-            enabled,
-            "Available 상태에서는 다운로드 메뉴가 활성화되어야 합니다"
-        );
-        assert_eq!(id, 11);
-
-        // 4. Downloading 상태 (중복 다운로드 방지: 메뉴 비활성화)
-        let downloading = UpdateStatus::Downloading;
-        let (label, enabled, id) = menu_item_for_update_status(&downloading);
-        assert_eq!(label, "업데이트 다운로드 중...");
-        assert!(
-            !enabled,
-            "Downloading 상태에서는 중복 실행 방지를 위해 비활성화되어야 합니다"
-        );
-        assert_eq!(id, 10);
-
-        // 5. ReadyToInstall 상태
-        let ready = UpdateStatus::ReadyToInstall {
-            installer_path: std::path::PathBuf::from(r"C:\temp\setup.exe"),
-            version: "0.1.1".into(),
-            install_kind: crate::updater::InstallKind::Nsis,
-        };
-        let (label, enabled, id) = menu_item_for_update_status(&ready);
-        assert_eq!(label, "v0.1.1 지금 설치");
-        assert!(
-            enabled,
-            "ReadyToInstall 상태에서는 설치 실행 메뉴가 활성화되어야 합니다"
-        );
-        assert_eq!(id, 12);
-
-        // 6. Installing 상태 (단일 실행 보장: 실행 중 중복 클릭 차단)
-        let installing = UpdateStatus::Installing {
-            version: "0.1.1".into(),
-        };
-        let (label, enabled, id) = menu_item_for_update_status(&installing);
-        assert_eq!(label, "v0.1.1 설치 진행 중...");
-        assert!(
-            !enabled,
-            "Installing 상태에서는 중복 실행 방지를 위해 비활성화되어야 합니다"
-        );
-        assert_eq!(id, 10);
-
-        // 7. 설치 취소/실패 복구: Installing에서 다시 ReadyToInstall로 복귀 가능 검증
-        let mut current_state = installing;
-        assert_eq!(
-            current_state,
-            UpdateStatus::Installing {
+            UpdateStatus::Downloading {
                 version: "0.1.1".into()
             }
+            .in_progress()
         );
-        current_state = ready;
-        let (label, enabled, id) = menu_item_for_update_status(&current_state);
-        assert_eq!(label, "v0.1.1 지금 설치");
-        assert!(enabled);
-        assert_eq!(id, 12);
     }
 
     #[test]
@@ -1040,6 +1053,33 @@ mod tests {
         assert!(rx.try_recv().is_err());
         tray.notice(NotificationKind::LockRecovery, "자동 잠금", "보여야 합니다");
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn update_item_is_first_and_replaced_in_place() {
+        let label = |menu: HMENU, pos: u32| unsafe {
+            let mut buf = [0u16; 64];
+            let n = GetMenuStringW(menu, pos, Some(&mut buf), MF_BYPOSITION);
+            String::from_utf16_lossy(&buf[..n as usize])
+        };
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+            put_update_item(menu, &UpdateStatus::Checking, true);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, 1, w!("열기"));
+            put_update_item(
+                menu,
+                &UpdateStatus::Downloading {
+                    version: "9.9.9".into(),
+                },
+                false,
+            );
+            assert_eq!(GetMenuItemCount(Some(menu)), 3);
+            assert_eq!(label(menu, 0), "업데이트 다운로드 중 (v9.9.9)");
+            assert_eq!(GetMenuItemID(menu, 0), 11);
+            assert_eq!(label(menu, 2), "열기");
+            let _ = DestroyMenu(menu);
+        }
     }
 
     #[test]
