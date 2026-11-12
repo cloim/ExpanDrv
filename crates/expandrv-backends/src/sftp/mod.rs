@@ -849,13 +849,50 @@ async fn read_exact_or_eof(
     Ok(buf)
 }
 
-async fn write_file(c: &Conn, target: &str, name: &str, source: &WriteSource) -> Result<Entry> {
+/// 업로드가 취소되어 퓨처가 중간에 버려지면 남은 임시 파일을 백그라운드에서 지웁니다.
+struct TempCleanup {
+    conn: Option<Arc<Conn>>,
+    path: String,
+}
+
+impl TempCleanup {
+    fn disarm(&mut self) {
+        self.conn = None;
+    }
+}
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        let path = std::mem::take(&mut self.path);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = conn.pick().remove(path.as_str()).await {
+                    tracing::debug!(%path, error = %e, "취소된 업로드 임시 파일 정리 실패");
+                }
+            });
+        }
+    }
+}
+
+async fn write_file(
+    c: &Arc<Conn>,
+    target: &str,
+    name: &str,
+    source: &WriteSource,
+) -> Result<Entry> {
     let s = c.pick();
     let existing = stat_opt(s, target).await?;
     if existing.as_ref().is_some_and(|a| a.is_dir()) {
         return Err(Error::IsADirectory);
     }
     let tmp = sibling(target, &temp_name());
+    let mut cleanup = TempCleanup {
+        conn: Some(c.clone()),
+        path: tmp.clone(),
+    };
     let res = async {
         // 기존 파일의 권한을 이어받습니다.
         let attrs = FileAttributes {
@@ -886,8 +923,10 @@ async fn write_file(c: &Conn, target: &str, name: &str, source: &WriteSource) ->
     .await;
     if let Err(e) = res {
         let _ = s.remove(tmp.as_str()).await;
+        cleanup.disarm();
         return Err(e);
     }
+    cleanup.disarm();
     stat_entry(s, target, name).await
 }
 

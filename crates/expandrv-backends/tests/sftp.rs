@@ -360,6 +360,58 @@ async fn sftp_key_login() {
     be.delete(&f, EntryKind::File).await.unwrap();
 }
 
+/// 업로드가 중간에 취소되어도 임시 파일이 남지 않아야 합니다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_cancelled_upload_removes_temp_file() {
+    let Some(mut cfg) = base_config() else {
+        return;
+    };
+    if let (Some(user), Some(key)) = (env("KEY_USER"), env("KEY")) {
+        cfg.username = user;
+        cfg.password = None;
+        cfg.private_key = Some(PathBuf::from(key));
+    }
+    let be = Arc::new(SftpBackend::connect(&cfg, &EnvSecrets).await.unwrap());
+    let dir = p(&format!("/{}", unique("cancel")));
+    be.mkdir(&dir).await.unwrap();
+    let temps = |be: Arc<SftpBackend>, dir: RemotePath| async move {
+        be.list(&dir)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.name.starts_with(".~expandrv-"))
+            .count()
+    };
+
+    let target = dir.join("big.bin").unwrap();
+    let data = Bytes::from(pattern(64 << 20));
+    let task = tokio::spawn({
+        let be = be.clone();
+        async move { be.write(&target, WriteSource::Bytes(data)).await }
+    });
+    // 임시 파일이 생길 때까지 기다린 뒤 업로드를 취소합니다.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while temps(be.clone(), dir.clone()).await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "임시 파일이 생기지 않았습니다"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    task.abort();
+    let _ = task.await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while temps(be.clone(), dir.clone()).await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "취소된 업로드의 임시 파일이 남았습니다"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    be.delete(&dir, EntryKind::Dir).await.unwrap();
+}
+
 #[tokio::test]
 async fn sftp_reconnects_after_server_restart() {
     let (Some(cfg), Some(container)) = (base_config(), env("CONTAINER")) else {
