@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-agent"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "clap",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-autostart"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "expandrv-core",
  "windows 0.62.2",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-backends"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-gui"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "expandrv-autostart",
  "expandrv-backends",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-ipc"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "rmp-serde",
@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-log"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "regex",
  "tracing",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-secrets"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "expandrv-core",
  "ring",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-shell"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "expandrv-core",
  "tempfile",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-vfs"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "expandrv-winfsp"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "expandrv-backends",
  "expandrv-core",
