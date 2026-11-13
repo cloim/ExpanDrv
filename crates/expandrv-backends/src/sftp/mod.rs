@@ -210,6 +210,9 @@ macro_rules! with_conn {
 
 #[async_trait]
 impl Backend for SftpBackend {
+    fn normalize_mtime(&self, mtime: SystemTime) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(u64::from(unix_secs(mtime)))
+    }
     fn kind(&self) -> &'static str {
         "sftp"
     }

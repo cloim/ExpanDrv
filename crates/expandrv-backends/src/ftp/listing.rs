@@ -2,7 +2,66 @@
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use expandrv_core::{Entry, EntryKind};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// 현지 시각을 UTC로 보고하는 서버의 보정값. 백엔드의 모든 연결과 세션이 공유합니다.
+#[derive(Default)]
+pub(super) struct ServerClock {
+    seconds: AtomicI64,
+}
+
+impl ServerClock {
+    pub fn offset(&self) -> i64 {
+        self.seconds.load(Ordering::SeqCst)
+    }
+
+    /// 방금 업로드한 파일의 원시 MLST 시각으로만 보정값을 한 번 확정합니다.
+    pub fn observe_upload(&self, entry: &Entry, now: SystemTime) {
+        if self.offset() != 0 {
+            return;
+        }
+        let Some(reported) = entry.modified else {
+            return;
+        };
+        let delta = match reported.duration_since(now) {
+            Ok(d) => d.as_secs_f64(),
+            Err(e) => -e.duration().as_secs_f64(),
+        };
+        if !(900.0..=50_400.0).contains(&delta.abs()) {
+            return;
+        }
+        let offset = (delta / 900.0).round() as i64 * 900;
+        if self
+            .seconds
+            .compare_exchange(0, offset, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            tracing::info!(offset_seconds = offset, "FTP 서버 시각 오프셋 확정 및 적용");
+        }
+    }
+
+    pub fn apply(&self, entry: &mut Entry) {
+        let offset = self.offset();
+        if offset == 0 {
+            return;
+        }
+        let duration = Duration::from_secs(offset.unsigned_abs());
+        let correct = |t: SystemTime| {
+            if offset > 0 {
+                t.checked_sub(duration)
+            } else {
+                t.checked_add(duration)
+            }
+        };
+        entry.modified = entry.modified.and_then(correct);
+        entry.created = entry.created.and_then(correct);
+        entry.etag = entry
+            .modified
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| format!("{:x}-{:x}", d.as_secs(), entry.size));
+    }
+}
 
 /// MLSD 한 줄(`fact=값;...; 이름`)을 해석합니다. `cdir`, `pdir`와 형식이 깨진 줄은 `None`입니다.
 pub(super) fn parse_mlsd_line(line: &str) -> Option<Entry> {
@@ -253,6 +312,71 @@ fn parse_dos(line: &str) -> Option<Entry> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn server_clock_limits_and_quarter_hour_rounding() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        for delta in [0, 14 * 60, -14 * 60, 14 * 3600 + 1, -14 * 3600 - 1] {
+            let clock = ServerClock::default();
+            let mut entry = Entry::file("f", 1);
+            entry.modified = Some(if delta >= 0 {
+                now + Duration::from_secs(delta as u64)
+            } else {
+                now - Duration::from_secs((-delta) as u64)
+            });
+            clock.observe_upload(&entry, now);
+            assert_eq!(clock.offset(), 0, "{delta}");
+        }
+        for (delta, expected) in [
+            (900, 900),
+            (-900, -900),
+            (32_400, 32_400),
+            (32_849, 32_400),
+            (32_850, 33_300),
+            (-32_850, -33_300),
+            (50_400, 50_400),
+            (-50_400, -50_400),
+        ] {
+            let clock = ServerClock::default();
+            let mut entry = Entry::file("f", 1);
+            entry.modified = Some(if delta >= 0 {
+                now + Duration::from_secs(delta as u64)
+            } else {
+                now - Duration::from_secs((-delta) as u64)
+            });
+            clock.observe_upload(&entry, now);
+            assert_eq!(clock.offset(), expected, "{delta}");
+        }
+    }
+
+    #[test]
+    fn server_clock_corrects_mlst_and_mlsd_without_changing_mfmt() {
+        let clock = std::sync::Arc::new(ServerClock::default());
+        let now = ts(2026, 11, 13, 3, 0, 0);
+        let line = "type=file;size=3;modify=20261113120000;create=20261113110000;perm=rw; f";
+        let mut stat = parse_mlst_line(line, "f").unwrap();
+        let raw = stat.clone();
+        clock.apply(&mut stat);
+        assert_eq!(stat, raw);
+        clock.observe_upload(&stat, now);
+        assert_eq!(clock.offset(), 9 * 3600);
+        clock.apply(&mut stat);
+        let mut list = parse_mlsd_line(line).unwrap();
+        clock.clone().apply(&mut list);
+        assert_eq!(stat, list);
+        assert_eq!(stat.modified, Some(now));
+        assert_eq!(stat.created, Some(now - Duration::from_secs(3600)));
+        assert_eq!(
+            stat.etag,
+            make_entry("f", EntryKind::File, 3, Some(now)).etag
+        );
+        assert_eq!(format_mfmt_time(now), "20261113030000");
+        // 연결이 달라지거나 다음 표본이 달라도 백엔드의 확정값은 유지합니다.
+        let mut next = Entry::file("g", 2);
+        next.modified = Some(now + Duration::from_secs(3600));
+        clock.clone().observe_upload(&next, now);
+        assert_eq!(clock.offset(), 9 * 3600);
+    }
 
     fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> SystemTime {
         to_system_time(

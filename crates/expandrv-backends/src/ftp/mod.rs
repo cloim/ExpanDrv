@@ -152,6 +152,7 @@ pub struct FtpBackend {
     state: Arc<PoolState>,
     parked: Arc<Mutex<Vec<Parked>>>,
     park_seq: AtomicU64,
+    clock: Arc<listing::ServerClock>,
 }
 
 impl FtpBackend {
@@ -233,6 +234,7 @@ impl FtpBackend {
             state,
             parked: Arc::new(Mutex::new(Vec::new())),
             park_seq: AtomicU64::new(0),
+            clock: Arc::new(listing::ServerClock::default()),
         })
     }
 
@@ -533,6 +535,7 @@ struct FtpUpload {
     remote: String,
     name: String,
     feats: Feats,
+    clock: Arc<listing::ServerClock>,
     sent: u64,
     idle: Arc<Mutex<Vec<Conn>>>,
     state: Arc<PoolState>,
@@ -608,7 +611,12 @@ impl UploadSession for FtpUpload {
         if !c.poisoned {
             return_idle(&self.idle, &self.state, c);
         }
-        entry
+        let mut entry = entry?;
+        if self.feats.mlst {
+            self.clock.observe_upload(&entry, SystemTime::now());
+            self.clock.apply(&mut entry);
+        }
+        Ok(entry)
     }
 
     async fn abort(mut self: Box<Self>) {
@@ -1130,6 +1138,12 @@ async fn rename_on(
 
 #[async_trait]
 impl Backend for FtpBackend {
+    fn metadata_epoch(&self) -> u64 {
+        u64::from(self.clock.offset() != 0)
+    }
+    fn normalize_mtime(&self, mtime: SystemTime) -> SystemTime {
+        listing::parse_mlsd_time(&listing::format_mfmt_time(mtime)).unwrap_or(mtime)
+    }
     fn kind(&self) -> &'static str {
         "ftp"
     }
@@ -1151,20 +1165,32 @@ impl Backend for FtpBackend {
             return Ok(Entry::dir(""));
         }
         let (feats, remote) = (self.feats, self.remote(path));
-        self.run(OP_TIMEOUT, move |c| {
-            let remote = remote.clone();
-            Box::pin(async move { stat_on(c, feats, &remote).await })
-        })
-        .await
+        let mut entry = self
+            .run(OP_TIMEOUT, move |c| {
+                let remote = remote.clone();
+                Box::pin(async move { stat_on(c, feats, &remote).await })
+            })
+            .await?;
+        if feats.mlst {
+            self.clock.apply(&mut entry);
+        }
+        Ok(entry)
     }
 
     async fn list(&self, path: &RemotePath) -> Result<Vec<Entry>> {
         let (feats, remote) = (self.feats, self.remote(path));
-        self.run(OP_TIMEOUT, move |c| {
-            let remote = remote.clone();
-            Box::pin(async move { list_on(c, feats, &remote).await })
-        })
-        .await
+        let mut entries = self
+            .run(OP_TIMEOUT, move |c| {
+                let remote = remote.clone();
+                Box::pin(async move { list_on(c, feats, &remote).await })
+            })
+            .await?;
+        if feats.mlst {
+            for entry in &mut entries {
+                self.clock.apply(entry);
+            }
+        }
+        Ok(entries)
     }
 
     async fn read_range(&self, path: &RemotePath, offset: u64, len: u64) -> Result<Bytes> {
@@ -1192,18 +1218,24 @@ impl Backend for FtpBackend {
         let name = path.name().unwrap_or("").to_owned();
         let size = source.len();
         let source = Arc::new(source);
-        self.run(transfer_budget(size), move |c| {
-            let (remote, source, name) = (remote.clone(), Arc::clone(&source), name.clone());
-            Box::pin(async move {
-                write_on(c, &remote, &source).await?;
-                match stat_on(c, feats, &remote).await {
-                    Ok(e) => Ok(e),
-                    Err(f) if f.is_broken() => Err(f),
-                    Err(_) => Ok(Entry::file(name, size)),
-                }
+        let mut entry = self
+            .run(transfer_budget(size), move |c| {
+                let (remote, source, name) = (remote.clone(), Arc::clone(&source), name.clone());
+                Box::pin(async move {
+                    write_on(c, &remote, &source).await?;
+                    match stat_on(c, feats, &remote).await {
+                        Ok(e) => Ok(e),
+                        Err(f) if f.is_broken() => Err(f),
+                        Err(_) => Ok(Entry::file(name, size)),
+                    }
+                })
             })
-        })
-        .await
+            .await?;
+        if feats.mlst {
+            self.clock.observe_upload(&entry, SystemTime::now());
+            self.clock.apply(&mut entry);
+        }
+        Ok(entry)
     }
 
     async fn begin_upload(
@@ -1231,6 +1263,7 @@ impl Backend for FtpBackend {
                         remote,
                         name,
                         feats: self.feats,
+                        clock: self.clock.clone(),
                         sent: 0,
                         idle: self.idle.clone(),
                         state: self.state.clone(),
@@ -1258,28 +1291,33 @@ impl Backend for FtpBackend {
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
         let (feats, remote) = (self.feats, self.remote(path));
         let name = path.name().unwrap_or("").to_owned();
-        self.run(OP_TIMEOUT, move |c| {
-            let (remote, name) = (remote.clone(), name.clone());
-            Box::pin(async move {
-                if let Err(e) = c.s.mkdir(&remote).await {
-                    let orig = Fail::from(e);
-                    if orig.code().is_none() {
-                        return Err(orig);
+        let mut entry = self
+            .run(OP_TIMEOUT, move |c| {
+                let (remote, name) = (remote.clone(), name.clone());
+                Box::pin(async move {
+                    if let Err(e) = c.s.mkdir(&remote).await {
+                        let orig = Fail::from(e);
+                        if orig.code().is_none() {
+                            return Err(orig);
+                        }
+                        return match stat_on(c, feats, &remote).await {
+                            Ok(_) => Err(Fail::Fs(Error::AlreadyExists)),
+                            Err(f) if f.is_broken() => Err(f),
+                            Err(_) => Err(orig),
+                        };
                     }
-                    return match stat_on(c, feats, &remote).await {
-                        Ok(_) => Err(Fail::Fs(Error::AlreadyExists)),
+                    match stat_on(c, feats, &remote).await {
+                        Ok(e) => Ok(e),
                         Err(f) if f.is_broken() => Err(f),
-                        Err(_) => Err(orig),
-                    };
-                }
-                match stat_on(c, feats, &remote).await {
-                    Ok(e) => Ok(e),
-                    Err(f) if f.is_broken() => Err(f),
-                    Err(_) => Ok(Entry::dir(name)),
-                }
+                        Err(_) => Ok(Entry::dir(name)),
+                    }
+                })
             })
-        })
-        .await
+            .await?;
+        if feats.mlst {
+            self.clock.apply(&mut entry);
+        }
+        Ok(entry)
     }
 
     async fn rename(&self, from: &RemotePath, to: &RemotePath, replace: bool) -> Result<()> {
