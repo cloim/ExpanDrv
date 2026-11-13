@@ -153,6 +153,16 @@ pub trait Backend: Send + Sync + 'static {
         Capabilities::default()
     }
 
+    /// 메타데이터 해석 기준이 바뀔 때 증가합니다. 이전 기준의 캐시는 다시 받아야 합니다.
+    fn metadata_epoch(&self) -> u64 {
+        0
+    }
+
+    /// 수정 시각을 서버에 전송할 수 있는 정밀도와 범위에 맞춥니다.
+    fn normalize_mtime(&self, mtime: SystemTime) -> SystemTime {
+        mtime
+    }
+
     async fn stat(&self, path: &RemotePath) -> Result<Entry>;
 
     async fn list(&self, path: &RemotePath) -> Result<Vec<Entry>>;
