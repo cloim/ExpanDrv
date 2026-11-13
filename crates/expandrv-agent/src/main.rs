@@ -470,6 +470,7 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
         auto_mount: a.auto_mount,
         network_drive: true,
         proxy,
+        write_mode: Default::default(),
         backend,
     });
     cfg.validate()?;
@@ -502,12 +503,16 @@ fn list(cfg: &Config, pipe: &str) -> Result<()> {
         println!("설정된 드라이브가 없습니다.");
         return Ok(());
     }
+    let mut busy_uploads: HashMap<String, (u64, u64)> = HashMap::new();
     let states: HashMap<String, (DriveState, u64, u64)> = match AgentLink::connect(pipe)? {
         Some(mut link) => link
             .status()?
             .drives
             .into_iter()
-            .map(|d| (d.id, (d.state, d.pending_uploads, d.active_downloads)))
+            .map(|d| {
+                busy_uploads.insert(d.id.clone(), (d.uploading, d.failed_uploads));
+                (d.id, (d.state, d.pending_uploads, d.active_downloads))
+            })
             .collect(),
         None => HashMap::new(),
     };
@@ -517,12 +522,19 @@ fn list(cfg: &Config, pipe: &str) -> Result<()> {
     );
     for d in &cfg.drives {
         let state = match states.get(&d.id) {
-            Some((DriveState::Mounted, up, down)) => {
-                let busy: Vec<String> = [(*up, "업로드"), (*down, "다운로드")]
-                    .iter()
-                    .filter(|(n, _)| *n > 0)
-                    .map(|(n, what)| format!("{what} {n}"))
-                    .collect();
+            Some((DriveState::Mounted, total, down)) => {
+                let (up, failed) = busy_uploads.get(&d.id).copied().unwrap_or_default();
+                let waiting = total.saturating_sub(up + failed);
+                let busy: Vec<String> = [
+                    (up, "업로드 중"),
+                    (waiting, "업로드 대기"),
+                    (failed, "업로드 실패"),
+                    (*down, "다운로드"),
+                ]
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{what} {n}"))
+                .collect();
                 if busy.is_empty() {
                     "마운트됨".to_owned()
                 } else {

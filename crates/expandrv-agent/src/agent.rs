@@ -11,7 +11,7 @@ use expandrv_ipc::{
 };
 use expandrv_secrets::lock::PinStore;
 use expandrv_secrets::{CredentialStore, Secrets, target_for};
-use expandrv_vfs::{DiskCacheOptions, Vfs, VfsOptions};
+use expandrv_vfs::{DiskCacheOptions, UploadCounts, Vfs, VfsOptions};
 use expandrv_winfsp::{MountOptions, MountedDrive};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -98,6 +98,7 @@ fn connect_and_mount(d: &DriveConfig, rt: &Handle) -> Result<(MountedDrive, Vfs)
             block_size: u64::from(d.cache.block_size_mib) << 20,
             memory_cache_bytes: (d.cache.memory_limit_mib as usize) << 20,
             readahead_blocks: d.cache.readahead_blocks,
+            write_mode: d.write_mode,
             meta_db: Some(dir.join("meta.db")),
             disk_cache,
             ..VfsOptions::new(dir.join("staging"))
@@ -230,20 +231,21 @@ impl Agent {
             .chain(st.mounted.values().map(|m| &m.cfg))
             .filter(|d| seen.insert(d.id.as_str()))
             .map(|d| {
-                let (d, state, pending, downloads) = if let Some(m) = st.mounted.get(&d.id) {
+                let none = UploadCounts::default();
+                let (d, state, uploads, downloads) = if let Some(m) = st.mounted.get(&d.id) {
                     let v = &m.vfs;
                     (
                         &m.cfg,
                         DriveState::Mounted,
-                        v.pending_uploads(),
+                        v.upload_counts(),
                         v.active_downloads(),
                     )
                 } else if let Some(Some(vfs)) = st.busy.get(&d.id) {
-                    (d, DriveState::Unmounted, vfs.pending_uploads(), 0)
+                    (d, DriveState::Unmounted, vfs.upload_counts(), 0)
                 } else if let Some(msg) = st.failed.get(&d.id) {
-                    (d, DriveState::Failed(msg.clone()), 0, 0)
+                    (d, DriveState::Failed(msg.clone()), none, 0)
                 } else {
-                    (d, DriveState::Unmounted, 0, 0)
+                    (d, DriveState::Unmounted, none, 0)
                 };
                 DriveStatus {
                     id: d.id.clone(),
@@ -251,8 +253,10 @@ impl Agent {
                     mount_point: d.mount_point.clone(),
                     backend: d.backend.kind().into(),
                     state,
-                    pending_uploads: pending as u64,
+                    pending_uploads: uploads.total() as u64,
                     active_downloads: downloads as u64,
+                    uploading: uploads.uploading as u64,
+                    failed_uploads: uploads.failed as u64,
                 }
             })
             .collect();

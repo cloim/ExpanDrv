@@ -241,15 +241,25 @@ impl Tray {
     /// 전송 이벤트는 알림을 꺼도 비워서 쌓이지 않게 합니다.
     pub fn transfers(&self, id: &str, vfs: &Vfs) {
         for event in vfs.take_transfer_events() {
-            let (title, path) = match event {
-                TransferEvent::Uploaded(p) => ("업로드 완료", p),
-                TransferEvent::Conflict(p) => ("충돌 사본 생성", p),
+            let (kind, title, body) = match event {
+                TransferEvent::Uploaded(p) => (
+                    NotificationKind::FileTransfers,
+                    "업로드 완료",
+                    format!("{id}: {p}"),
+                ),
+                TransferEvent::Conflict(p) => (
+                    NotificationKind::FileTransfers,
+                    "충돌 사본 생성",
+                    format!("{id}: {p}"),
+                ),
+                // 닫기 단계의 실패는 호출 프로그램에 전달되지 않으므로 바로 알립니다.
+                TransferEvent::Failed(p, error) => (
+                    NotificationKind::MountStatus,
+                    "업로드 실패",
+                    format!("{id}: {p}\n{error}\n백그라운드에서 다시 시도합니다"),
+                ),
             };
-            self.notice(
-                NotificationKind::FileTransfers,
-                title,
-                &format!("{id}: {path}"),
-            );
+            self.notice(kind, title, &body);
         }
     }
 }
@@ -279,13 +289,22 @@ fn tooltip(status: &AgentStatus) -> String {
         .iter()
         .filter(|d| matches!(d.state, DriveState::Failed(_)))
         .count();
-    let pending: u64 = status.drives.iter().map(|d| d.pending_uploads).sum();
+    let total: u64 = status.drives.iter().map(|d| d.pending_uploads).sum();
+    let uploading: u64 = status.drives.iter().map(|d| d.uploading).sum();
+    let failed_uploads: u64 = status.drives.iter().map(|d| d.failed_uploads).sum();
+    let waiting = total.saturating_sub(uploading + failed_uploads);
     if status.locking {
         "ExpanDrv | 잠그는 중".into()
     } else if status.locked {
         "ExpanDrv | 잠김".into()
     } else {
-        format!("ExpanDrv | 마운트 {mounted}개 | 업로드 대기 {pending}개 | 오류 {failed}개")
+        let mut text = format!(
+            "ExpanDrv | 마운트 {mounted}개 | 업로드 중 {uploading}개 | 대기 {waiting}개 | 오류 {failed}개"
+        );
+        if failed_uploads > 0 {
+            text.push_str(&format!(" | 업로드 실패 {failed_uploads}개"));
+        }
+        text
     }
 }
 
@@ -1086,7 +1105,25 @@ mod tests {
     fn tooltip_summarizes_state() {
         assert_eq!(
             tooltip(&AgentStatus::default()),
-            "ExpanDrv | 마운트 0개 | 업로드 대기 0개 | 오류 0개"
+            "ExpanDrv | 마운트 0개 | 업로드 중 0개 | 대기 0개 | 오류 0개"
+        );
+        let busy = AgentStatus {
+            drives: vec![expandrv_ipc::DriveStatus {
+                id: "nas".into(),
+                label: "NAS".into(),
+                mount_point: "N:".into(),
+                backend: "sftp".into(),
+                state: DriveState::Mounted,
+                pending_uploads: 6,
+                active_downloads: 0,
+                uploading: 2,
+                failed_uploads: 1,
+            }],
+            ..AgentStatus::default()
+        };
+        assert_eq!(
+            tooltip(&busy),
+            "ExpanDrv | 마운트 1개 | 업로드 중 2개 | 대기 3개 | 오류 0개 | 업로드 실패 1개"
         );
     }
 
