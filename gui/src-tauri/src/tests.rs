@@ -58,6 +58,8 @@ fn merges_config_with_agent_status() {
         state,
         pending_uploads: 3,
         active_downloads: 2,
+        uploading: 1,
+        failed_uploads: 0,
     };
     let status = AgentStatus {
         drives: vec![

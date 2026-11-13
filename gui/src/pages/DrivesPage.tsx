@@ -4,7 +4,7 @@ import { Outlet, useNavigate } from 'react-router-dom';
 import { Check, Minus, Play, Plus, RefreshCw, Settings2, Square, Trash2, TriangleAlert } from 'lucide-react';
 import { DataGrid } from '../components/DataGrid';
 import { Modal } from '../components/Modal';
-import { api, BACKEND_LABEL, errorText, STATE_LABEL } from '../api';
+import { api, BACKEND_LABEL, errorText, STATE_LABEL, waitingUploads } from '../api';
 import type { DriveRow } from '../api';
 import { PageFrame } from '../shell/AppShell';
 import { useStatus } from '../status';
@@ -15,7 +15,9 @@ import { RecoveryPanel } from '../ui/RecoveryPanel';
 type Busy = Record<string, 'mount' | 'unmount' | 'delete'>;
 
 function stateText(d: DriveRow) {
-  if (d.state === 'mounted' && d.pendingUploads > 0) return '업로드 중';
+  if (d.state === 'mounted' && d.uploading > 0) return '업로드 중';
+  if (d.state === 'mounted' && d.failedUploads > 0) return '업로드 실패';
+  if (d.state === 'mounted' && waitingUploads(d) > 0) return '업로드 대기';
   if (d.state === 'mounted' && d.activeDownloads > 0) return '다운로드 중';
   if (d.state === 'unmounted' && d.pendingUploads > 0) return '해제 중';
   return STATE_LABEL[d.state];
@@ -47,7 +49,9 @@ function AgentStrip() {
     );
   else {
     const mounted = status.drives.filter((d) => d.state === 'mounted').length;
-    const pending = status.drives.reduce((n, d) => n + d.pendingUploads, 0);
+    const uploading = status.drives.reduce((n, d) => n + d.uploading, 0);
+    const waiting = status.drives.reduce((n, d) => n + waitingUploads(d), 0);
+    const failedUploads = status.drives.reduce((n, d) => n + d.failedUploads, 0);
     body = (
       <span className="flex flex-wrap items-center gap-x-4 text-ink-2">
         <span>
@@ -59,8 +63,16 @@ function AgentStrip() {
           <span className="text-ink-3"> / {status.drives.length}</span>
         </span>
         <span>
-          업로드 대기 <strong className="kbd-mono text-ink">{pending}</strong>
+          업로드 중 <strong className="kbd-mono text-ink">{uploading}</strong>
         </span>
+        <span>
+          대기 <strong className="kbd-mono text-ink">{waiting}</strong>
+        </span>
+        {failedUploads > 0 ? (
+          <span className="font-semibold text-danger">
+            업로드 실패 <strong className="kbd-mono">{failedUploads}</strong>
+          </span>
+        ) : null}
       </span>
     );
   }
@@ -187,12 +199,30 @@ export function DrivesPage() {
         filterValueGetter: (d: DriveRow) => BACKEND_LABEL[d.backend] ?? d.backend,
       },
       {
-        field: 'pendingUploads',
-        headerName: '업로드 대기',
+        field: 'uploading',
+        headerName: '업로드 중',
         width: 88,
         cellRenderer: ({ value }: { value: number }) => (
-          <span className={`kbd-mono ${value > 0 ? 'font-bold text-warn' : 'text-ink-3'}`}>{value}</span>
+          <span className={`kbd-mono ${value > 0 ? 'font-bold text-accent' : 'text-ink-3'}`}>{value}</span>
         ),
+      },
+      {
+        field: 'pendingUploads',
+        headerName: '업로드 대기',
+        width: 96,
+        cellRenderer: ({ data }: { data: DriveRow }) => {
+          const waiting = waitingUploads(data);
+          return (
+            <span className="kbd-mono">
+              <span className={waiting > 0 ? 'font-bold text-warn' : 'text-ink-3'}>{waiting}</span>
+              {data.failedUploads > 0 ? (
+                <span className="ml-1.5 font-bold text-danger" title="업로드 실패">
+                  실패 {data.failedUploads}
+                </span>
+              ) : null}
+            </span>
+          );
+        },
       },
       {
         field: 'activeDownloads',

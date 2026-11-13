@@ -11,12 +11,24 @@ export interface DriveRow {
   backend: string;
   state: DriveState;
   message: string | null;
+  /** 업로드가 끝나지 않은 파일 전체 수 */
   pendingUploads: number;
+  /** 그중 전송 중이거나 닫을 때 바로 반영할 파일 수 */
+  uploading: number;
+  /** 그중 마지막 시도가 실패한 파일 수 */
+  failedUploads: number;
   activeDownloads: number;
   autoMount: boolean;
   readOnly: boolean;
   configured: boolean;
 }
+
+/** 백그라운드 업로드를 기다리는 파일 수 */
+export const waitingUploads = (d: DriveRow) =>
+  Math.max(0, d.pendingUploads - d.uploading - d.failedUploads);
+
+/** through: 실시간 업로드(완료 표시와 원격 저장 일치), back: 백그라운드 업로드 */
+export type WriteMode = 'through' | 'back';
 
 export interface StatusView {
   locked: boolean;
@@ -67,6 +79,7 @@ export interface DriveDetail {
   secrets: SecretInfo[];
   cache: CacheSettings;
   transfer: TransferSettings;
+  writeMode: WriteMode;
   proxy: { url: string; username: string | null } | null;
 }
 
@@ -131,6 +144,7 @@ export interface DrivePatch {
   autoMount: boolean;
   cache: CacheSettings;
   transfer: TransferSettings;
+  writeMode: WriteMode;
   proxy: ProxyInput | null;
 }
 

@@ -300,6 +300,7 @@ mod tests {
             cache: CacheConfig::default(),
             transfer: TransferConfig::default(),
             proxy: None,
+            write_mode: Default::default(),
             backend: BackendConfig::Local { root },
         });
         cfg.save(&path).unwrap();

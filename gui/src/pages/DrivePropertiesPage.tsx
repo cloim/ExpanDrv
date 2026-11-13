@@ -7,7 +7,7 @@ import { ConnectionEditor } from './ConnectionEditor';
 import { RecoveryPanel } from '../ui/RecoveryPanel';
 import { PERFORMANCE_PRESETS, performancePreset } from '../performance';
 import { api, BACKEND_LABEL, errorText, STATE_LABEL } from '../api';
-import type { CacheSettings, DriveDetail, SecretInfo, TransferSettings } from '../api';
+import type { CacheSettings, DriveDetail, SecretInfo, TransferSettings, WriteMode } from '../api';
 import { PageFrame } from '../shell/AppShell';
 import { useStatus } from '../status';
 import { Field, IconButton, Led, Section, Skeleton, Switch } from '../ui/controls';
@@ -20,6 +20,7 @@ interface Draft {
   autoMount: boolean;
   cache: Record<keyof CacheSettings, string>;
   transfer: Record<keyof TransferSettings, string>;
+  writeMode: WriteMode;
   proxyOn: boolean;
   proxyUrl: string;
   proxyUser: string;
@@ -36,6 +37,7 @@ function toDraft(d: DriveDetail): Draft {
     autoMount: d.autoMount,
     cache: str(d.cache),
     transfer: str(d.transfer),
+    writeMode: d.writeMode,
     proxyOn: d.proxy !== null,
     proxyUrl: d.proxy?.url ?? '',
     proxyUser: d.proxy?.username ?? '',
@@ -50,6 +52,21 @@ const CACHE_FIELDS: { key: keyof CacheSettings; label: string; unit: string; min
   { key: 'pollIntervalSecs', label: '원격 변경 확인 주기', unit: '초, 0이면 끔', min: 0, max: 86400 },
   { key: 'diskLimitMib', label: '암호화 디스크 캐시 상한', unit: 'MiB, 0이면 끔', min: 0, max: 1048576 },
   { key: 'readaheadBlocks', label: '선행 읽기 상한', unit: '블록, 0이면 끔', min: 0, max: 16 },
+];
+
+const WRITE_MODES: { id: WriteMode; label: string; description: string }[] = [
+  {
+    id: 'through',
+    label: '실시간 업로드(권장)',
+    description:
+      '쓰는 동안 바로 원격으로 보내고, 복사나 저장이 끝났다고 표시되는 시점에 원격 저장도 끝나 있습니다. 진행률은 실제 전송 속도를 따릅니다.',
+  },
+  {
+    id: 'back',
+    label: '백그라운드 업로드',
+    description:
+      '로컬에 먼저 기록해 복사와 저장이 즉시 끝나고, 업로드는 그 뒤에 진행됩니다. 완료 여부는 트레이와 활동 화면의 업로드 대기에서 확인해야 합니다.',
+  },
 ];
 
 const TRANSFER_FIELDS: { key: keyof TransferSettings; label: string }[] = [
@@ -167,6 +184,7 @@ export function DrivePropertiesPage() {
           uploadKibPerSec: Number(draft.transfer.uploadKibPerSec),
           downloadKibPerSec: Number(draft.transfer.downloadKibPerSec),
         },
+        writeMode: draft.writeMode,
         proxy: draft.proxyOn
           ? { url: draft.proxyUrl, username: draft.proxyUser, password: draft.proxyPassword }
           : null,
@@ -474,6 +492,31 @@ export function DrivePropertiesPage() {
                 ) : null}
               </>
             )}
+          </Section>
+
+          <Section title="쓰기 반영">
+            <Field label="업로드 방식">
+              {(p) => (
+                <SelectControl
+                  {...p}
+                  disabled={!draft || saving}
+                  value={draft?.writeMode ?? 'through'}
+                  onChange={(e) => patchDraft({ writeMode: e.target.value as WriteMode })}
+                >
+                  {WRITE_MODES.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </SelectControl>
+              )}
+            </Field>
+            {draft ? (
+              <div className="rounded-lg border border-line bg-surface-2 p-3 text-xs leading-relaxed text-ink-2" aria-live="polite">
+                <p>{WRITE_MODES.find((m) => m.id === draft.writeMode)?.description}</p>
+                <p className="mt-1">저장 후 다시 마운트하면 적용</p>
+              </div>
+            ) : null}
           </Section>
 
           <Section title="캐시">

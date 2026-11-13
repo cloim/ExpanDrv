@@ -2,7 +2,7 @@
 
 use expandrv_core::config::{
     BackendConfig, CacheConfig, Config, DriveConfig, FtpConfig, FtpTls, ProxyConfig, S3Config,
-    SecretResolver, SecretSource, SftpConfig, TransferConfig, WebDavConfig,
+    SecretResolver, SecretSource, SftpConfig, TransferConfig, WebDavConfig, WriteMode,
 };
 use expandrv_core::{Error, Result};
 use expandrv_secrets::{CredentialStore, MAX_SECRET_BYTES, target_for};
@@ -532,6 +532,7 @@ pub fn build_drive(input: NewDrive) -> Result<(DriveConfig, Vec<PendingSecret>)>
         auto_mount: input.auto_mount,
         network_drive: true,
         proxy,
+        write_mode: Default::default(),
         backend,
     };
     Ok((drive, pending))
@@ -607,6 +608,9 @@ pub struct DrivePatch {
     pub cache: CacheInput,
     pub transfer: TransferInput,
     pub proxy: Option<ProxyInput>,
+    /// 없으면 기존 값을 유지합니다(이전 화면과의 호환).
+    #[serde(default)]
+    pub write_mode: Option<WriteMode>,
 }
 
 fn in_range<T: PartialOrd + std::fmt::Display>(what: &str, v: T, min: T, max: T) -> Result<T> {
@@ -658,6 +662,9 @@ pub fn update_drive(
     d.auto_mount = patch.auto_mount;
     d.cache = build_cache(patch.cache)?;
     d.transfer = build_transfer(patch.transfer)?;
+    if let Some(mode) = patch.write_mode {
+        d.write_mode = mode;
+    }
     let dropped = stale_proxy_target(id, d.proxy.as_ref(), proxy.as_ref());
     d.proxy = proxy;
     cfg.validate()?;
@@ -814,6 +821,7 @@ pub struct DriveDetail {
     pub secrets: Vec<SecretInfo>,
     pub cache: CacheInput,
     pub transfer: TransferInput,
+    pub write_mode: WriteMode,
     pub proxy: Option<ProxyView>,
 }
 
@@ -985,6 +993,7 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
             upload_kib_per_sec: d.transfer.upload_kib_per_sec,
             download_kib_per_sec: d.transfer.download_kib_per_sec,
         },
+        write_mode: d.write_mode,
         proxy: d.proxy.as_ref().map(|p| ProxyView {
             url: p.url.clone(),
             username: p.username.clone(),

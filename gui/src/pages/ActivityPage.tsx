@@ -1,3 +1,4 @@
+import { waitingUploads } from '../api';
 import { useMemo } from 'react';
 import { Eraser } from 'lucide-react';
 import { DataGrid } from '../components/DataGrid';
@@ -75,9 +76,15 @@ export function ActivityPage() {
                   />
                   <span className="kbd-mono font-semibold">{d.id}</span>
                   <span className="kbd-mono text-ink-3">{d.mountPoint}</span>
-                  <span className={d.pendingUploads > 0 ? 'font-semibold text-warn' : 'text-ink-3'}>
-                    업로드 대기 {d.pendingUploads}
+                  <span className={d.uploading > 0 ? 'font-semibold text-accent' : 'text-ink-3'}>
+                    업로드 중 {d.uploading}
                   </span>
+                  <span className={waitingUploads(d) > 0 ? 'font-semibold text-warn' : 'text-ink-3'}>
+                    대기 {waitingUploads(d)}
+                  </span>
+                  {d.failedUploads > 0 ? (
+                    <span className="font-semibold text-danger">실패 {d.failedUploads}</span>
+                  ) : null}
                   <span className={d.activeDownloads > 0 ? 'font-semibold text-accent' : 'text-ink-3'}>
                     다운로드 {d.activeDownloads}
                   </span>
@@ -96,7 +103,7 @@ export function ActivityPage() {
               rowData={events}
               columnDefs={columns}
               getRowId={({ data }: { data: ActivityEvent }) => String(data.seq)}
-              emptyMessage="아직 기록이 없으며, 마운트와 해제, 업로드 대기 변화가 여기에 쌓입니다"
+              emptyMessage="아직 기록이 없으며, 마운트와 해제, 업로드 상태 변화가 여기에 쌓입니다"
               rowHeight={44}
             />
           </div>

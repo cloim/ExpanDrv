@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { api, errorText, STATE_LABEL } from './api';
+import { api, errorText, STATE_LABEL, waitingUploads } from './api';
 import type { StatusView } from './api';
 
 const POLL_MS = 3000;
@@ -47,8 +47,20 @@ function diff(prev: StatusView | null, next: StatusView, nextSeq: () => number):
     if (before.state !== d.state) {
       add(d.id, 'state', STATE_LABEL[d.state], d.message ?? d.mountPoint);
     }
-    if (before.pendingUploads !== d.pendingUploads) {
-      const text = d.pendingUploads === 0 ? '업로드 완료' : `업로드 대기 ${d.pendingUploads}개`;
+    if (before.pendingUploads !== d.pendingUploads || before.failedUploads !== d.failedUploads) {
+      const waiting = waitingUploads(d);
+      const text =
+        d.pendingUploads === 0
+          ? '업로드 완료'
+          : d.failedUploads > before.failedUploads
+            ? `업로드 실패 ${d.failedUploads}개`
+            : [
+                d.uploading > 0 ? `업로드 중 ${d.uploading}개` : '',
+                waiting > 0 ? `대기 ${waiting}개` : '',
+                d.failedUploads > 0 ? `실패 ${d.failedUploads}개` : '',
+              ]
+                .filter(Boolean)
+                .join(', ');
       add(d.id, 'uploads', text, `${before.pendingUploads} → ${d.pendingUploads}`);
     }
   }

@@ -96,7 +96,12 @@ pub struct DriveRow {
     /// `mounted`, `unmounted`, `failed`
     pub state: &'static str,
     pub message: Option<String>,
+    /// 업로드가 끝나지 않은 파일 전체 수
     pub pending_uploads: u64,
+    /// 그중 전송 중이거나 닫을 때 바로 반영할 파일 수
+    pub uploading: u64,
+    /// 그중 마지막 시도가 실패한 파일 수
+    pub failed_uploads: u64,
     /// 원격에서 받고 있는 블록 수
     pub active_downloads: u64,
     pub auto_mount: bool,
@@ -142,6 +147,8 @@ pub fn merge_status(cfg: Option<&Config>, status: &AgentStatus) -> Vec<DriveRow>
                 state,
                 message,
                 pending_uploads: live.map_or(0, |s| s.pending_uploads),
+                uploading: live.map_or(0, |s| s.uploading),
+                failed_uploads: live.map_or(0, |s| s.failed_uploads),
                 active_downloads: live.map_or(0, |s| s.active_downloads),
                 auto_mount: d.auto_mount,
                 read_only: d.read_only,
@@ -162,6 +169,8 @@ pub fn merge_status(cfg: Option<&Config>, status: &AgentStatus) -> Vec<DriveRow>
             state,
             message,
             pending_uploads: s.pending_uploads,
+            uploading: s.uploading,
+            failed_uploads: s.failed_uploads,
             active_downloads: s.active_downloads,
             auto_mount: false,
             read_only: false,
