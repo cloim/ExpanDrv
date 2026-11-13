@@ -320,6 +320,8 @@ mod tests {
                         state: DriveState::Unmounted,
                         pending_uploads: 0,
                         active_downloads: 0,
+                        uploading: 0,
+                        failed_uploads: 0,
                     }],
                     ..AgentStatus::default()
                 }),

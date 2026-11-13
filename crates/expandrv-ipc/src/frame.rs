@@ -92,6 +92,8 @@ mod tests {
                 state: DriveState::Failed("연결 실패".into()),
                 pending_uploads: 3,
                 active_downloads: 0,
+                uploading: 1,
+                failed_uploads: 1,
             }],
             ..AgentStatus::default()
         });

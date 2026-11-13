@@ -81,10 +81,17 @@ pub struct DriveStatus {
     pub mount_point: String,
     pub backend: String,
     pub state: DriveState,
+    /// 업로드가 끝나지 않은 파일 전체 수(전송 중, 대기, 실패 합계)
     pub pending_uploads: u64,
     /// 원격에서 받고 있는 블록 수. 이전 에이전트 응답에는 없을 수 있습니다.
     #[serde(default)]
     pub active_downloads: u64,
+    /// `pending_uploads` 중 지금 전송 중이거나 닫을 때 바로 반영할 파일 수
+    #[serde(default)]
+    pub uploading: u64,
+    /// `pending_uploads` 중 마지막 시도가 실패해 다시 시도를 기다리는 파일 수
+    #[serde(default)]
+    pub failed_uploads: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
