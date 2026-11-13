@@ -5,6 +5,8 @@ pub mod config;
 mod error;
 mod path;
 
-pub use backend::{Backend, Capabilities, Entry, EntryKind, Quota, WriteSource};
+pub use backend::{
+    Backend, Capabilities, Entry, EntryKind, Quota, UploadHint, UploadSession, WriteSource,
+};
 pub use error::{Error, Result, ntstatus};
 pub use path::RemotePath;

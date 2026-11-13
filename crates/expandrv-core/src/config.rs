@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 현재 설정 스키마 버전. 형식이 바뀌면 올리고 [`migrate`]에 변환 단계를 추가합니다.
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,7 +125,22 @@ pub struct DriveConfig {
     /// 이 드라이브의 원격 연결에 쓸 프록시
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+    /// 쓰기 완료 시점. 기본값은 호출 프로그램의 완료 표시와 원격 저장을 일치시키는 실시간 업로드입니다.
+    #[serde(default)]
+    pub write_mode: WriteMode,
     pub backend: BackendConfig,
+}
+
+/// 파일 쓰기를 원격에 반영하는 시점
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteMode {
+    /// 실시간 업로드. 쓰는 동안 바로 전송하고 닫기가 원격 저장까지 기다립니다.
+    /// 탐색기의 복사 완료 표시가 실제 업로드 완료와 같습니다.
+    #[default]
+    Through,
+    /// 백그라운드 업로드. 닫기는 즉시 끝나고 업로드는 뒤에 진행하며 트레이에서 확인합니다.
+    Back,
 }
 
 /// SOCKS5 또는 HTTP CONNECT 프록시. 자격 증명은 URL이 아닌 별도 필드로 둡니다.
@@ -377,6 +392,7 @@ pub fn migrate(table: &mut toml::Table) -> Result<Option<u32>> {
         return Ok(None);
     }
     // v0 -> v1: 버전 필드. v1 -> v2: 자동 잠금. v2 -> v3: 적응형 선행 읽기 상한.
+    // v3 -> v4: 드라이브별 쓰기 모드(기본 실시간 업로드).
     table.insert(
         "version".into(),
         toml::Value::Integer(CONFIG_VERSION.into()),
@@ -701,13 +717,44 @@ root = 'C:\tmp'
     }
 
     #[test]
+    fn migrates_v3_to_realtime_write_mode_with_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let before = format!(
+            "version = 3
+{SAMPLE}"
+        );
+        std::fs::write(&path, &before).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        // 이전 설정의 드라이브는 실시간 업로드로 옮겨 완료 표시와 원격 저장이 일치하게 합니다.
+        assert!(
+            cfg.drives
+                .iter()
+                .all(|d| d.write_mode == WriteMode::Through)
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("toml.v3.bak")).unwrap(),
+            before
+        );
+        cfg.drives[0].write_mode = WriteMode::Back;
+        cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("write_mode = \"back\""), "{text}");
+        assert_eq!(
+            Config::load(&path).unwrap().drives[0].write_mode,
+            WriteMode::Back
+        );
+    }
+
+    #[test]
     fn migrates_v2_readahead_with_backup_and_validates_limit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let before = format!("version = 2\n{SAMPLE}");
         std::fs::write(&path, &before).unwrap();
         let mut cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.version, 3);
+        assert_eq!(cfg.version, CONFIG_VERSION);
         assert_eq!(cfg.drives[0].cache.readahead_blocks, 4);
         assert_eq!(
             std::fs::read_to_string(path.with_extension("toml.v2.bak")).unwrap(),

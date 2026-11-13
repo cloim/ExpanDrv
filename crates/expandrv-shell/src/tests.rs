@@ -103,6 +103,7 @@ fn paths_respect_boundaries_case_and_nested_mounts() {
             auto_mount: false,
             network_drive: true,
             proxy: None,
+            write_mode: Default::default(),
             backend: expandrv_core::config::BackendConfig::Local { root: "C:/".into() },
         };
         config.drives.push(drive);
