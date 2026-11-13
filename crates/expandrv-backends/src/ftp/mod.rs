@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::config::{FtpConfig, FtpTls, SecretResolver};
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Error, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Error, RemotePath, Result, UploadHint, UploadSession,
+    WriteSource,
 };
 use secrecy::SecretString;
 use std::future::Future;
@@ -26,7 +27,7 @@ use suppaftp::tokio_rustls::rustls::{self, ClientConfig};
 use suppaftp::types::{FileType, Mode};
 use suppaftp::{FtpError, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use wire::{Charset, Fail, PASS_PLACEHOLDER};
 
 type FtpStream = AsyncRustlsFtpStream;
@@ -147,7 +148,7 @@ pub struct FtpBackend {
     /// 해석된 원격 루트 절대 경로. 루트 자체면 `/`이고 그 외에는 후행 `/`가 없습니다.
     root: String,
     idle: Arc<Mutex<Vec<Conn>>>,
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
     state: Arc<PoolState>,
     parked: Arc<Mutex<Vec<Parked>>>,
     park_seq: AtomicU64,
@@ -228,7 +229,7 @@ impl FtpBackend {
                 poisoned: false,
                 _live: LiveToken::new(&state),
             }])),
-            permits: Semaphore::new(POOL_SIZE),
+            permits: Arc::new(Semaphore::new(POOL_SIZE)),
             state,
             parked: Arc::new(Mutex::new(Vec::new())),
             park_seq: AtomicU64::new(0),
@@ -247,10 +248,8 @@ impl FtpBackend {
         self.idle.lock().unwrap_or_else(|e| e.into_inner()).pop()
     }
 
-    fn put_idle(&self, mut c: Conn) {
-        c.last_used = Instant::now();
-        self.idle.lock().unwrap_or_else(|e| e.into_inner()).push(c);
-        self.state.freed.notify_one();
+    fn put_idle(&self, c: Conn) {
+        return_idle(&self.idle, &self.state, c);
     }
 
     /// 작업을 마친 연결을 풀로 돌려줍니다. 상태를 장담할 수 없으면 버리고 예비 연결을 엽니다.
@@ -515,6 +514,105 @@ impl FtpBackend {
                 }
             }
         }
+    }
+}
+
+/// 연결을 풀로 돌려줍니다. 세션처럼 백엔드 참조 없이 돌려줄 때도 씁니다.
+fn return_idle(idle: &Mutex<Vec<Conn>>, state: &PoolState, mut c: Conn) {
+    c.last_used = Instant::now();
+    idle.lock().unwrap_or_else(|e| e.into_inner()).push(c);
+    state.freed.notify_one();
+}
+
+// ---------- 스트리밍 업로드 ----------
+
+/// STOR 데이터 연결을 열어 둔 세션. 순차 쓰기만 받고 확정 시 전송 완료 응답을 확인합니다.
+struct FtpUpload {
+    conn: Option<Conn>,
+    stream: Option<Transfer>,
+    remote: String,
+    name: String,
+    feats: Feats,
+    sent: u64,
+    idle: Arc<Mutex<Vec<Conn>>>,
+    state: Arc<PoolState>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl FtpUpload {
+    /// 데이터 연결을 끊고 서버에 남은 부분 파일을 지웁니다. 제어 연결을 되살리지 못하면 버립니다.
+    async fn discard(&mut self) {
+        drop(self.stream.take());
+        let Some(mut c) = self.conn.take() else {
+            return;
+        };
+        match tokio::time::timeout(RESYNC_TIMEOUT, resync(&mut c.s)).await {
+            Ok(Ok(())) => {
+                if let Err(e) = c.s.rm(&self.remote).await {
+                    tracing::debug!(remote = %self.remote, error = %e, "취소된 업로드 부분 파일 정리 실패");
+                }
+                return_idle(&self.idle, &self.state, c);
+            }
+            _ => {
+                tracing::debug!("취소된 업로드 뒤 FTP 제어 연결을 되살리지 못해 버립니다");
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl UploadSession for FtpUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        if offset != self.sent {
+            return Err(Error::Unsupported("FTP 순서 밖 쓰기"));
+        }
+        let stream = self.stream.as_mut().ok_or(Error::Cancelled)?;
+        match tokio::time::timeout(OP_TIMEOUT, stream.write_all(&data)).await {
+            Ok(Ok(())) => {
+                self.sent += data.len() as u64;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(Error::Network(format!("FTP 데이터 전송 실패: {e}"))),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        let stream = self.stream.as_mut().ok_or(Error::Cancelled)?;
+        tokio::time::timeout(OP_TIMEOUT, stream.flush())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|e| Error::Network(format!("FTP 데이터 전송 실패: {e}")))
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Entry> {
+        let stream = self.stream.take().ok_or(Error::Cancelled)?;
+        let mut c = self.conn.take().ok_or(Error::Cancelled)?;
+        let done = tokio::time::timeout(OP_TIMEOUT, stream.finish()).await;
+        match done {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let f = Fail::Ftp(e);
+                if !f.is_broken() {
+                    return_idle(&self.idle, &self.state, c);
+                }
+                return Err(f.into_error());
+            }
+            Err(_) => return Err(Error::Timeout),
+        }
+        let entry = match stat_on(&mut c, self.feats, &self.remote).await {
+            Ok(e) => Ok(e),
+            Err(f) if f.is_broken() => Err(f.into_error()),
+            Err(_) => Ok(Entry::file(self.name.clone(), self.sent)),
+        };
+        if !c.poisoned {
+            return_idle(&self.idle, &self.state, c);
+        }
+        entry
+    }
+
+    async fn abort(mut self: Box<Self>) {
+        self.discard().await;
     }
 }
 
@@ -1043,6 +1141,8 @@ impl Backend for FtpBackend {
             rename_dir: true,
             case_sensitive: true,
             sequential_transfer: true,
+            streaming_upload: true,
+            random_write: false,
         }
     }
 
@@ -1104,6 +1204,55 @@ impl Backend for FtpBackend {
             })
         })
         .await
+    }
+
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        _hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        let remote = self.remote(path);
+        let name = path.name().ok_or(Error::IsADirectory)?.to_owned();
+        self.drop_parked(&remote);
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Cancelled)?;
+        let mut retried = false;
+        loop {
+            let (mut c, reused) = self.checkout().await.map_err(Fail::into_error)?;
+            match tokio::time::timeout(OP_TIMEOUT, c.s.put_with_stream(&remote)).await {
+                Ok(Ok(stream)) => {
+                    return Ok(Box::new(FtpUpload {
+                        conn: Some(c),
+                        stream: Some(stream),
+                        remote,
+                        name,
+                        feats: self.feats,
+                        sent: 0,
+                        idle: self.idle.clone(),
+                        state: self.state.clone(),
+                        _permit: permit,
+                    }));
+                }
+                Ok(Err(e)) => {
+                    let f = Fail::Ftp(e);
+                    if f.is_broken() {
+                        drop(c);
+                        if reused && !retried && f.is_retryable() {
+                            retried = true;
+                            continue;
+                        }
+                    } else if !c.poisoned {
+                        self.put_idle(c);
+                    }
+                    return Err(f.into_error());
+                }
+                Err(_) => return Err(Error::Timeout),
+            }
+        }
     }
 
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {

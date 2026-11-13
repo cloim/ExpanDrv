@@ -8,10 +8,11 @@ mod xml;
 
 use crate::proxy::Proxy;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use expandrv_core::config::{S3Config, SecretResolver};
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Error, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Error, RemotePath, Result, UploadHint, UploadSession,
+    WriteSource,
 };
 use futures::{StreamExt, TryStreamExt};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -19,7 +20,7 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap, LAST_MODIFI
 use reqwest::{Body, RequestBuilder, Response, StatusCode, Url};
 use rusty_s3::{Bucket, Credentials, Method, UrlStyle};
 use secrecy::{ExposeSecret, SecretString};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -45,6 +46,7 @@ const COPY_SOURCE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
+#[derive(Clone)]
 pub struct S3Backend {
     http: reqwest::Client,
     bucket: Bucket,
@@ -315,16 +317,19 @@ impl S3Backend {
             Err(e) => Err(e),
         };
         if res.is_err() {
-            let abort =
-                match self.request(Method::Delete, Some(key), &[("uploadId", upload_id)], &[]) {
-                    Ok(rb) => self.exec(rb).await.map(|_| ()),
-                    Err(e) => Err(e),
-                };
-            if let Err(e) = abort {
-                tracing::warn!(error = %e, "S3 멀티파트 업로드 중단 실패");
-            }
+            self.abort_multipart(key, upload_id).await;
         }
         res
+    }
+
+    async fn abort_multipart(&self, key: &str, upload_id: &str) {
+        let abort = match self.request(Method::Delete, Some(key), &[("uploadId", upload_id)], &[]) {
+            Ok(rb) => self.exec(rb).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = abort {
+            tracing::warn!(error = %e, "S3 멀티파트 업로드 중단 실패");
+        }
     }
 
     async fn put_multipart(&self, key: &str, src: &Path, size: u64) -> Result<()> {
@@ -351,6 +356,17 @@ impl S3Backend {
         f.seek(std::io::SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; len as usize];
         f.read_exact(&mut buf).await?;
+        self.upload_part_bytes(key, upload_id, num, Bytes::from(buf))
+            .await
+    }
+
+    async fn upload_part_bytes(
+        &self,
+        key: &str,
+        upload_id: &str,
+        num: u32,
+        data: Bytes,
+    ) -> Result<(u32, String)> {
         let n = num.to_string();
         let rb = self
             .request(
@@ -359,8 +375,8 @@ impl S3Backend {
                 &[("partNumber", &n), ("uploadId", upload_id)],
                 &[],
             )?
-            .header(CONTENT_LENGTH, len)
-            .body(buf);
+            .header(CONTENT_LENGTH, data.len())
+            .body(data);
         let resp = self.exec(rb).await?;
         let etag = resp
             .headers()
@@ -442,6 +458,8 @@ impl Backend for S3Backend {
             rename_dir: false,
             case_sensitive: true,
             sequential_transfer: false,
+            streaming_upload: true,
+            random_write: false,
         }
     }
 
@@ -525,6 +543,29 @@ impl Backend for S3Backend {
             WriteSource::File { path: src, .. } => self.put_file(&key, &src).await?,
         }
         self.stat(path).await
+    }
+
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        if path.is_root() {
+            return Err(Error::IsADirectory);
+        }
+        let part = part_size(hint.size.unwrap_or(0), PART_SIZE);
+        Ok(Box::new(S3Upload {
+            backend: self.clone(),
+            key: self.key(path),
+            path: path.clone(),
+            part,
+            buf: BytesMut::new(),
+            upload_id: None,
+            next_part: 1,
+            sent: 0,
+            inflight: VecDeque::new(),
+            parts: Vec::new(),
+        }))
     }
 
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
@@ -628,6 +669,116 @@ fn normalize_prefix(raw: &str) -> Result<String> {
     } else {
         format!("{}/", parts.join("/"))
     })
+}
+
+// ---------- 스트리밍 업로드 ----------
+
+/// 파트 크기만큼 모아 멀티파트로 올리는 세션. 파트 하나를 넘지 않는 파일은 확정 시 단일 PUT으로 올립니다.
+struct S3Upload {
+    backend: S3Backend,
+    key: String,
+    path: RemotePath,
+    part: u64,
+    buf: BytesMut,
+    upload_id: Option<String>,
+    next_part: u32,
+    sent: u64,
+    inflight: VecDeque<tokio::task::JoinHandle<Result<(u32, String)>>>,
+    parts: Vec<(u32, String)>,
+}
+
+impl S3Upload {
+    async fn reap(&mut self, keep: usize) -> Result<()> {
+        while self.inflight.len() > keep {
+            let task = self.inflight.pop_front().expect("inflight");
+            let part = task
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+            self.parts.push(part);
+        }
+        Ok(())
+    }
+
+    /// 모아 둔 파트를 올립니다. 첫 파트에서 멀티파트 업로드를 시작합니다.
+    async fn push_part(&mut self, data: Bytes) -> Result<()> {
+        if self.upload_id.is_none() {
+            self.upload_id = Some(self.backend.create_multipart(&self.key).await?);
+        }
+        self.reap(PART_CONCURRENCY - 1).await?;
+        let (be, key, id) = (
+            self.backend.clone(),
+            self.key.clone(),
+            self.upload_id.clone().expect("upload id"),
+        );
+        let num = self.next_part;
+        self.next_part += 1;
+        self.inflight.push_back(tokio::spawn(async move {
+            be.upload_part_bytes(&key, &id, num, data).await
+        }));
+        Ok(())
+    }
+
+    async fn discard(&mut self) {
+        while let Some(task) = self.inflight.pop_front() {
+            let _ = task.await;
+        }
+        if let Some(id) = self.upload_id.take() {
+            self.backend.abort_multipart(&self.key, &id).await;
+        }
+    }
+}
+
+#[async_trait]
+impl UploadSession for S3Upload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        if offset != self.sent {
+            return Err(Error::Unsupported("S3 순서 밖 쓰기"));
+        }
+        self.sent += data.len() as u64;
+        self.buf.extend_from_slice(&data);
+        while self.buf.len() as u64 >= self.part {
+            let chunk = self.buf.split_to(self.part as usize).freeze();
+            self.push_part(chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.reap(0).await
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Entry> {
+        let res = async {
+            match self.upload_id.clone() {
+                None => {
+                    let data = std::mem::take(&mut self.buf).freeze();
+                    self.backend.put_bytes(&self.key, data).await?;
+                }
+                Some(id) => {
+                    if !self.buf.is_empty() {
+                        let data = std::mem::take(&mut self.buf).freeze();
+                        self.push_part(data).await?;
+                    }
+                    self.reap(0).await?;
+                    let parts = std::mem::take(&mut self.parts);
+                    self.upload_id = None;
+                    self.backend
+                        .finish_multipart(&self.key, &id, Ok(parts))
+                        .await?;
+                }
+            }
+            self.backend.stat(&self.path).await
+        }
+        .await;
+        if res.is_err() {
+            self.discard().await;
+        }
+        res
+    }
+
+    async fn abort(mut self: Box<Self>) {
+        self.discard().await;
+    }
 }
 
 /// 파트 크기. 기본 크기에서 시작해 파트 수가 상한을 넘으면 MiB 단위로 키웁니다.

@@ -16,6 +16,7 @@ webdav = [
     "dep:percent-encoding",
     "dep:httpdate",
     "dep:time",
+    "dep:futures",
     "dep:sha2",
     "dep:tokio-util",
 ]

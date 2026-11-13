@@ -13,7 +13,7 @@
 use bytes::Bytes;
 use expandrv_backends::ftp::FtpBackend;
 use expandrv_core::config::{EnvSecrets, FtpConfig, FtpTls, SecretResolver, SecretSource};
-use expandrv_core::{Backend, EntryKind, Error, RemotePath, WriteSource};
+use expandrv_core::{Backend, EntryKind, Error, RemotePath, UploadHint, WriteSource};
 use secrecy::SecretString;
 use std::sync::Arc;
 use suppaftp::tokio_rustls::rustls::pki_types::CertificateDer;
@@ -352,4 +352,67 @@ async fn explicit_ftps_roundtrip() {
         FtpBackend::connect(&cfg, &EnvSecrets).await,
         Error::Network(_)
     );
+}
+
+/// 스트리밍 세션: 순차 쓰기만 받고 확정 시 전송 완료를 확인합니다. 중단하면 부분 파일을 지웁니다.
+#[tokio::test]
+async fn ftp_streaming_session_commits_and_aborts_cleanly() {
+    let Some(cfg) = config("EXPANDRV_TEST_FTP_PORT", FtpTls::None, "utf-8") else {
+        return;
+    };
+    let be = Arc::new(FtpBackend::connect(&cfg, &EnvSecrets).await.unwrap());
+    assert!(be.capabilities().streaming_upload && !be.capabilities().random_write);
+    let dir = p(&unique("stream"));
+    be.mkdir(&dir).await.unwrap();
+    let target = dir.join("streamed.bin").unwrap();
+
+    let data = pattern(1_572_864 + 7);
+    let mut s = be
+        .begin_upload(
+            &target,
+            UploadHint {
+                size: Some(data.len() as u64),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    s.write(0, Bytes::from(data[..700_000].to_vec()))
+        .await
+        .unwrap();
+    s.flush().await.unwrap();
+    assert_err!(
+        s.write(0, Bytes::from_static(b"x")).await,
+        Error::Unsupported(_)
+    );
+    s.write(700_000, Bytes::from(data[700_000..].to_vec()))
+        .await
+        .unwrap();
+    let e = s.finish().await.unwrap();
+    assert_eq!(e.size, data.len() as u64);
+    let got = be.read_range(&target, 0, data.len() as u64).await.unwrap();
+    assert_eq!(&got[..], &data[..]);
+
+    // 세션 뒤에도 풀 연결이 정상 동작합니다.
+    assert!(be.stat(&target).await.unwrap().size == data.len() as u64);
+
+    let partial = dir.join("partial.bin").unwrap();
+    let mut s = be
+        .begin_upload(&partial, UploadHint::default())
+        .await
+        .unwrap();
+    s.write(0, Bytes::from(pattern(300_000))).await.unwrap();
+    s.abort().await;
+    assert_err!(be.stat(&partial).await, Error::NotFound);
+    let names: Vec<_> = be
+        .list(&dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["streamed.bin"]);
+
+    be.delete(&target, EntryKind::File).await.unwrap();
+    be.delete(&dir, EntryKind::Dir).await.unwrap();
 }

@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use expandrv_backends::webdav::WebDavBackend;
 use expandrv_core::config::{SecretResolver, SecretSource, WebDavConfig};
-use expandrv_core::{Backend, EntryKind, Error, RemotePath, Result, WriteSource};
+use expandrv_core::{Backend, EntryKind, Error, RemotePath, Result, UploadHint, WriteSource};
 use secrecy::SecretString;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -265,4 +265,55 @@ async fn webdav_pinned_certificate() {
         WebDavBackend::connect(&config(url, Some(wrong)), &secrets()).await,
         Err(Error::Network(_))
     ));
+}
+
+/// 스트리밍 세션: 크기를 알리면 길이를 명시해 보내고, 모르면 chunked로 보냅니다.
+#[tokio::test]
+async fn webdav_streaming_session_roundtrip() {
+    let Some(url) = base_url() else { return };
+    let be = WebDavBackend::connect(&config(url, None), &secrets())
+        .await
+        .unwrap();
+    assert!(be.capabilities().streaming_upload);
+    let root = unique_root("stream");
+    be.mkdir(&root).await.unwrap();
+
+    let data: Vec<u8> = (0..(2 << 20) + 11).map(|i| (i * 7 % 253) as u8).collect();
+    for (name, hint) in [
+        ("sized.bin", Some(data.len() as u64)),
+        ("chunked.bin", None),
+    ] {
+        let target = root.join(name).unwrap();
+        let mut s = be
+            .begin_upload(
+                &target,
+                UploadHint {
+                    size: hint,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut off = 0usize;
+        for chunk in data.chunks(500_000) {
+            s.write(off as u64, Bytes::from(chunk.to_vec()))
+                .await
+                .unwrap();
+            off += chunk.len();
+        }
+        let e = match s.finish().await {
+            Ok(e) => e,
+            // chunked 전송을 받지 않는 서버는 오류로 알려 주고 VFS가 전체 업로드로 전환합니다.
+            Err(err) if hint.is_none() => {
+                eprintln!("서버가 chunked PUT을 거부했습니다: {err}");
+                continue;
+            }
+            Err(err) => panic!("{name}: {err}"),
+        };
+        assert_eq!(e.size, data.len() as u64, "{name}");
+        let got = be.read_range(&target, 0, data.len() as u64).await.unwrap();
+        assert_eq!(&got[..], &data[..], "{name}");
+        be.delete(&target, EntryKind::File).await.unwrap();
+    }
+    be.delete(&root, EntryKind::Dir).await.unwrap();
 }

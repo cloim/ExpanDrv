@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::config::{SecretResolver, SftpConfig};
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Error, Quota, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Error, Quota, RemotePath, Result, UploadHint,
+    UploadSession, WriteSource,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use known_hosts::HostKeyCheck;
@@ -18,6 +19,7 @@ use russh_sftp::client::RawSftpSession;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -61,8 +63,11 @@ struct Conn {
 impl Conn {
     /// 작업 하나는 같은 채널을 끝까지 씁니다(파일 핸들이 채널별이므로).
     fn pick(&self) -> &RawSftpSession {
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
-        &self.sessions[i]
+        &self.sessions[self.pick_index()]
+    }
+
+    fn pick_index(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len()
     }
 }
 
@@ -216,6 +221,8 @@ impl Backend for SftpBackend {
             rename_dir: true,
             case_sensitive: true,
             sequential_transfer: true,
+            streaming_upload: true,
+            random_write: true,
         }
     }
 
@@ -240,6 +247,22 @@ impl Backend for SftpBackend {
         let name = path.name().unwrap_or("");
         // 임시 파일에 올린 뒤 교체하므로 재시도해도 결과가 같습니다.
         with_conn!(self, 1, |c| write_file(&c, &p, name, &source).await)
+    }
+
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        let p = self.remote(path);
+        let name = path.name().ok_or(Error::IsADirectory)?.to_owned();
+        with_conn!(self, 1, |c| open_upload(
+            c.clone(),
+            &p,
+            &name,
+            hint.new_file
+        )
+        .await)
     }
 
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
@@ -928,6 +951,169 @@ async fn write_file(
     }
     cleanup.disarm();
     stat_entry(s, target, name).await
+}
+
+// ---------- 스트리밍 업로드 ----------
+
+/// 임시 파일 핸들을 열어 둔 세션. 쓰기 요청은 [`MAX_INFLIGHT`]개까지 겹쳐 보내고 확정 시 대상으로 바꿉니다.
+struct SftpUpload {
+    conn: Arc<Conn>,
+    /// 핸들은 채널별이므로 같은 채널을 끝까지 씁니다.
+    idx: usize,
+    handle: Option<String>,
+    tmp: String,
+    target: String,
+    name: String,
+    target_exists: bool,
+    chunk: usize,
+    inflight: VecDeque<tokio::task::JoinHandle<Result<()>>>,
+}
+
+async fn open_upload(
+    c: Arc<Conn>,
+    target: &str,
+    name: &str,
+    new_file: bool,
+) -> Result<Box<dyn UploadSession>> {
+    let idx = c.pick_index();
+    let s = &c.sessions[idx];
+    // 새 파일이면 대상 확인 왕복을 생략합니다. 그사이 누가 만들었다면 posix-rename이 덮어쓰고,
+    // 지원하지 않는 서버에서는 교체가 실패해 VFS가 전체 업로드로 다시 올립니다.
+    let existing = if new_file {
+        None
+    } else {
+        stat_opt(s, target).await?
+    };
+    if existing.as_ref().is_some_and(|a| a.is_dir()) {
+        return Err(Error::IsADirectory);
+    }
+    let tmp = sibling(target, &temp_name());
+    let attrs = FileAttributes {
+        permissions: existing
+            .as_ref()
+            .and_then(|a| a.permissions)
+            .map(|p| p & 0o7777),
+        ..FileAttributes::empty()
+    };
+    let flags = OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE;
+    let handle = s
+        .open(tmp.as_str(), flags, attrs)
+        .await
+        .map_err(map_sftp)?
+        .handle;
+    Ok(Box::new(SftpUpload {
+        chunk: c.write_chunk as usize,
+        conn: c,
+        idx,
+        handle: Some(handle),
+        tmp,
+        target: target.to_owned(),
+        name: name.to_owned(),
+        target_exists: existing.is_some(),
+        inflight: VecDeque::new(),
+    }))
+}
+
+impl SftpUpload {
+    fn session(&self) -> &RawSftpSession {
+        &self.conn.sessions[self.idx]
+    }
+
+    /// 진행 중인 쓰기가 `keep`개 이하가 될 때까지 결과를 거둡니다.
+    async fn reap(&mut self, keep: usize) -> Result<()> {
+        while self.inflight.len() > keep {
+            let task = self.inflight.pop_front().expect("inflight");
+            task.await
+                .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        }
+        Ok(())
+    }
+
+    /// 남은 쓰기를 기다리고 핸들과 임시 파일을 정리합니다.
+    async fn discard(&mut self) {
+        while let Some(task) = self.inflight.pop_front() {
+            let _ = task.await;
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = self.session().close(h).await;
+        }
+        if let Err(e) = self.session().remove(self.tmp.as_str()).await {
+            tracing::debug!(path = %self.tmp, error = %e, "취소된 업로드 임시 파일 정리 실패");
+        }
+    }
+}
+
+impl Drop for SftpUpload {
+    /// 확정이나 중단 없이 버려지면 백그라운드에서 핸들과 임시 파일을 정리합니다.
+    fn drop(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        let (conn, idx) = (self.conn.clone(), self.idx);
+        let handle = self.handle.take();
+        let tmp = std::mem::take(&mut self.tmp);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let s = &conn.sessions[idx];
+                if let Some(h) = handle {
+                    let _ = s.close(h).await;
+                }
+                let _ = s.remove(tmp.as_str()).await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl UploadSession for SftpUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        let handle = self.handle.clone().ok_or(Error::Cancelled)?;
+        let mut at = offset;
+        for piece in data.chunks(self.chunk.max(1)) {
+            self.reap(MAX_INFLIGHT - 1).await?;
+            let (conn, idx, handle, buf) =
+                (self.conn.clone(), self.idx, handle.clone(), piece.to_vec());
+            self.inflight.push_back(tokio::spawn(async move {
+                conn.sessions[idx]
+                    .write(handle, at, buf)
+                    .await
+                    .map(|_| ())
+                    .map_err(map_sftp)
+            }));
+            at += piece.len() as u64;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.reap(0).await
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Entry> {
+        let res = async {
+            self.reap(0).await?;
+            let handle = self.handle.take().ok_or(Error::Cancelled)?;
+            self.session().close(handle).await.map_err(map_sftp)?;
+            replace_into(
+                &self.conn,
+                self.session(),
+                &self.tmp,
+                &self.target,
+                self.target_exists,
+            )
+            .await?;
+            stat_entry(self.session(), &self.target, &self.name).await
+        }
+        .await;
+        if res.is_err() {
+            self.discard().await;
+        }
+        res
+    }
+
+    async fn abort(mut self: Box<Self>) {
+        self.discard().await;
+    }
 }
 
 /// 로컬 원본을 청크로 읽어 여러 쓰기 요청을 겹쳐 보냅니다. 메모리에는 진행 중인 청크만 둡니다.

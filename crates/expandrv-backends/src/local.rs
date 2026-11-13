@@ -3,11 +3,64 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Error, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Error, RemotePath, Result, UploadHint, UploadSession,
+    WriteSource,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 대상 옆 임시 파일에 쓰고 `finish`에서 이름을 바꿉니다. 확정 전에는 대상 내용이 바뀌지 않습니다.
+struct LocalUpload {
+    tmp: PathBuf,
+    target: PathBuf,
+    name: String,
+    file: Option<tokio::fs::File>,
+}
+
+impl Drop for LocalUpload {
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+#[async_trait]
+impl UploadSession for LocalUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        let f = self.file.as_mut().ok_or(Error::Cancelled)?;
+        f.seek(std::io::SeekFrom::Start(offset)).await?;
+        f.write_all(&data).await?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        let f = self.file.as_mut().ok_or(Error::Cancelled)?;
+        f.flush().await?;
+        f.sync_data().await?;
+        Ok(())
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Entry> {
+        let mut f = self.file.take().ok_or(Error::Cancelled)?;
+        f.flush().await?;
+        drop(f);
+        if let Err(e) = tokio::fs::rename(&self.tmp, &self.target).await {
+            let _ = tokio::fs::remove_file(&self.tmp).await;
+            return Err(e.into());
+        }
+        stat_local(&self.target, &self.name).await
+    }
+
+    async fn abort(mut self: Box<Self>) {
+        self.file.take();
+        let _ = tokio::fs::remove_file(&self.tmp).await;
+    }
+}
 
 pub struct LocalBackend {
     root: PathBuf,
@@ -68,6 +121,8 @@ impl Backend for LocalBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             set_mtime: true,
+            streaming_upload: true,
+            random_write: true,
             ..Capabilities::default()
         }
     }
@@ -114,6 +169,34 @@ impl Backend for LocalBackend {
             }
         }
         stat_local(&target, path.name().unwrap_or("")).await
+    }
+
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        _hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        let target = self.local(path);
+        let name = path.name().ok_or(Error::IsADirectory)?.to_owned();
+        if tokio::fs::metadata(&target).await.is_ok_and(|m| m.is_dir()) {
+            return Err(Error::IsADirectory);
+        }
+        let seq = UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = target.with_file_name(format!(
+            ".{name}.expandrv-{}-{seq}.part",
+            std::process::id()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .await?;
+        Ok(Box::new(LocalUpload {
+            tmp,
+            target,
+            name,
+            file: Some(file),
+        }))
     }
 
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
@@ -257,6 +340,50 @@ mod tests {
         let t = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         be.set_mtime(&p("/f.bin"), t).await.unwrap();
         assert_eq!(be.stat(&p("/f.bin")).await.unwrap().modified, Some(t));
+    }
+
+    #[tokio::test]
+    async fn upload_session_commits_on_finish_and_discards_on_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = LocalBackend::new(dir.path()).unwrap();
+        be.write(&p("/f"), WriteSource::Bytes(Bytes::from_static(b"old")))
+            .await
+            .unwrap();
+
+        let mut s = be
+            .begin_upload(
+                &p("/f"),
+                UploadHint {
+                    size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        s.write(0, Bytes::from_static(b"hello")).await.unwrap();
+        s.write(5, Bytes::from_static(b" world")).await.unwrap();
+        s.flush().await.unwrap();
+        // 확정 전에는 대상이 그대로입니다.
+        assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), b"old");
+        let e = s.finish().await.unwrap();
+        assert_eq!(e.size, 11);
+        assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), b"hello world");
+
+        let mut s = be
+            .begin_upload(&p("/f"), UploadHint::default())
+            .await
+            .unwrap();
+        s.write(0, Bytes::from_static(b"zzz")).await.unwrap();
+        s.abort().await;
+        assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), b"hello world");
+        let names: Vec<_> = be
+            .list(&RemotePath::root())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["f"]);
     }
 
     #[tokio::test]

@@ -335,6 +335,81 @@ mod minio {
         entries.iter().map(|e| (e.name.clone(), e.kind)).collect()
     }
 
+    /// 스트리밍 세션: 파트 크기를 넘으면 멀티파트, 넘지 않으면 단일 PUT으로 확정합니다.
+    #[tokio::test]
+    async fn streaming_session_single_put_and_multipart() {
+        let Some(ep) = endpoint() else { return };
+        let bucket = fresh_bucket(&ep, "stream").await;
+        let be = backend(&ep, &bucket, "").await;
+        assert!(be.capabilities().streaming_upload);
+
+        // 파트 크기(8 MiB) 미만: 단일 PUT
+        let small = pattern(300_000);
+        let mut s = be
+            .begin_upload(
+                &p("/small.bin"),
+                UploadHint {
+                    size: Some(300_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        s.write(0, Bytes::from(small[..100_000].to_vec()))
+            .await
+            .unwrap();
+        s.write(100_000, Bytes::from(small[100_000..].to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(s.finish().await.unwrap().size, 300_000);
+        assert_eq!(
+            &be.read_range(&p("/small.bin"), 0, 300_000).await.unwrap()[..],
+            &small[..]
+        );
+
+        // 파트 크기를 넘는 파일: 파트 3개(8, 8, 1 MiB + 5)
+        let big = pattern((17 << 20) + 5);
+        let mut s = be
+            .begin_upload(&p("/big.bin"), UploadHint::default())
+            .await
+            .unwrap();
+        let mut off = 0usize;
+        for chunk in big.chunks(1 << 20) {
+            s.write(off as u64, Bytes::from(chunk.to_vec()))
+                .await
+                .unwrap();
+            off += chunk.len();
+        }
+        s.flush().await.unwrap();
+        let e = s.finish().await.unwrap();
+        assert_eq!(e.size, big.len() as u64);
+        let got = be
+            .read_range(&p("/big.bin"), (8 << 20) - 10, 40)
+            .await
+            .unwrap();
+        assert_eq!(&got[..], &big[(8 << 20) - 10..(8 << 20) + 30]);
+
+        // 중단: 객체가 생기지 않고 진행 중 멀티파트도 남지 않습니다.
+        let mut s = be
+            .begin_upload(&p("/aborted.bin"), UploadHint::default())
+            .await
+            .unwrap();
+        s.write(0, Bytes::from(pattern(9 << 20))).await.unwrap();
+        s.abort().await;
+        assert!(matches!(
+            be.stat(&p("/aborted.bin")).await,
+            Err(Error::NotFound)
+        ));
+        let names: Vec<_> = be
+            .list(&RemotePath::root())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["big.bin", "small.bin"]);
+    }
+
     #[tokio::test]
     async fn full_flow() {
         let Some(ep) = endpoint() else { return };

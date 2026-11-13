@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use expandrv_core::config::{SecretResolver, WebDavConfig};
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Error, Quota, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Error, Quota, RemotePath, Result, UploadHint,
+    UploadSession, WriteSource,
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderMap, RANGE};
@@ -19,6 +20,7 @@ use secrecy::{ExposeSecret, SecretString};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 use xml::{DavResponse, PROPFIND_QUOTA, PROPFIND_STAT, Props};
 
 /// 경로 구성 요소에서 그대로 둘 문자(RFC 3986 unreserved)
@@ -68,6 +70,7 @@ impl Op {
     }
 }
 
+#[derive(Clone)]
 pub struct WebDavBackend {
     client: reqwest::Client,
     /// 후행 `/`가 있고 사용자 정보, 쿼리, 조각이 없는 루트 URL
@@ -290,6 +293,8 @@ impl Backend for WebDavBackend {
             rename_dir: true,
             case_sensitive: true,
             sequential_transfer: false,
+            streaming_upload: true,
+            random_write: false,
         }
     }
 
@@ -367,6 +372,35 @@ impl Backend for WebDavBackend {
         let limit = IO_TIMEOUT + Duration::from_secs(size / MIN_UPLOAD_RATE);
         check(send(rb, limit).await?, Op::Put)?;
         self.stat(path).await
+    }
+
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        if path.is_root() {
+            return Err(Error::IsADirectory);
+        }
+        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+        let body = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let mut rb = self.request(Op::Put, self.url(path, false)?);
+        if let Some(n) = hint.size {
+            // 청크 전송을 받지 않는 서버가 있어 크기를 알면 길이를 명시합니다.
+            rb = rb.header(CONTENT_LENGTH, n);
+        }
+        let rb = rb.body(reqwest::Body::wrap_stream(body));
+        let task = tokio::spawn(async move { rb.send().await.map_err(map_reqwest) });
+        Ok(Box::new(DavUpload {
+            backend: self.clone(),
+            path: path.clone(),
+            tx: Some(tx),
+            task: Some(task),
+            sent: 0,
+            expected: hint.size,
+        }))
     }
 
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
@@ -513,6 +547,101 @@ fn split_self(
         });
     }
     (me, items)
+}
+
+// ---------- 스트리밍 업로드 ----------
+
+/// 본문을 채널로 흘려보내는 PUT 요청. 응답은 본문이 끝난 뒤 `finish`에서 확인합니다.
+struct DavUpload {
+    backend: WebDavBackend,
+    path: RemotePath,
+    tx: Option<mpsc::Sender<std::io::Result<Bytes>>>,
+    task: Option<tokio::task::JoinHandle<Result<Response>>>,
+    sent: u64,
+    expected: Option<u64>,
+}
+
+impl DavUpload {
+    /// 요청이 먼저 끝났을 때(서버 거부 등) 그 결과를 오류로 돌려줍니다.
+    async fn early_result(&mut self) -> Error {
+        let Some(task) = self.task.take() else {
+            return Error::Cancelled;
+        };
+        match tokio::time::timeout(IO_TIMEOUT, task).await {
+            Ok(Ok(Ok(resp))) => match check(resp, Op::Put) {
+                Ok(_) => Error::Protocol("서버가 본문을 다 받기 전에 PUT을 끝냈습니다".into()),
+                Err(e) => e,
+            },
+            Ok(Ok(Err(e))) => e,
+            Ok(Err(e)) => Error::Io(std::io::Error::other(e)),
+            Err(_) => Error::Timeout,
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.tx.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for DavUpload {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[async_trait]
+impl UploadSession for DavUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        if offset != self.sent {
+            return Err(Error::Unsupported("WebDAV 순서 밖 쓰기"));
+        }
+        let len = data.len() as u64;
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::Cancelled);
+        };
+        if tx.send(Ok(data)).await.is_err() {
+            return Err(self.early_result().await);
+        }
+        self.sent += len;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        // HTTP 본문은 요청이 끝나야 수락되므로 여기서는 전송 큐만 비웁니다.
+        match self.tx.as_ref() {
+            Some(tx) if tx.reserve().await.is_ok() => Ok(()),
+            Some(_) => Err(self.early_result().await),
+            None => Err(Error::Cancelled),
+        }
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Entry> {
+        if let Some(n) = self.expected
+            && n != self.sent
+        {
+            self.cancel();
+            return Err(Error::Protocol(format!(
+                "업로드 크기가 미리 알린 값과 다릅니다({} != {n})",
+                self.sent
+            )));
+        }
+        self.tx.take();
+        let task = self.task.take().ok_or(Error::Cancelled)?;
+        let resp = match tokio::time::timeout(SLOW_OP_TIMEOUT, task).await {
+            Ok(Ok(r)) => r?,
+            Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(e))),
+            Err(_) => return Err(Error::Timeout),
+        };
+        check(resp, Op::Put)?;
+        self.backend.stat(&self.path).await
+    }
+
+    async fn abort(mut self: Box<Self>) {
+        self.cancel();
+    }
 }
 
 async fn send(rb: RequestBuilder, limit: Duration) -> Result<Response> {

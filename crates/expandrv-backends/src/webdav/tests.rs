@@ -463,6 +463,98 @@ async fn put_from_file_sends_content_length() {
 }
 
 #[tokio::test]
+async fn streaming_put_with_size_hint_sends_content_length() {
+    const STAT_207: (&str, &str) = (
+        "207 Multi-Status",
+        r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/dav/s.bin</D:href><D:propstat><D:prop><D:getcontentlength>300000</D:getcontentlength></D:prop></D:propstat></D:response></D:multistatus>"#,
+    );
+    let (url, h) = mock(vec![ROOT_207, ("201 Created", ""), STAT_207]).await;
+    let be = WebDavBackend::connect(&cfg(&url), &Fixed).await.unwrap();
+    let mut s = be
+        .begin_upload(
+            &p("/s.bin"),
+            UploadHint {
+                size: Some(300_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    s.write(0, Bytes::from(vec![1u8; 100_000])).await.unwrap();
+    s.flush().await.unwrap();
+    s.write(100_000, Bytes::from(vec![2u8; 200_000]))
+        .await
+        .unwrap();
+    let e = s.finish().await.unwrap();
+    assert_eq!((e.name.as_str(), e.size), ("s.bin", 300_000));
+    let reqs = h.await.unwrap();
+    let put = reqs[1].to_ascii_lowercase();
+    assert!(put.starts_with("put /dav/s.bin http/1.1"));
+    assert!(put.contains("content-length: 300000"));
+    assert!(!put.contains("transfer-encoding"));
+    assert!(put.ends_with("body-len=300000"));
+}
+
+#[tokio::test]
+async fn streaming_put_without_size_hint_uses_chunked_body() {
+    const STAT_207: (&str, &str) = (
+        "207 Multi-Status",
+        r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/dav/c.bin</D:href><D:propstat><D:prop><D:getcontentlength>7</D:getcontentlength></D:prop></D:propstat></D:response></D:multistatus>"#,
+    );
+    let (url, h) = mock(vec![ROOT_207, ("201 Created", ""), STAT_207]).await;
+    let be = WebDavBackend::connect(&cfg(&url), &Fixed).await.unwrap();
+    let mut s = be
+        .begin_upload(&p("/c.bin"), UploadHint::default())
+        .await
+        .unwrap();
+    s.write(0, Bytes::from_static(b"abc")).await.unwrap();
+    s.write(3, Bytes::from_static(b"defg")).await.unwrap();
+    assert!(matches!(
+        s.write(0, Bytes::from_static(b"x")).await,
+        Err(Error::Unsupported(_))
+    ));
+    let e = s.finish().await.unwrap();
+    assert_eq!(e.size, 7);
+    let reqs = h.await.unwrap();
+    let put = reqs[1].to_ascii_lowercase();
+    assert!(put.contains("transfer-encoding: chunked"), "{put}");
+    assert!(!put.contains("content-length"));
+}
+
+#[tokio::test]
+async fn streaming_put_size_mismatch_and_rejection_are_errors() {
+    let (url, h) = mock(vec![ROOT_207, ("507 Insufficient Storage", "")]).await;
+    let be = WebDavBackend::connect(&cfg(&url), &Fixed).await.unwrap();
+    // 미리 알린 크기보다 적게 보내면 확정하지 않습니다.
+    let mut s = be
+        .begin_upload(
+            &p("/m.bin"),
+            UploadHint {
+                size: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    s.write(0, Bytes::from_static(b"abc")).await.unwrap();
+    assert!(matches!(s.finish().await, Err(Error::Protocol(_))));
+    // 서버가 거부하면 그 상태가 오류로 돌아옵니다.
+    let mut s = be
+        .begin_upload(
+            &p("/r.bin"),
+            UploadHint {
+                size: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    s.write(0, Bytes::from_static(b"abc")).await.unwrap();
+    assert!(matches!(s.finish().await, Err(Error::StorageFull)));
+    h.abort();
+}
+
+#[tokio::test]
 async fn mkcol_405_and_move_412_map_to_already_exists() {
     let (url, h) = mock(vec![
         ROOT_207,

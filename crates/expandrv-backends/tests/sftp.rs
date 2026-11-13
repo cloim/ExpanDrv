@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use expandrv_backends::sftp::SftpBackend;
 use expandrv_core::config::{BackendConfig, EnvSecrets, SecretResolver, SecretSource, SftpConfig};
-use expandrv_core::{Backend, EntryKind, Error, RemotePath, WriteSource};
+use expandrv_core::{Backend, EntryKind, Error, RemotePath, UploadHint, WriteSource};
 use secrecy::SecretString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -436,4 +436,68 @@ async fn sftp_reconnects_after_server_restart() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("재연결 실패: {last:?}");
+}
+
+/// 스트리밍 세션: 쓰는 동안 임시 파일에 기록하고 확정 시 대상으로 바뀌며, 중단하면 흔적이 남지 않습니다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sftp_streaming_session_commits_and_aborts_cleanly() {
+    let Some(cfg) = base_config() else { return };
+    let be = SftpBackend::connect(&cfg, &EnvSecrets).await.unwrap();
+    assert!(be.capabilities().streaming_upload && be.capabilities().random_write);
+    let dir = p(&format!("/{}", unique("stream")));
+    be.mkdir(&dir).await.unwrap();
+    let target = dir.join("streamed.bin").unwrap();
+    be.write(&target, WriteSource::Bytes(Bytes::from_static(b"old")))
+        .await
+        .unwrap();
+
+    // 쓰기 청크 여러 개를 겹쳐 보내고, 임의 오프셋 쓰기도 받습니다.
+    let data = pattern(3 << 20);
+    let mut s = be
+        .begin_upload(
+            &target,
+            UploadHint {
+                size: Some(data.len() as u64),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    s.write(0, Bytes::from(data[..1_000_000].to_vec()))
+        .await
+        .unwrap();
+    s.flush().await.unwrap();
+    // 확정 전에는 대상이 그대로입니다.
+    assert_eq!(&be.read_range(&target, 0, 8).await.unwrap()[..], b"old");
+    s.write(2_000_000, Bytes::from(data[2_000_000..].to_vec()))
+        .await
+        .unwrap();
+    s.write(1_000_000, Bytes::from(data[1_000_000..2_000_000].to_vec()))
+        .await
+        .unwrap();
+    let e = s.finish().await.unwrap();
+    assert_eq!(e.size, data.len() as u64);
+    let got = be.read_range(&target, 0, data.len() as u64).await.unwrap();
+    assert_eq!(&got[..], &data[..]);
+
+    let names =
+        |list: Vec<expandrv_core::Entry>| list.into_iter().map(|e| e.name).collect::<Vec<_>>();
+    assert_eq!(names(be.list(&dir).await.unwrap()), ["streamed.bin"]);
+
+    // 중단하면 대상은 그대로이고 임시 파일은 남지 않습니다.
+    let mut s = be
+        .begin_upload(&target, UploadHint::default())
+        .await
+        .unwrap();
+    s.write(0, Bytes::from_static(b"zzz")).await.unwrap();
+    s.abort().await;
+    assert_eq!(e.size, be.stat(&target).await.unwrap().size);
+    assert_eq!(names(be.list(&dir).await.unwrap()), ["streamed.bin"]);
+
+    assert!(matches!(
+        be.begin_upload(&dir, UploadHint::default()).await,
+        Err(Error::IsADirectory)
+    ));
+    be.delete(&target, EntryKind::File).await.unwrap();
+    be.delete(&dir, EntryKind::Dir).await.unwrap();
 }
