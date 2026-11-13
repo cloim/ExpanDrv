@@ -1,6 +1,7 @@
 use super::*;
 use expandrv_backends::local::LocalBackend;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::time::UNIX_EPOCH;
 
 #[path = "performance_tests.rs"]
 mod performance;
@@ -30,6 +31,65 @@ struct TestBackend {
     read_delay: Mutex<Duration>,
     started_writes: AtomicUsize,
     connections: Semaphore,
+    /// 연 스트리밍 세션 수와 세션으로 보낸 쓰기 수
+    sessions: AtomicUsize,
+    session_writes: Arc<AtomicUsize>,
+    /// 다음 세션 쓰기 몇 번을 일시 오류로 실패시킵니다.
+    fail_session_writes: Arc<AtomicU32>,
+    /// 임의 오프셋 세션 지원 여부(기본 true)
+    random_write: AtomicBool,
+    /// 쓰기 성능 비교용 망 모형: 왕복 지연과 업로드 대역폭(바이트/초, 0이면 무제한)
+    net_rtt: Mutex<Duration>,
+    net_bps: Arc<AtomicU64>,
+}
+
+/// 망 모형에서 `len`바이트를 보내는 시간
+fn transfer_time(bps: &AtomicU64, len: u64) -> Duration {
+    match bps.load(Ordering::SeqCst) {
+        0 => Duration::ZERO,
+        n => Duration::from_secs_f64(len as f64 / n as f64),
+    }
+}
+
+/// 실패 주입과 계수를 더한 시험용 세션
+struct TestUpload {
+    inner: Box<dyn UploadSession>,
+    writes: Arc<AtomicUsize>,
+    fail: Arc<AtomicU32>,
+    rtt: Duration,
+    bps: Arc<AtomicU64>,
+    /// 아직 기다리지 않은 전송 시간. 짧은 대기를 모아 타이머 해상도 왜곡을 줄입니다.
+    debt: Duration,
+}
+
+#[async_trait::async_trait]
+impl UploadSession for TestUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        if self
+            .fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::Network("injected session".into()));
+        }
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.debt += transfer_time(&self.bps, data.len() as u64);
+        if self.debt >= Duration::from_millis(100) {
+            tokio::time::sleep(std::mem::take(&mut self.debt)).await;
+        }
+        self.inner.write(offset, data).await
+    }
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+    async fn finish(self: Box<Self>) -> Result<Entry> {
+        // SFTP 기준 닫기, 교체, 조회 왕복 3회와 남은 전송 시간
+        tokio::time::sleep(self.rtt * 3 + self.debt).await;
+        self.inner.finish().await
+    }
+    async fn abort(self: Box<Self>) {
+        self.inner.abort().await;
+    }
 }
 
 impl TestBackend {
@@ -50,6 +110,7 @@ impl Backend for TestBackend {
     fn capabilities(&self) -> expandrv_core::Capabilities {
         expandrv_core::Capabilities {
             sequential_transfer: self.sequential.load(Ordering::SeqCst),
+            random_write: self.random_write.load(Ordering::SeqCst),
             ..self.inner.capabilities()
         }
     }
@@ -110,7 +171,30 @@ impl Backend for TestBackend {
             return Err(Error::Network("injected".into()));
         }
         self.writes.fetch_add(1, Ordering::SeqCst);
+        // SFTP 기준 대상 확인, 열기, 닫기, 교체, 조회 왕복 5회에 본문 전송 시간을 더합니다.
+        let rtt = *self.net_rtt.lock();
+        tokio::time::sleep(rtt * 5 + transfer_time(&self.net_bps, source.len())).await;
         self.inner.write(path, source).await
+    }
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        self.check()?;
+        self.sessions.fetch_add(1, Ordering::SeqCst);
+        let rtt = *self.net_rtt.lock();
+        // SFTP 기준 대상 확인과 임시 파일 열기. 새 파일이면 확인을 생략합니다.
+        tokio::time::sleep(if hint.new_file { rtt } else { rtt * 2 }).await;
+        let inner = self.inner.begin_upload(path, hint).await?;
+        Ok(Box::new(TestUpload {
+            inner,
+            writes: self.session_writes.clone(),
+            fail: self.fail_session_writes.clone(),
+            rtt,
+            bps: self.net_bps.clone(),
+            debt: Duration::ZERO,
+        }))
     }
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
         self.inner.mkdir(path).await
@@ -120,6 +204,9 @@ impl Backend for TestBackend {
     }
     async fn delete(&self, path: &RemotePath, kind: EntryKind) -> Result<()> {
         self.inner.delete(path, kind).await
+    }
+    async fn set_mtime(&self, path: &RemotePath, mtime: SystemTime) -> Result<()> {
+        self.inner.set_mtime(path, mtime).await
     }
 }
 
@@ -159,10 +246,18 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
         read_delay: Mutex::new(Duration::ZERO),
         started_writes: AtomicUsize::new(0),
         connections: Semaphore::new(4),
+        sessions: AtomicUsize::new(0),
+        session_writes: Arc::new(AtomicUsize::new(0)),
+        fail_session_writes: Arc::new(AtomicU32::new(0)),
+        random_write: AtomicBool::new(true),
+        net_rtt: Mutex::new(Duration::ZERO),
+        net_bps: Arc::new(AtomicU64::new(0)),
     });
     let mut opts = VfsOptions::new(staging.path().join("stage"));
     opts.metadata_ttl = Duration::from_secs(60);
     opts.op_timeout = Duration::from_secs(10);
+    // 기존 시험은 백그라운드 업로드 동작을 검증합니다. 실시간 모드는 `through()`를 씁니다.
+    opts.write_mode = WriteMode::Back;
     tune(&mut opts);
     let vfs = Vfs::new(backend.clone(), rt.handle().clone(), opts.clone()).unwrap();
     Fixture {
@@ -177,6 +272,34 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
 
 fn fixture(read_only: bool) -> Fixture {
     fixture_with(|o| o.read_only = read_only)
+}
+
+/// 실시간 업로드(write-through) 픽스처
+fn through() -> Fixture {
+    fixture_with(|o| o.write_mode = WriteMode::Through)
+}
+
+fn remote(f: &Fixture, name: &str) -> Vec<u8> {
+    std::fs::read(f.root.path().join(name)).unwrap()
+}
+
+/// 조건이 참이 될 때까지 최대 3초 기다립니다. 세션 중단 정리는 비동기로 끝납니다.
+fn wait_until(mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !cond() {
+        assert!(Instant::now() < deadline, "조건이 제때 충족되지 않았습니다");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 원격 루트의 이름 목록. 세션 임시 파일이 남지 않았는지 확인할 때 씁니다.
+fn remote_names(f: &Fixture) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(f.root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    v.sort();
+    v
 }
 
 fn p(s: &str) -> RemotePath {
@@ -221,6 +344,369 @@ fn create_write_upload_after_last_cleanup() {
         vec![TransferEvent::Uploaded(p("/a.txt"))]
     );
     assert!(f.vfs.take_transfer_events().is_empty());
+}
+
+#[test]
+fn through_write_streams_and_cleanup_waits_for_remote() {
+    let f = through();
+    let h = f.vfs.create(&p("/a.txt"), EntryKind::File).unwrap();
+    let full_uploads = f.backend.writes.load(Ordering::SeqCst);
+    f.vfs.write(&h, 0, b"hello", false, false).unwrap();
+    f.vfs.write(&h, 0, b" world", true, false).unwrap();
+    assert_eq!(f.backend.sessions.load(Ordering::SeqCst), 1);
+    assert_eq!(f.vfs.stat(&p("/a.txt")).unwrap().1.size, 11);
+
+    // 동기화 호출 없이 정리가 돌아오면 원격에 반영되어 있습니다.
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "a.txt"), b"hello world");
+    assert_eq!(f.vfs.pending_uploads(), 0);
+    assert_eq!(staging_files(&f), 0);
+    assert_eq!(f.backend.writes.load(Ordering::SeqCst), full_uploads);
+    assert_eq!(f.backend.session_writes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.vfs.take_transfer_events(),
+        vec![TransferEvent::Uploaded(p("/a.txt"))]
+    );
+    f.vfs.close(&h);
+    assert_eq!(remote_names(&f), ["a.txt"]);
+}
+
+#[test]
+fn through_create_defers_remote_file_until_commit() {
+    let f = through();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    let h = f.vfs.create(&p("/new.txt"), EntryKind::File).unwrap();
+    // 원격에는 아직 없지만 목록과 속성에는 보입니다.
+    assert_eq!(f.backend.started_writes.load(Ordering::SeqCst), 0);
+    assert!(remote_names(&f).is_empty());
+    assert_eq!(f.vfs.stat(&p("/new.txt")).unwrap().1.size, 0);
+    let names: Vec<String> = f
+        .vfs
+        .list(&RemotePath::root())
+        .unwrap()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert_eq!(names, ["new.txt"]);
+    assert!(matches!(
+        f.vfs.create(&p("/new.txt"), EntryKind::File),
+        Err(Error::AlreadyExists)
+    ));
+    // 원격 변경 확인이 쓰는 중인 새 파일을 사라진 것으로 알리지 않습니다.
+    assert!(f.vfs.poll_changes().is_empty());
+    assert_eq!(
+        f.vfs.upload_counts(),
+        UploadCounts {
+            uploading: 1,
+            ..Default::default()
+        }
+    );
+
+    // 데이터 없이 닫아도 빈 파일을 한 번에 만듭니다.
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(remote(&f, "new.txt"), b"");
+    assert_eq!(f.vfs.upload_counts(), UploadCounts::default());
+    assert_eq!(f.backend.started_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.vfs.take_transfer_events(),
+        vec![TransferEvent::Uploaded(p("/new.txt"))]
+    );
+    assert!(f.vfs.poll_changes().is_empty());
+}
+
+#[test]
+fn through_local_only_rename_and_replace_happen_at_commit() {
+    let f = through();
+    std::fs::write(f.root.path().join("doc.txt"), b"old").unwrap();
+    // 저장 프로그램처럼 임시 이름으로 쓰고 원래 이름으로 바꿉니다.
+    let h = f.vfs.create(&p("/doc.tmp"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"new", false, false).unwrap();
+    assert!(matches!(
+        f.vfs.rename(&h, &p("/doc.txt"), false),
+        Err(Error::AlreadyExists)
+    ));
+    f.vfs.rename(&h, &p("/doc.txt"), true).unwrap();
+    assert_eq!(h.path().as_str(), "/doc.txt");
+    // 확정 전에는 원격 원본이 그대로입니다.
+    assert_eq!(remote(&f, "doc.txt"), b"old");
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(remote(&f, "doc.txt"), b"new");
+    wait_until(|| remote_names(&f) == ["doc.txt"]);
+    assert!(matches!(f.vfs.stat(&p("/doc.tmp")), Err(Error::NotFound)));
+}
+
+/// 파일 시스템 요청이 상태 잠금이나 노드 표 잠금을 쥔 채 원격 응답을 기다리는 동안에도
+/// 에이전트의 상태 집계는 막히지 않아야 합니다(막히면 런타임 입출력이 멈춰 교착에 빠집니다).
+#[test]
+fn upload_counts_never_blocks_on_busy_locks() {
+    let f = through();
+    let h = f.vfs.create(&p("/busy.bin"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"x", false, false).unwrap();
+    let expected = UploadCounts {
+        uploading: 1,
+        ..Default::default()
+    };
+    assert_eq!(f.vfs.upload_counts(), expected);
+
+    let counts_from_other_thread = |f: &Fixture| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let vfs = f.vfs.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(vfs.upload_counts());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("상태 집계가 잠금에서 기다렸습니다")
+    };
+    {
+        let _busy_state = h.node.state.lock();
+        assert_eq!(counts_from_other_thread(&f), expected);
+    }
+    {
+        let _busy_nodes = f.vfs.s.nodes.lock();
+        assert_eq!(counts_from_other_thread(&f), expected);
+    }
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(f.vfs.upload_counts(), UploadCounts::default());
+}
+
+#[test]
+fn upload_counts_separate_active_waiting_and_failed() {
+    // 백그라운드 모드: 닫기 전 변경은 대기, 실패한 업로드는 실패로 셉니다.
+    let f = fixture(false);
+    *f.backend.write_delay.lock() = Duration::from_millis(300);
+    f.backend.fail_writes.store(1, Ordering::SeqCst);
+    std::fs::write(f.root.path().join("w.txt"), b"x").unwrap();
+    let h = f.vfs.open(&p("/w.txt")).unwrap();
+    f.vfs.write(&h, 0, b"y", false, false).unwrap();
+    assert_eq!(
+        f.vfs.upload_counts(),
+        UploadCounts {
+            waiting: 1,
+            ..Default::default()
+        }
+    );
+    f.vfs.cleanup(&h, false).unwrap();
+    // 첫 시도가 전송 중이면 업로드 중입니다.
+    wait_until(|| f.vfs.upload_counts().uploading == 1);
+    // 첫 시도가 실패하면 다시 시도할 때까지 실패로 보입니다.
+    wait_until(|| f.vfs.upload_counts().failed == 1);
+    sync(&f);
+    assert_eq!(f.vfs.upload_counts(), UploadCounts::default());
+}
+
+/// 캐시 관리자가 같은 파일의 쓰기를 여러 스레드로 동시에 내보내도, 조각이 확정보다 늦게 도착해
+/// 취소 오류가 나거나 조각이 빠진 채 확정되지 않아야 합니다.
+#[test]
+fn through_concurrent_writes_keep_chunk_and_commit_order() {
+    for random in [true, false] {
+        for round in 0..20 {
+            let f = through();
+            f.backend.random_write.store(random, Ordering::SeqCst);
+            let name = format!("c-{round}.bin");
+            let h = f
+                .vfs
+                .create(&p(&format!("/{name}")), EntryKind::File)
+                .unwrap();
+            let chunk = 8 * 1024usize;
+            let data: Vec<u8> = (0..chunk * 8).map(|i| (i % 251) as u8).collect();
+            f.vfs.set_size(&h, data.len() as u64, false).unwrap();
+            std::thread::scope(|scope| {
+                for part in 0..8 {
+                    let (vfs, h, data) = (&f.vfs, &h, &data);
+                    scope.spawn(move || {
+                        let off = part * chunk;
+                        vfs.write(h, off as u64, &data[off..off + chunk], false, true)
+                            .unwrap();
+                    });
+                }
+            });
+            f.vfs.cleanup(&h, false).unwrap();
+            f.vfs.close(&h);
+            assert_eq!(remote(&f, &name), data, "random={random} round={round}");
+            assert_eq!(f.vfs.pending_uploads(), 0);
+        }
+    }
+}
+
+#[test]
+fn through_early_commit_on_size_hint() {
+    let f = through();
+    let h = f.vfs.create(&p("/b.bin"), EntryKind::File).unwrap();
+    // 탐색기는 데이터를 쓰기 전에 최종 크기를 설정합니다.
+    assert_eq!(f.vfs.set_size(&h, 11, false).unwrap().size, 11);
+    f.vfs.write(&h, 0, b"hello ", false, false).unwrap();
+    assert_eq!(f.vfs.pending_uploads(), 1);
+    f.vfs.write(&h, 6, b"world", false, false).unwrap();
+    // 마지막 바이트를 쓴 호출 안에서 확정됩니다.
+    assert_eq!(remote(&f, "b.bin"), b"hello world");
+    assert_eq!(f.vfs.pending_uploads(), 0);
+
+    let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    f.vfs.set_mtime(&h, t).unwrap();
+    assert_eq!(
+        std::fs::metadata(f.root.path().join("b.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        t
+    );
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert_eq!(
+        f.vfs.take_transfer_events(),
+        vec![TransferEvent::Uploaded(p("/b.bin"))]
+    );
+    assert_eq!(remote_names(&f), ["b.bin"]);
+}
+
+#[test]
+fn through_flush_waits_for_sent_data() {
+    let f = through();
+    *f.backend.write_delay.lock() = Duration::ZERO;
+    let h = f.vfs.create(&p("/fl"), EntryKind::File).unwrap();
+    f.vfs
+        .write(&h, 0, &vec![1u8; 300_000], false, false)
+        .unwrap();
+    f.vfs.flush(&h).unwrap();
+    assert_eq!(f.backend.session_writes.load(Ordering::SeqCst), 1);
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "fl").len(), 300_000);
+}
+
+#[test]
+fn through_stream_error_is_returned_to_caller_then_cleanup_uploads_fully() {
+    let f = through();
+    f.backend.fail_session_writes.store(1, Ordering::SeqCst);
+    let h = f.vfs.create(&p("/c"), EntryKind::File).unwrap();
+    let full_uploads = f.backend.writes.load(Ordering::SeqCst);
+    f.vfs.write(&h, 0, b"abc", false, false).unwrap();
+    // 실패는 다음 동기 지점에서 호출 프로그램에 드러납니다.
+    assert!(matches!(f.vfs.flush(&h), Err(Error::Network(_))));
+    // 이후 쓰기는 스테이징에만 남고, 정리 때 전체 업로드로 반영됩니다.
+    f.vfs.write(&h, 3, b"def", false, false).unwrap();
+    assert_eq!(f.backend.sessions.load(Ordering::SeqCst), 1);
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "c"), b"abcdef");
+    assert_eq!(f.backend.writes.load(Ordering::SeqCst), full_uploads + 1);
+    assert_eq!(f.vfs.pending_uploads(), 0);
+    assert_eq!(
+        f.vfs.take_transfer_events(),
+        vec![TransferEvent::Uploaded(p("/c"))]
+    );
+    wait_until(|| remote_names(&f) == ["c"]);
+}
+
+#[test]
+fn through_out_of_order_write_falls_back_to_full_upload() {
+    let f = through();
+    f.backend.random_write.store(false, Ordering::SeqCst);
+    let h = f.vfs.create(&p("/d"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"aaaa", false, false).unwrap();
+    f.vfs.write(&h, 8, b"bb", false, false).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "d"), b"aaaa\0\0\0\0bb");
+    assert_eq!(f.backend.sessions.load(Ordering::SeqCst), 1);
+    wait_until(|| remote_names(&f) == ["d"]);
+}
+
+#[test]
+fn through_size_change_after_sending_falls_back() {
+    let f = through();
+    let h = f.vfs.create(&p("/t"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"0123456789", false, false).unwrap();
+    assert_eq!(f.vfs.set_size(&h, 4, false).unwrap().size, 4);
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "t"), b"0123");
+    wait_until(|| remote_names(&f) == ["t"]);
+}
+
+#[test]
+fn through_partial_edit_uploads_synchronously_on_cleanup() {
+    let f = through();
+    std::fs::write(f.root.path().join("e.bin"), b"0123456789").unwrap();
+    let h = f.vfs.open(&p("/e.bin")).unwrap();
+    f.vfs.write(&h, 2, b"AB", false, false).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "e.bin"), b"01AB456789");
+    assert_eq!(f.backend.sessions.load(Ordering::SeqCst), 0);
+    assert_eq!(f.vfs.pending_uploads(), 0);
+}
+
+#[test]
+fn through_cleanup_commit_failure_notifies_and_retries_in_background() {
+    let f = through();
+    let h = f.vfs.create(&p("/x"), EntryKind::File).unwrap();
+    f.backend.fail_session_writes.store(1, Ordering::SeqCst);
+    f.backend.fail_writes.store(1, Ordering::SeqCst);
+    f.vfs.write(&h, 0, b"x", false, false).unwrap();
+    // 세션과 전체 업로드가 모두 실패해도 정리는 돌아오고, 실패를 알린 뒤 다시 시도합니다.
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(f.vfs.pending_uploads(), 1);
+    assert!(matches!(
+        f.vfs.take_transfer_events().as_slice(),
+        [TransferEvent::Failed(path, _)] if *path == p("/x")
+    ));
+    f.vfs.close(&h);
+    sync(&f);
+    assert_eq!(remote(&f, "x"), b"x");
+    assert_eq!(f.vfs.pending_uploads(), 0);
+    assert_eq!(
+        f.vfs.take_transfer_events(),
+        vec![TransferEvent::Uploaded(p("/x"))]
+    );
+}
+
+#[test]
+fn through_delete_while_streaming_discards_session() {
+    let f = through();
+    let h = f.vfs.create(&p("/del"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"gone", false, false).unwrap();
+    f.vfs.check_delete(&h).unwrap();
+    f.vfs.cleanup(&h, true).unwrap();
+    f.vfs.close(&h);
+    assert!(matches!(f.vfs.stat(&p("/del")), Err(Error::NotFound)));
+    assert_eq!(f.vfs.pending_uploads(), 0);
+    wait_until(|| remote_names(&f).is_empty());
+}
+
+#[test]
+fn through_rename_while_streaming_commits_to_new_path() {
+    let f = through();
+    let h = f.vfs.create(&p("/old"), EntryKind::File).unwrap();
+    f.vfs.write(&h, 0, b"moved", false, false).unwrap();
+    f.vfs.rename(&h, &p("/new"), false).unwrap();
+    f.vfs.cleanup(&h, false).unwrap();
+    assert_eq!(remote(&f, "new"), b"moved");
+    wait_until(|| remote_names(&f) == ["new"]);
+}
+
+#[test]
+fn through_concurrent_files_stream_within_slots_and_rest_fall_back() {
+    let f = through();
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            f.vfs
+                .create(&p(&format!("/p{i}")), EntryKind::File)
+                .unwrap()
+        })
+        .collect();
+    for (i, h) in handles.iter().enumerate() {
+        f.vfs
+            .write(h, 0, format!("file-{i}").as_bytes(), false, false)
+            .unwrap();
+    }
+    // 세션 슬롯(2개)을 넘는 파일은 정리 때 전체 업로드로 반영됩니다.
+    assert_eq!(f.backend.sessions.load(Ordering::SeqCst), 2);
+    for h in &handles {
+        f.vfs.cleanup(h, false).unwrap();
+    }
+    for i in 0..3 {
+        assert_eq!(remote(&f, &format!("p{i}")), format!("file-{i}").as_bytes());
+    }
+    assert_eq!(f.vfs.pending_uploads(), 0);
 }
 
 #[test]
@@ -880,6 +1366,32 @@ fn local_changes_survive_offline_cooldown_listing() {
 }
 
 #[test]
+fn slow_probe_during_active_transfer_does_not_start_offline_cooldown() {
+    let f = fixture_with(|o| o.meta_db = Some(o.staging_dir.with_file_name("meta.db")));
+    std::fs::write(f.root.path().join("a.txt"), b"a").unwrap();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    // 큰 업로드 중 서버가 목록 조회에 늦게 답하는 상황: 저장본으로 답하고 오프라인 대기는 시작하지 않습니다.
+    f.vfs.s.mark_alive();
+    *f.backend.metadata_delay.lock() = Duration::from_millis(2500);
+    f.vfs.refresh();
+    let names: Vec<String> = f
+        .vfs
+        .list(&RemotePath::root())
+        .unwrap()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert_eq!(names, ["a.txt"]);
+    assert!(f.vfs.s.offline_until.lock().is_none());
+
+    // 최근 성공 기록이 오래되었으면 이전처럼 오프라인 대기로 들어갑니다.
+    *f.vfs.s.alive_at.lock() = Instant::now().checked_sub(Duration::from_secs(60));
+    f.vfs.refresh();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    assert!(f.vfs.s.offline_until.lock().is_some());
+}
+
+#[test]
 fn rename_target_parent_uses_real_case() {
     let f = fixture(false);
     std::fs::create_dir(f.root.path().join("loras")).unwrap();
@@ -929,4 +1441,160 @@ fn shutdown_releases_backend_held_by_directory_watcher() {
         2,
         "해제 후 백그라운드 작업이 백엔드를 보관합니다"
     );
+}
+
+// ---------- 실제 백엔드 대상 실시간 업로드 종단 시험(환경 변수가 없으면 건너뜁니다) ----------
+
+mod live {
+    use super::*;
+    use expandrv_core::config::{
+        BackendConfig, EnvSecrets, FtpConfig, FtpTls, SecretSource, SftpConfig, WebDavConfig,
+    };
+
+    fn env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    }
+
+    fn sftp() -> Option<BackendConfig> {
+        Some(BackendConfig::Sftp(SftpConfig {
+            ssh_shell: false,
+            use_ssh_config: false,
+            host: env("EXPANDRV_TEST_SFTP_HOST")?,
+            port: env("EXPANDRV_TEST_SFTP_PORT")?.parse().ok()?,
+            username: env("EXPANDRV_TEST_SFTP_USER")?,
+            password: Some(SecretSource::Env {
+                var: "EXPANDRV_TEST_SFTP_PASSWORD".into(),
+            }),
+            private_key: None,
+            key_passphrase: None,
+            root: env("EXPANDRV_TEST_SFTP_ROOT").unwrap_or_else(|| "/data".into()),
+            known_hosts: Some(env("EXPANDRV_TEST_SFTP_KNOWN_HOSTS")?.into()),
+        }))
+    }
+
+    fn ftp() -> Option<BackendConfig> {
+        Some(BackendConfig::Ftp(FtpConfig {
+            pinned_cert_sha256: None,
+            host: env("EXPANDRV_TEST_FTP_HOST")?,
+            port: env("EXPANDRV_TEST_FTP_PORT")?.parse().ok()?,
+            username: env("EXPANDRV_TEST_FTP_USER").unwrap_or_else(|| "u".into()),
+            password: Some(SecretSource::Env {
+                var: "EXPANDRV_TEST_FTP_PASS".into(),
+            }),
+            tls: FtpTls::None,
+            encoding: "utf-8".into(),
+            root: env("EXPANDRV_TEST_FTP_ROOT").unwrap_or_else(|| ".".into()),
+        }))
+    }
+
+    fn webdav() -> Option<BackendConfig> {
+        Some(BackendConfig::Webdav(WebDavConfig {
+            url: env("EXPANDRV_TEST_WEBDAV_URL")?,
+            username: Some(env("EXPANDRV_TEST_WEBDAV_USER").unwrap_or_else(|| "u".into())),
+            password: Some(SecretSource::Env {
+                var: "EXPANDRV_TEST_WEBDAV_PASS".into(),
+            }),
+            pinned_cert_sha256: None,
+        }))
+    }
+
+    /// 탐색기 복사 순서(생성, 크기 설정, 순차 쓰기, 정리)를 VFS 실시간 모드로 수행하고 원격 내용을 대조합니다.
+    fn exercise(tag: &str, cfg: BackendConfig) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend = rt
+            .block_on(expandrv_backends::connect(&cfg, None, &EnvSecrets))
+            .unwrap();
+        assert!(backend.capabilities().streaming_upload, "{tag}");
+        let staging = tempfile::tempdir().unwrap();
+        let mut opts = VfsOptions::new(staging.path().join("stage"));
+        opts.op_timeout = Duration::from_secs(30);
+        let vfs = Vfs::new(backend.clone(), rt.handle().clone(), opts).unwrap();
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = p(&format!("/vfs-{tag}-{nanos:x}"));
+        let dh = vfs.create(&dir, EntryKind::Dir).unwrap();
+        vfs.cleanup(&dh, false).unwrap();
+        let file = dir.join("big.bin").unwrap();
+        let data: Vec<u8> = (0..(3 << 20) + 123).map(|i| (i * 31 % 251) as u8).collect();
+
+        let h = vfs.create(&file, EntryKind::File).unwrap();
+        vfs.set_size(&h, data.len() as u64, false).unwrap();
+        let mut off = 0usize;
+        for chunk in data.chunks(1 << 20) {
+            vfs.write(&h, off as u64, chunk, false, false).unwrap();
+            off += chunk.len();
+        }
+        // 크기 힌트와 같아진 마지막 쓰기 안에서 확정됩니다.
+        assert_eq!(vfs.pending_uploads(), 0, "{tag}: 조기 커밋");
+        vfs.cleanup(&h, false).unwrap();
+        vfs.close(&h);
+        let got = rt
+            .block_on(backend.read_range(&file, 0, data.len() as u64))
+            .unwrap();
+        assert_eq!(&got[..], &data[..], "{tag}: 원격 내용");
+        let names: Vec<String> = rt
+            .block_on(backend.list(&dir))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["big.bin"], "{tag}: 임시 파일 흔적");
+
+        // 기존 파일 일부 수정은 정리 때 동기 전체 업로드로 반영됩니다.
+        let h = vfs.open(&file).unwrap();
+        vfs.write(&h, 100, b"ZZZ", false, false).unwrap();
+        vfs.cleanup(&h, false).unwrap();
+        vfs.close(&h);
+        assert_eq!(vfs.pending_uploads(), 0, "{tag}: 부분 수정 동기 반영");
+        let got = rt.block_on(backend.read_range(&file, 100, 3)).unwrap();
+        assert_eq!(&got[..], b"ZZZ", "{tag}");
+        assert_eq!(
+            vfs.take_transfer_events(),
+            vec![
+                TransferEvent::Uploaded(file.clone()),
+                TransferEvent::Uploaded(file.clone())
+            ]
+        );
+
+        let h = vfs.open(&file).unwrap();
+        vfs.check_delete(&h).unwrap();
+        vfs.cleanup(&h, true).unwrap();
+        vfs.close(&h);
+        let dh = vfs.open(&dir).unwrap();
+        vfs.check_delete(&dh).unwrap();
+        vfs.cleanup(&dh, true).unwrap();
+        vfs.close(&dh);
+        vfs.shutdown();
+    }
+
+    #[test]
+    fn through_mode_against_sftp() {
+        match sftp() {
+            Some(cfg) => exercise("sftp", cfg),
+            None => eprintln!("EXPANDRV_TEST_SFTP_*가 없어 건너뜁니다"),
+        }
+    }
+
+    #[test]
+    fn through_mode_against_ftp() {
+        match ftp() {
+            Some(cfg) => exercise("ftp", cfg),
+            None => eprintln!("EXPANDRV_TEST_FTP_*가 없어 건너뜁니다"),
+        }
+    }
+
+    #[test]
+    fn through_mode_against_webdav() {
+        match webdav() {
+            Some(cfg) => exercise("webdav", cfg),
+            None => eprintln!("EXPANDRV_TEST_WEBDAV_URL이 없어 건너뜁니다"),
+        }
+    }
 }

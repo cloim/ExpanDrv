@@ -2,7 +2,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Error, Quota, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Error, Quota, RemotePath, Result, UploadHint,
+    UploadSession, WriteSource,
 };
 use std::{sync::Arc, time::SystemTime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -57,6 +58,28 @@ impl Scheduled {
     }
 }
 
+/// 세션이 열려 있는 동안 연결 슬롯을 쥡니다.
+struct ScheduledUpload {
+    inner: Box<dyn UploadSession>,
+    _permit: (Option<OwnedSemaphorePermit>, OwnedSemaphorePermit),
+}
+
+#[async_trait]
+impl UploadSession for ScheduledUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        self.inner.write(offset, data).await
+    }
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+    async fn finish(self: Box<Self>) -> Result<Entry> {
+        self.inner.finish().await
+    }
+    async fn abort(self: Box<Self>) {
+        self.inner.abort().await;
+    }
+}
+
 pub(crate) fn schedule(inner: Arc<dyn Backend>) -> [Arc<dyn Backend>; 3] {
     let budget = Arc::new(Budget {
         all: Arc::new(Semaphore::new(4)),
@@ -95,6 +118,18 @@ impl Backend for Scheduled {
     async fn write(&self, path: &RemotePath, source: WriteSource) -> Result<Entry> {
         let _permit = self.enter().await?;
         self.inner.write(path, source).await
+    }
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        let permit = self.enter().await?;
+        let inner = self.inner.begin_upload(path, hint).await?;
+        Ok(Box::new(ScheduledUpload {
+            inner,
+            _permit: permit,
+        }))
     }
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
         let _permit = self.enter().await?;

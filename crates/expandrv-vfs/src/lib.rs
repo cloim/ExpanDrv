@@ -4,7 +4,11 @@
 //! 백엔드 비동기 호출을 실행합니다. tokio 작업 스레드 안에서 호출하면 안 됩니다.
 //!
 //! - 읽기: 고정 크기 블록 단위로 받아 메모리 LRU에 두고, 순차 읽기면 다음 블록을 미리 받습니다.
-//! - 쓰기: 로컬 스테이징 파일에 기록하고 마지막 핸들 정리 후 백그라운드에서 업로드합니다(write-back).
+//! - 쓰기(실시간, 기본): 로컬 스테이징 파일에 기록하면서 백엔드 업로드 세션으로 바로 보냅니다(write-through).
+//!   전송 창이 차면 쓰기 호출이 기다리므로 호출 프로그램의 진행률이 실제 전송을 따르고, 마지막 핸들 정리는
+//!   원격 확정까지 기다립니다. 스트리밍할 수 없는 쓰기(기존 파일 일부 수정, 순서 밖 쓰기 등)는 정리 때
+//!   전체 업로드를 동기로 수행합니다.
+//! - 쓰기(백그라운드): 로컬 스테이징 파일에 기록하고 마지막 핸들 정리 후 백그라운드에서 업로드합니다(write-back).
 //!   업로드 중 내용이 다시 바뀌면 진행 중 업로드를 취소하고 다음 정리 때 다시 올립니다.
 //! - 메타: 메모리 TTL 캐시와 SQLite 저장소. 원격이 응답하지 않으면 저장된 목록으로 탐색을 이어갑니다.
 
@@ -22,7 +26,11 @@ pub use throttle::throttle;
 use block::BlockCache;
 use bytes::Bytes;
 use diskcache::DiskCache;
-use expandrv_core::{Backend, Entry, EntryKind, Error, Quota, RemotePath, Result, WriteSource};
+pub use expandrv_core::config::WriteMode;
+use expandrv_core::{
+    Backend, Entry, EntryKind, Error, Quota, RemotePath, Result, UploadHint, UploadSession,
+    WriteSource,
+};
 use meta::{Lookup, MetaCache};
 use parking_lot::Mutex;
 use persist::MetaStore;
@@ -32,16 +40,20 @@ use std::io::Write;
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{NamedTempFile, TempPath};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 /// 일시 오류로 실패한 원격 읽기를 다시 시도하는 횟수와 첫 대기 시간(이후 두 배씩)
 const READ_RETRIES: u32 = 3;
 const READ_RETRY_BASE: Duration = Duration::from_millis(200);
 const OFFLINE_COOLDOWN: Duration = Duration::from_secs(30);
+/// 이 시간 안에 데이터 전송(업로드, 블록 내려받기)이 성공했으면 짧은 확인 조회의 시간 초과를 단절로 보지 않습니다.
+/// 메타데이터 응답은 근거로 삼지 않아, 응답을 멈춘 서버는 이전처럼 바로 오프라인 대기로 들어갑니다.
+/// 큰 파일을 올리는 동안 서버가 목록 조회에 늦게 답하는 경우 드라이브 전체가 오프라인 대기로 바뀌지 않게 합니다.
+const LIVENESS_WINDOW: Duration = Duration::from_secs(10);
 const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 /// 자동 재시도 횟수. 넘으면 다음 정리나 `sync` 때 다시 시도합니다.
@@ -51,6 +63,12 @@ const WATCH_WINDOW: Duration = Duration::from_secs(600);
 const MAX_WATCHED_DIRS: usize = 64;
 /// 소비자가 없을 때 쌓아 둘 변경 알림 상한
 const MAX_PENDING_CHANGES: usize = 10_000;
+/// 실시간 업로드에서 아직 전송되지 않은 채 쌓아 둘 바이트 상한. 차면 쓰기 호출이 기다립니다.
+const STREAM_WINDOW: usize = 16 << 20;
+/// 닫기 단계의 커밋이 실패한 뒤 백그라운드 재시도까지 기다리는 시간
+const COMMIT_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// 동시에 열어 두는 실시간 업로드 세션 수. 세션은 연결 슬롯을 쥐므로 조회용 슬롯을 남깁니다.
+const STREAM_SLOTS: usize = 2;
 /// 이 시간 동안 쓰지 않은 읽기 블록은 메모리에서 비웁니다.
 const BLOCK_IDLE: Duration = Duration::from_secs(20);
 const BLOCK_TRIM_INTERVAL: Duration = Duration::from_secs(10);
@@ -84,6 +102,8 @@ pub struct Change {
 pub enum TransferEvent {
     Uploaded(RemotePath),
     Conflict(RemotePath),
+    /// 호출 프로그램이 닫은 뒤의 커밋이 실패했습니다. 변경분은 저널에 남겨 백그라운드에서 다시 시도합니다.
+    Failed(RemotePath, String),
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +123,8 @@ pub struct VfsOptions {
     pub max_parallel_uploads: usize,
     /// 암호화 디스크 블록 캐시. `None`이면 메모리 캐시만 씁니다.
     pub disk_cache: Option<DiskCacheOptions>,
+    /// 쓰기를 원격에 반영하는 시점
+    pub write_mode: WriteMode,
 }
 
 impl VfsOptions {
@@ -118,6 +140,7 @@ impl VfsOptions {
             meta_db: None,
             max_parallel_uploads: 4,
             disk_cache: None,
+            write_mode: WriteMode::Through,
         }
     }
 }
@@ -142,6 +165,8 @@ struct Shared {
     nodes: Mutex<HashMap<RemotePath, Arc<Node>>>,
     quota: Mutex<Option<(Quota, Instant)>>,
     uploads: Semaphore,
+    /// 실시간 업로드 세션 슬롯. 비어 있으면 정리 때 전체 업로드로 전환합니다.
+    stream_slots: Arc<Semaphore>,
     /// 최근 열거한 디렉터리와 그 시각
     watched: Mutex<HashMap<RemotePath, Instant>>,
     changes: Mutex<Vec<Change>>,
@@ -153,7 +178,11 @@ struct Shared {
     /// 연속 전송 백엔드에서 파일별로 하나씩 도는 순차 선행 읽기 범위
     seq_prefetch: Mutex<HashMap<RemotePath, SeqPrefetch>>,
     offline_until: Mutex<Option<Instant>>,
+    /// 마지막으로 데이터 전송이 성공한 시각
+    alive_at: Arc<Mutex<Option<Instant>>>,
     events: Mutex<Vec<TransferEvent>>,
+    /// 마지막 업로드 집계. 노드 표 잠금이 바쁠 때 돌려줍니다.
+    last_counts: Mutex<UploadCounts>,
     background: Mutex<Vec<AbortHandle>>,
 }
 
@@ -184,7 +213,14 @@ struct Node {
     /// Cleanup 전인 핸들 수
     opens: AtomicUsize,
     state: Mutex<NodeState>,
+    /// 마지막으로 확인한 업로드 상태([`UPLOAD_NONE`] 등). 상태 잠금이 바쁠 때 집계에 씁니다.
+    upload_class: AtomicU8,
 }
+
+const UPLOAD_NONE: u8 = 0;
+const UPLOAD_ACTIVE: u8 = 1;
+const UPLOAD_WAITING: u8 = 2;
+const UPLOAD_FAILED: u8 = 3;
 
 struct NodeState {
     entry: Entry,
@@ -206,6 +242,165 @@ struct NodeState {
     recovered: bool,
     /// 끊긴 스테이징 다운로드(파일, 받은 바이트, 원격 버전). 같은 버전이면 이어받습니다.
     partial: Option<(NamedTempFile, u64, String)>,
+    /// 진행 중인 실시간 업로드 세션
+    stream: Option<StreamState>,
+    /// 스테이징 내용이 빈 파일에서 시작했는지 여부. 원격 내용을 내려받아 고치는 중이면 false입니다.
+    fresh: bool,
+    /// 스트리밍을 포기하고 정리 때 전체 업로드로 반영해야 하는 상태
+    fallback: bool,
+    /// 데이터를 쓰기 전에 호출 프로그램이 알려 준 최종 크기
+    size_hint: Option<u64>,
+    /// 정리 단계의 동기 커밋이 진행 중
+    committing: bool,
+    /// 원격에 아직 없는 새 파일(실시간 모드의 지연 생성). 확정 전까지 이름 변경과 삭제는 로컬에서만 처리합니다.
+    local_only: bool,
+    /// 백그라운드 업로드가 연결을 얻어 실제로 전송 중
+    transferring: bool,
+}
+
+/// 업로드가 끝나지 않은 파일 수를 상태별로 나눈 값
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UploadCounts {
+    /// 전송 중이거나, 호출 프로그램이 아직 쓰는 중이라 닫을 때 바로 반영할 파일
+    pub uploading: usize,
+    /// 백그라운드 업로드를 기다리는 파일
+    pub waiting: usize,
+    /// 마지막 업로드 시도가 실패해 다시 시도를 기다리는 파일
+    pub failed: usize,
+}
+
+impl UploadCounts {
+    pub fn total(&self) -> usize {
+        self.uploading + self.waiting + self.failed
+    }
+}
+
+/// 실시간 업로드 세션의 호출 측 상태. 세션 자체는 tokio 작업이 쥐고 명령 채널로 받습니다.
+struct StreamState {
+    _slot: OwnedSemaphorePermit,
+    tx: mpsc::UnboundedSender<StreamCmd>,
+    window: Arc<Semaphore>,
+    failed: Arc<Mutex<Option<Error>>>,
+    random: bool,
+    /// 순차 전용 세션이 다음에 받아야 할 오프셋
+    next: u64,
+    /// 보낸 바이트 합계와 가장 큰 끝 오프셋. 둘이 같으면 겹침 없이 이어 보낸 것입니다.
+    sent: u64,
+    max_end: u64,
+}
+
+enum StreamCmd {
+    Write(u64, Bytes, OwnedSemaphorePermit),
+    Flush(oneshot::Sender<Result<()>>),
+    Finish(oneshot::Sender<Result<Entry>>),
+    Abort,
+}
+
+impl StreamState {
+    fn abort(self) {
+        let _ = self.tx.send(StreamCmd::Abort);
+    }
+
+    fn error(&self) -> Option<Error> {
+        self.failed.lock().as_ref().map(clone_error)
+    }
+}
+
+/// 세션을 소비하며 명령을 처리합니다. 한 번 실패하면 이후 명령은 같은 오류로 답합니다.
+async fn pump_stream(
+    mut session: Box<dyn UploadSession>,
+    mut rx: mpsc::UnboundedReceiver<StreamCmd>,
+    failed: Arc<Mutex<Option<Error>>>,
+    alive: Arc<Mutex<Option<Instant>>>,
+) {
+    let mut error: Option<Error> = None;
+    let record = |e: Error, error: &mut Option<Error>| {
+        *failed.lock() = Some(clone_error(&e));
+        *error = Some(e);
+    };
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            StreamCmd::Write(offset, data, permit) => {
+                if error.is_none() {
+                    match session.write(offset, data).await {
+                        Ok(()) => *alive.lock() = Some(Instant::now()),
+                        Err(e) => record(e, &mut error),
+                    }
+                }
+                drop(permit);
+            }
+            StreamCmd::Flush(reply) => {
+                let r = match &error {
+                    Some(e) => Err(clone_error(e)),
+                    None => match session.flush().await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            let out = clone_error(&e);
+                            record(e, &mut error);
+                            Err(out)
+                        }
+                    },
+                };
+                let _ = reply.send(r);
+            }
+            StreamCmd::Finish(reply) => {
+                let r = match &error {
+                    Some(e) => {
+                        session.abort().await;
+                        Err(clone_error(e))
+                    }
+                    None => session.finish().await,
+                };
+                let _ = reply.send(r);
+                return;
+            }
+            StreamCmd::Abort => {
+                session.abort().await;
+                return;
+            }
+        }
+    }
+    session.abort().await;
+}
+
+/// 잠금을 잡습니다. tokio 작업 스레드에서 잠금이 바쁘면 그 스레드를 런타임에 돌려준 뒤 기다립니다.
+///
+/// 파일 시스템 요청은 노드 잠금을 쥔 채 원격 응답을 기다릴 수 있습니다. 작업 스레드가 같은 잠금에서
+/// 그냥 기다리면, 그 스레드가 맡던 네트워크 이벤트와 타이머 처리가 멈춰 원격 응답이 오지 않는 교착이
+/// 생깁니다. 바쁘지 않으면 바로 잡으므로 평소 비용은 없습니다.
+fn lock_in_task<T>(m: &Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
+    if let Some(guard) = m.try_lock() {
+        return guard;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| m.lock())
+        }
+        _ => m.lock(),
+    }
+}
+
+/// 오류를 여러 호출자에게 전달하기 위한 복제. 입출력 오류는 종류와 메시지를 보존합니다.
+fn clone_error(e: &Error) -> Error {
+    match e {
+        Error::NotFound => Error::NotFound,
+        Error::AlreadyExists => Error::AlreadyExists,
+        Error::NotADirectory => Error::NotADirectory,
+        Error::IsADirectory => Error::IsADirectory,
+        Error::DirectoryNotEmpty => Error::DirectoryNotEmpty,
+        Error::PermissionDenied => Error::PermissionDenied,
+        Error::ReadOnly => Error::ReadOnly,
+        Error::InvalidPath(s) => Error::InvalidPath(s.clone()),
+        Error::Unsupported(s) => Error::Unsupported(s),
+        Error::Auth(s) => Error::Auth(s.clone()),
+        Error::Timeout => Error::Timeout,
+        Error::Cancelled => Error::Cancelled,
+        Error::StorageFull => Error::StorageFull,
+        Error::Network(s) => Error::Network(s.clone()),
+        Error::Protocol(s) => Error::Protocol(s.clone()),
+        Error::Config(s) => Error::Config(s.clone()),
+        Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
+    }
 }
 
 impl Drop for NodeState {
@@ -227,7 +422,27 @@ impl NodeState {
         if let Some((_, h)) = self.upload.take() {
             h.abort();
         }
+        self.transferring = false;
         self.generation += 1;
+    }
+
+    /// 실시간 세션을 버리고 정리 때 전체 업로드로 전환합니다.
+    fn drop_stream(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            stream.abort();
+        }
+        self.fallback = true;
+    }
+
+    /// 스테이징을 빈 내용으로 되돌립니다. 이후 쓰기는 새 세션으로 스트리밍할 수 있습니다.
+    fn reset_fresh(&mut self, staged: NamedTempFile) {
+        if let Some(stream) = self.stream.take() {
+            stream.abort();
+        }
+        self.staged = Some(staged);
+        self.fresh = true;
+        self.fallback = false;
+        self.size_hint = None;
     }
 }
 
@@ -287,13 +502,27 @@ impl Shared {
         let result = tokio::time::timeout(timeout, fut)
             .await
             .unwrap_or(Err(Error::Timeout));
+        // 저장본이 있는 짧은 확인 조회가 늦었을 뿐이고 서버가 최근까지 응답했다면, 이번 호출만
+        // 저장본으로 답하고 드라이브 전체를 오프라인 대기로 돌리지 않습니다.
+        let busy_but_alive =
+            cached && matches!(result, Err(Error::Timeout)) && self.recently_alive();
         let mut until = self.offline_until.lock();
-        if result.as_ref().is_err_and(offline) {
+        if result.as_ref().is_err_and(offline) && !busy_but_alive {
             *until = Some(Instant::now() + OFFLINE_COOLDOWN);
         } else if result.is_ok() {
             *until = None;
         }
         result
+    }
+
+    fn mark_alive(&self) {
+        *self.alive_at.lock() = Some(Instant::now());
+    }
+
+    fn recently_alive(&self) -> bool {
+        self.alive_at
+            .lock()
+            .is_some_and(|at| at.elapsed() < LIVENESS_WINDOW)
     }
 
     fn spawn_background(&self, work: impl Future<Output = ()> + Send + 'static) {
@@ -428,13 +657,13 @@ impl Shared {
 
     /// 정리가 끝나고 업로드도 없는 노드를 핸들 테이블에서 뺍니다.
     fn release(&self, node: &Arc<Node>) {
-        let mut nodes = self.nodes.lock();
+        let mut nodes = lock_in_task(&self.nodes);
         if node.opens.load(Ordering::SeqCst) != 0 {
             return;
         }
         {
-            let st = node.state.lock();
-            if (st.dirty && !st.deleted) || st.upload.is_some() {
+            let st = lock_in_task(&node.state);
+            if (st.dirty && !st.deleted) || st.upload.is_some() || st.committing {
                 return;
             }
         }
@@ -445,7 +674,7 @@ impl Shared {
     }
 
     fn schedule_upload(self: &Arc<Self>, node: &Arc<Node>, delay: Duration) {
-        let mut st = node.state.lock();
+        let mut st = lock_in_task(&node.state);
         if !st.dirty || st.deleted || st.upload.is_some() || self.closed.load(Ordering::SeqCst) {
             return;
         }
@@ -459,8 +688,8 @@ impl Shared {
                 return;
             };
             let job = {
-                let st = n.state.lock();
-                match &st.staged {
+                let mut st = lock_in_task(&n.state);
+                let job = match &st.staged {
                     Some(staged) if st.generation == generation && !st.deleted => Some((
                         n.path.lock().clone(),
                         WriteSource::File {
@@ -471,7 +700,9 @@ impl Shared {
                         st.recovered.then(|| st.base_etag.clone()).flatten(),
                     )),
                     _ => None,
-                }
+                };
+                st.transferring = job.is_some();
+                job
             };
             let Some((path, source, mtime, recovered_base)) = job else {
                 s.upload_done(&n, generation, None, None);
@@ -490,6 +721,7 @@ impl Shared {
                     remote_kept = Some(remote);
                 }
                 let mut e = s.background_backend.write(&target, source).await?;
+                s.mark_alive();
                 if let Some(m) = mtime.filter(|_| s.backend.capabilities().set_mtime) {
                     s.background_backend.set_mtime(&target, m).await?;
                     e.modified = Some(m);
@@ -515,12 +747,13 @@ impl Shared {
         outcome: Option<(RemotePath, Result<Entry>)>,
         conflict: Option<RemotePath>,
     ) {
-        let mut st = node.state.lock();
+        let mut st = lock_in_task(&node.state);
         // 취소된 이전 작업이 늦게 끝난 경우 현재 업로드 상태를 건드리지 않습니다.
         if !matches!(st.upload, Some((g, _)) if g == generation) {
             return;
         }
         st.upload = None;
+        st.transferring = false;
         match outcome {
             Some((path, Ok(entry))) if st.generation == generation && !st.deleted => {
                 tracing::debug!(%path, size = entry.size, "업로드 완료");
@@ -528,23 +761,7 @@ impl Shared {
                     Some(target) => TransferEvent::Conflict(target),
                     None => TransferEvent::Uploaded(path.clone()),
                 });
-                st.entry = entry.clone();
-                st.dirty = false;
-                st.staged = None;
-                st.pending_mtime = None;
-                st.failures = 0;
-                st.base_etag = None;
-                st.recovered = false;
-                if st.journaled.take().is_some()
-                    && let Some(store) = &self.store
-                    && let Err(e) = store.journal_remove(&path)
-                {
-                    tracing::warn!(%path, error = %e, "업로드 저널 정리 실패");
-                }
-                self.meta.invalidate(&path);
-                self.persist_entry(&path, &entry);
-                self.meta.put_entry(&path, entry);
-                self.drop_blocks(&path);
+                self.finalize_upload(&path, &mut st, entry);
             }
             Some((path, Err(e))) => {
                 st.failures += 1;
@@ -556,10 +773,188 @@ impl Shared {
         let delay = Duration::from_secs(1 << st.failures.min(6));
         drop(st);
         if retry && node.opens.load(Ordering::SeqCst) == 0 {
-            let first = node.state.lock().failures == 0;
+            let first = lock_in_task(&node.state).failures == 0;
             self.schedule_upload(node, if first { Duration::ZERO } else { delay });
         }
         self.release(node);
+    }
+
+    /// 원격에 반영된 항목으로 노드 상태, 저널, 메타와 블록 캐시를 맞춥니다.
+    fn finalize_upload(&self, path: &RemotePath, st: &mut NodeState, entry: Entry) {
+        st.entry = entry.clone();
+        st.dirty = false;
+        st.staged = None;
+        st.pending_mtime = None;
+        st.failures = 0;
+        st.base_etag = None;
+        st.recovered = false;
+        st.fresh = false;
+        st.fallback = false;
+        st.size_hint = None;
+        st.local_only = false;
+        st.transferring = false;
+        if let Some(stream) = st.stream.take() {
+            stream.abort();
+        }
+        if st.journaled.take().is_some()
+            && let Some(store) = &self.store
+            && let Err(e) = store.journal_remove(path)
+        {
+            tracing::warn!(%path, error = %e, "업로드 저널 정리 실패");
+        }
+        self.meta.invalidate(path);
+        self.persist_entry(path, &entry);
+        self.meta.put_entry(path, entry);
+        self.drop_blocks(path);
+    }
+
+    /// 변경분을 업로드 저널에 기록합니다. 스테이징 파일이 바뀌었으면 기록을 갱신합니다.
+    fn journal(&self, path: &RemotePath, st: &mut NodeState) {
+        let (Some(store), Some(staged)) = (&self.store, &st.staged) else {
+            return;
+        };
+        if st.journaled.as_deref() == Some(staged.path()) {
+            return;
+        }
+        if st.journaled.is_none() {
+            st.base_etag = st.entry.etag.clone();
+        }
+        match store.journal_put(path, staged.path(), st.base_etag.as_deref()) {
+            Ok(()) => st.journaled = Some(staged.path().to_owned()),
+            Err(e) => tracing::warn!(%path, error = %e, "업로드 저널 기록 실패"),
+        }
+    }
+
+    /// 실시간 업로드 세션을 엽니다. 열지 못하면 정리 때 전체 업로드로 전환합니다.
+    fn open_stream(self: &Arc<Self>, path: &RemotePath, st: &mut NodeState) {
+        let caps = self.backend.capabilities();
+        let hint = UploadHint {
+            size: st.size_hint,
+            new_file: st.local_only,
+        };
+        let Ok(slot) = self.stream_slots.clone().try_acquire_owned() else {
+            tracing::debug!(%path, "실시간 업로드 슬롯이 없어 정리 때 올립니다");
+            st.fallback = true;
+            return;
+        };
+        let session = match self.run(self.backend.begin_upload(path, hint)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(%path, error = %e, "실시간 업로드 세션을 열지 못해 정리 때 올립니다");
+                st.fallback = true;
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let failed = Arc::new(Mutex::new(None));
+        self.spawn_background(pump_stream(
+            session,
+            rx,
+            failed.clone(),
+            self.alive_at.clone(),
+        ));
+        st.stream = Some(StreamState {
+            _slot: slot,
+            tx,
+            window: Arc::new(Semaphore::new(STREAM_WINDOW)),
+            failed,
+            random: caps.random_write,
+            next: 0,
+            sent: 0,
+            max_end: 0,
+        });
+    }
+
+    /// 마지막 핸들이 닫힌 노드의 변경분을 지금 원격에 반영합니다(실시간 모드).
+    ///
+    /// 세션이 있으면 확정하고, 없거나 실패했으면 스테이징 파일 전체를 올립니다. 그래도 실패하면
+    /// 저널에 남기고 [`TransferEvent::Failed`]로 알린 뒤 백그라운드 재시도를 예약합니다.
+    /// `from_caller`가 true면 호출 프로그램이 결과를 받으므로 실패를 그대로 돌려주고 정리 때 다시
+    /// 시도하게 둡니다. false면 알림과 저널, 백그라운드 재시도로 넘깁니다.
+    fn commit_now(self: &Arc<Self>, node: &Arc<Node>, from_caller: bool) -> Result<()> {
+        loop {
+            let mut st = node.state.lock();
+            if !st.dirty || st.deleted || st.committing || self.closed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let Some(staged) = st.staged.as_ref() else {
+                return Ok(());
+            };
+            let generation = st.generation;
+            let path = node.path.lock().clone();
+            let full = WriteSource::File {
+                path: staged.path().to_owned(),
+                size: st.entry.size,
+            };
+            let stream = st.stream.take();
+            let mtime = st.pending_mtime;
+            // 예약된 백그라운드 업로드가 있으면 지금 커밋으로 대신합니다.
+            if let Some((_, h)) = st.upload.take() {
+                h.abort();
+            }
+            st.committing = true;
+            drop(st);
+
+            let mut result = match stream {
+                Some(stream) => {
+                    let (reply, wait) = oneshot::channel();
+                    match stream.tx.send(StreamCmd::Finish(reply)) {
+                        Ok(()) => self.run(async { wait.await.unwrap_or(Err(Error::Cancelled)) }),
+                        Err(_) => Err(Error::Cancelled),
+                    }
+                }
+                None => Err(Error::Cancelled),
+            };
+            if let Err(e) = &result {
+                if !matches!(e, Error::Cancelled) {
+                    tracing::warn!(%path, error = %e, "실시간 업로드 확정 실패: 전체 업로드로 전환");
+                }
+                result = self.rt.block_on(self.backend.write(&path, full));
+            }
+            if let Ok(entry) = &mut result
+                && let Some(m) = mtime.filter(|_| self.backend.capabilities().set_mtime)
+            {
+                match self.run(self.backend.set_mtime(&path, m)) {
+                    Ok(()) => entry.modified = Some(m),
+                    Err(e) => tracing::warn!(%path, error = %e, "수정 시각 반영 실패"),
+                }
+            }
+
+            let mut st = node.state.lock();
+            st.committing = false;
+            if st.generation != generation || st.deleted {
+                // 커밋 중에 내용이 다시 바뀌었습니다. 핸들이 없으면 새 내용을 이어서 올립니다.
+                drop(st);
+                if node.opens.load(Ordering::SeqCst) == 0 {
+                    continue;
+                }
+                return Ok(());
+            }
+            return match result {
+                Ok(entry) => {
+                    tracing::debug!(%path, size = entry.size, "실시간 업로드 완료");
+                    self.event(TransferEvent::Uploaded(path.clone()));
+                    self.finalize_upload(&path, &mut st, entry);
+                    Ok(())
+                }
+                Err(e) if from_caller => {
+                    tracing::warn!(%path, error = %e, "업로드 확정 실패: 호출 프로그램에 알립니다");
+                    st.fallback = true;
+                    Err(e)
+                }
+                Err(e) => {
+                    tracing::warn!(%path, error = %e, "닫기 단계 업로드 실패: 저널에 남기고 다시 시도합니다");
+                    self.journal(&path, &mut st);
+                    st.failures = 1;
+                    self.event(TransferEvent::Failed(path, e.to_string()));
+                    drop(st);
+                    if node.opens.load(Ordering::SeqCst) == 0 {
+                        self.schedule_upload(node, COMMIT_RETRY_DELAY);
+                    }
+                    Err(e)
+                }
+            };
+        }
     }
 
     fn fetch_block(
@@ -582,6 +977,8 @@ impl Shared {
         self.blocks.finish_inflight(path, idx);
         if got.as_ref().is_err_and(offline) {
             *self.offline_until.lock() = Some(Instant::now() + OFFLINE_COOLDOWN);
+        } else if got.as_ref().is_ok_and(|b| b.is_some()) {
+            self.mark_alive();
         }
         match got? {
             Some(b) => Ok(b),
@@ -833,6 +1230,7 @@ impl Shared {
                 kind: EntryKind::File,
                 path: Mutex::new(path.clone()),
                 opens: AtomicUsize::new(0),
+                upload_class: AtomicU8::new(UPLOAD_NONE),
                 state: Mutex::new(NodeState {
                     entry,
                     staged: Some(NamedTempFile::from_parts(file, temp)),
@@ -846,6 +1244,13 @@ impl Shared {
                     base_etag,
                     recovered: true,
                     partial: None,
+                    stream: None,
+                    fresh: false,
+                    fallback: false,
+                    size_hint: None,
+                    committing: false,
+                    local_only: false,
+                    transferring: false,
                 }),
             });
             self.nodes.lock().insert(path, node.clone());
@@ -934,6 +1339,7 @@ impl Vfs {
             nodes: Mutex::new(HashMap::new()),
             quota: Mutex::new(None),
             uploads: Semaphore::new(opts.max_parallel_uploads.max(1)),
+            stream_slots: Arc::new(Semaphore::new(STREAM_SLOTS)),
             watched: Mutex::new(HashMap::new()),
             changes: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
@@ -941,7 +1347,9 @@ impl Vfs {
             downloads: AtomicUsize::new(0),
             seq_prefetch: Mutex::new(HashMap::new()),
             offline_until: Mutex::new(None),
+            alive_at: Arc::new(Mutex::new(None)),
             events: Mutex::new(Vec::new()),
+            last_counts: Mutex::new(UploadCounts::default()),
             background: Mutex::new(Vec::new()),
             opts,
         });
@@ -971,8 +1379,12 @@ impl Vfs {
         self.s.closed.store(true, Ordering::SeqCst);
         let mut tasks = std::mem::take(&mut *self.s.background.lock());
         for node in self.s.nodes.lock().values() {
-            if let Some((_, task)) = node.state.lock().upload.take() {
+            let mut st = node.state.lock();
+            if let Some((_, task)) = st.upload.take() {
                 tasks.push(task);
+            }
+            if let Some(stream) = st.stream.take() {
+                stream.abort();
             }
         }
         for task in &tasks {
@@ -1120,15 +1532,20 @@ impl Vfs {
                 }
             }
         };
-        let overlay: Vec<(String, Entry)> = {
+        let overlay: Vec<(String, Entry, bool)> = {
             let nodes = s.nodes.lock();
             nodes
                 .iter()
                 .filter(|(p, _)| p.parent().as_ref() == Some(path))
                 .filter_map(|(p, n)| {
                     let st = n.state.lock();
-                    (st.dirty || st.staged.is_some())
-                        .then(|| (p.name().unwrap_or_default().to_owned(), st.entry.clone()))
+                    ((st.dirty || st.staged.is_some()) && !st.deleted).then(|| {
+                        (
+                            p.name().unwrap_or_default().to_owned(),
+                            st.entry.clone(),
+                            st.local_only,
+                        )
+                    })
                 })
                 .collect()
         };
@@ -1136,9 +1553,12 @@ impl Vfs {
             return Ok(list);
         }
         let mut out = (*list).clone();
-        for (name, e) in overlay {
+        for (name, e, local_only) in overlay {
             if let Some(slot) = out.iter_mut().find(|x| x.name == name) {
                 *slot = e;
+            } else if local_only {
+                // 원격에 아직 없는 새 파일도 쓰는 동안 목록에 보여 줍니다.
+                out.push(e);
             }
         }
         Ok(Arc::new(out))
@@ -1153,6 +1573,7 @@ impl Vfs {
                     kind: entry.kind,
                     path: Mutex::new(path),
                     opens: AtomicUsize::new(0),
+                    upload_class: AtomicU8::new(UPLOAD_NONE),
                     state: Mutex::new(NodeState {
                         entry,
                         staged: None,
@@ -1166,6 +1587,13 @@ impl Vfs {
                         base_etag: None,
                         recovered: false,
                         partial: None,
+                        stream: None,
+                        fresh: false,
+                        fallback: false,
+                        size_hint: None,
+                        committing: false,
+                        local_only: false,
+                        transferring: false,
                     }),
                 })
             })
@@ -1196,6 +1624,31 @@ impl Vfs {
             return Err(Error::NotADirectory);
         }
         let s = &self.s;
+        // 삭제 표시만 남은 옛 노드를 새 항목이 이어받지 않게 합니다.
+        {
+            let mut nodes = s.nodes.lock();
+            if nodes.get(path).is_some_and(|n| n.state.lock().deleted) {
+                nodes.remove(path);
+            }
+        }
+        if kind == EntryKind::File && self.through() {
+            // 실시간 모드는 원격에 빈 파일을 먼저 만들지 않고 첫 쓰기나 닫기 때 한 번에 만듭니다.
+            // 파일마다 원격 왕복이 한 세트 줄고, 다 쓰지 않은 0바이트 파일이 원격에 먼저 보이지 않습니다.
+            let now = SystemTime::now();
+            let mut entry = Entry::file(path.name().unwrap_or_default(), 0);
+            entry.modified = Some(now);
+            entry.created = Some(now);
+            let staged = NamedTempFile::new_in(&s.opts.staging_dir)?;
+            let h = self.attach(path.clone(), entry);
+            {
+                let mut st = h.node.state.lock();
+                st.reset_fresh(staged);
+                st.local_only = true;
+                st.dirty = true;
+            }
+            s.meta.invalidate(path);
+            return Ok(h);
+        }
         let entry = match kind {
             EntryKind::Dir => s.run(s.backend.mkdir(path))?,
             EntryKind::File => s.run(s.backend.write(path, WriteSource::Bytes(Bytes::new())))?,
@@ -1262,22 +1715,19 @@ impl Vfs {
         Ok((pos - offset) as usize)
     }
 
-    /// 변경 표시와 함께 업로드 저널에 기록합니다. 스테이징 파일이 바뀌었으면 기록을 갱신합니다.
+    /// 변경 표시. 백그라운드 모드에서는 업로드 저널에도 기록합니다.
+    ///
+    /// 실시간 모드는 호출 프로그램이 닫기까지 완료를 확인하지 않았으므로 열린 파일을 저널에 남기지
+    /// 않습니다. 남기면 다음 실행에서 불완전한 내용을 완성본처럼 올리게 됩니다.
     fn mark_dirty(&self, path: &RemotePath, st: &mut NodeState) {
         st.dirty = true;
-        let (Some(store), Some(staged)) = (&self.s.store, &st.staged) else {
-            return;
-        };
-        if st.journaled.as_deref() == Some(staged.path()) {
-            return;
+        if self.s.opts.write_mode == WriteMode::Back {
+            self.s.journal(path, st);
         }
-        if st.journaled.is_none() {
-            st.base_etag = st.entry.etag.clone();
-        }
-        match store.journal_put(path, staged.path(), st.base_etag.as_deref()) {
-            Ok(()) => st.journaled = Some(staged.path().to_owned()),
-            Err(e) => tracing::warn!(%path, error = %e, "업로드 저널 기록 실패"),
-        }
+    }
+
+    fn through(&self) -> bool {
+        self.s.opts.write_mode == WriteMode::Through
     }
 
     /// 스테이징 파일이 없으면 만들고 현재 원격 내용을 채웁니다.
@@ -1296,6 +1746,7 @@ impl Vfs {
             }
             _ => (NamedTempFile::new_in(&s.opts.staging_dir)?, 0),
         };
+        st.fresh = size == 0;
         while done < size {
             let idx = done / bs;
             let block = match s.fetch_block(path, &ver, idx, size) {
@@ -1332,7 +1783,40 @@ impl Vfs {
     ) -> Result<(usize, Entry)> {
         self.writable()?;
         let path = h.path();
+        // 실시간 세션이 있으면 전송 창 자리를 잠금 밖에서 먼저 받습니다. 창이 찰 때만 여기서 기다리므로
+        // 진행률이 실제 전송을 따르고, 기다리는 동안 같은 파일의 다른 요청과 폴더 조회는 막히지 않습니다.
+        // 세션으로 보내기는 아래 잠금 안에서 해, 여러 스레드가 동시에 써도 조각과 확정 순서가 뒤바뀌지 않습니다.
+        let reserved = if self.through() && !data.is_empty() {
+            let window = h
+                .node
+                .state
+                .lock()
+                .stream
+                .as_ref()
+                .map(|s| s.window.clone());
+            match window {
+                Some(window) => {
+                    let want = data.len().min(STREAM_WINDOW) as u32;
+                    self.s
+                        .run(async move {
+                            window
+                                .acquire_many_owned(want)
+                                .await
+                                .map_err(|_| Error::Cancelled)
+                        })
+                        .ok()
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut st = h.node.state.lock();
+        // 세션이 이미 실패했으면 호출 프로그램에 알리고 정리 때 전체 업로드로 전환합니다.
+        if let Some(e) = st.stream.as_ref().and_then(StreamState::error) {
+            st.drop_stream();
+            return Err(e);
+        }
         st.begin_change();
         self.ensure_staged(&path, &mut st)?;
         let size = st.entry.size;
@@ -1353,7 +1837,65 @@ impl Vfs {
         st.entry.size = size.max(off + data.len() as u64);
         st.entry.modified = Some(SystemTime::now());
         self.mark_dirty(&path, &mut st);
-        Ok((data.len(), st.entry.clone()))
+        let entry = st.entry.clone();
+        if !self.through() || data.is_empty() {
+            return Ok((data.len(), entry));
+        }
+
+        // 실시간 모드: 세션을 열거나 이어서 보냅니다.
+        if st.stream.is_none()
+            && st.fresh
+            && !st.fallback
+            && !st.committing
+            && self.s.backend.capabilities().streaming_upload
+        {
+            self.s.open_stream(&path, &mut st);
+        }
+        let Some(stream) = st.stream.as_mut() else {
+            st.fallback = true;
+            return Ok((data.len(), entry));
+        };
+        if !stream.random && off != stream.next {
+            tracing::debug!(%path, off, expected = stream.next, "순서 밖 쓰기: 정리 때 전체 업로드");
+            st.drop_stream();
+            return Ok((data.len(), entry));
+        }
+        // 미리 받은 자리가 지금 세션의 창이면 쓰고, 그사이 세션이 바뀌었으면(첫 쓰기 포함) 새 창에서
+        // 기다리지 않고 받습니다. 받을 수 없으면 순서를 지킬 수 없으므로 정리 때 전체 업로드로 넘깁니다.
+        let want = data.len().min(STREAM_WINDOW) as u32;
+        let permit = match reserved {
+            Some(p) if Arc::ptr_eq(p.semaphore(), &stream.window) => Some(p),
+            _ => stream.window.clone().try_acquire_many_owned(want).ok(),
+        };
+        let Some(permit) = permit else {
+            tracing::debug!(%path, "전송 창이 가득 차 정리 때 전체 업로드");
+            st.drop_stream();
+            return Ok((data.len(), entry));
+        };
+        let end = off + data.len() as u64;
+        stream.next = end;
+        stream.sent += data.len() as u64;
+        stream.max_end = stream.max_end.max(end);
+        // 잠금을 쥔 채 보내 다른 스레드의 조각이나 확정 명령보다 앞서도록 순서를 고정합니다.
+        let sent = stream
+            .tx
+            .send(StreamCmd::Write(off, Bytes::copy_from_slice(data), permit));
+        if sent.is_err() {
+            let e = stream.error().unwrap_or(Error::Cancelled);
+            st.drop_stream();
+            return Err(e);
+        }
+        let complete = st.size_hint.is_some_and(|n| {
+            let stream = st.stream.as_ref().expect("stream");
+            stream.sent == n && stream.max_end == n
+        });
+        drop(st);
+        let s = &self.s;
+        if complete {
+            // 마지막 바이트가 도착했으므로 지금 확정합니다. 실패는 이 쓰기의 결과로 돌려줍니다.
+            s.commit_now(&h.node, true)?;
+        }
+        Ok((data.len(), entry))
     }
 
     /// 파일 크기를 바꿉니다. 할당 크기 요청은 현재 크기보다 작을 때만 잘라냅니다.
@@ -1366,9 +1908,18 @@ impl Vfs {
         st.begin_change();
         let path = h.path();
         if new_size == 0 {
-            st.staged = Some(NamedTempFile::new_in(&self.s.opts.staging_dir)?);
+            st.reset_fresh(NamedTempFile::new_in(&self.s.opts.staging_dir)?);
         } else {
             self.ensure_staged(&path, &mut st)?;
+            if self.through() {
+                match &st.stream {
+                    // 데이터를 보내기 전의 크기 설정은 최종 크기 힌트로 씁니다.
+                    None if st.fresh && st.entry.size == 0 => st.size_hint = Some(new_size),
+                    None => st.size_hint = None,
+                    // 보내는 중의 크기 변경은 세션으로 표현할 수 없어 정리 때 전체 업로드로 전환합니다.
+                    Some(_) => st.drop_stream(),
+                }
+            }
         }
         st.staged
             .as_ref()
@@ -1431,6 +1982,9 @@ impl Vfs {
         if h.is_dir() && !s.backend.capabilities().rename_dir {
             return Err(Error::Unsupported("디렉터리 이름 변경"));
         }
+        if !h.is_dir() && h.node.state.lock().local_only {
+            return self.rename_local(h, &from, to, replace);
+        }
 
         // 옛 경로로 가는 업로드를 멈추고 이름 변경 뒤 새 경로로 다시 올립니다.
         // 원격 호출 동안 노드 테이블 잠금을 쥐지 않도록 대상만 먼저 모읍니다.
@@ -1440,6 +1994,10 @@ impl Vfs {
             if st.upload.is_some() {
                 st.begin_change();
                 requeue.push(node.1.clone());
+            }
+            // 열린 세션은 옛 경로로 확정되므로 버리고 정리 때 새 경로로 전체 업로드합니다.
+            if st.stream.is_some() {
+                st.drop_stream();
             }
         }
         if let Err(e) = s.run(s.backend.rename(&from, to, replace)) {
@@ -1483,6 +2041,43 @@ impl Vfs {
         Ok(())
     }
 
+    /// 원격에 아직 없는 새 파일의 이름 변경. 원격 호출 없이 노드만 옮기고 확정 때 새 경로로 올립니다.
+    fn rename_local(
+        &self,
+        h: &FileHandle,
+        from: &RemotePath,
+        to: &RemotePath,
+        replace: bool,
+    ) -> Result<()> {
+        let s = &self.s;
+        if !to.as_str().eq_ignore_ascii_case(from.as_str()) {
+            match self.stat(to) {
+                Ok((_, e)) if e.is_dir() => return Err(Error::IsADirectory),
+                Ok(_) if !replace => return Err(Error::AlreadyExists),
+                Ok(_) | Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        {
+            let mut st = h.node.state.lock();
+            // 열린 세션은 옛 경로로 확정되므로 버리고 정리 때 새 경로로 올립니다.
+            if st.stream.is_some() {
+                st.drop_stream();
+            }
+            st.entry.name = to.name().unwrap_or_default().to_owned();
+        }
+        {
+            let mut nodes = s.nodes.lock();
+            if let Some(node) = nodes.remove(from) {
+                *node.path.lock() = to.clone();
+                nodes.insert(to.clone(), node);
+            }
+        }
+        s.meta.invalidate(from);
+        s.meta.invalidate(to);
+        Ok(())
+    }
+
     /// 상위 경로를 원격의 실제 대소문자로 맞춘 대상 경로. 마지막 이름은 요청 그대로 둡니다.
     fn real_target(&self, to: &RemotePath) -> Result<RemotePath> {
         let (Some(parent), Some(name)) = (to.parent(), to.name()) else {
@@ -1495,26 +2090,67 @@ impl Vfs {
         real.join(name)
     }
 
-    /// 핸들 정리. `delete`면 원격에서 삭제하고, 마지막 핸들이면 변경분 업로드를 예약합니다.
+    /// 핸들 정리. `delete`면 원격에서 삭제합니다. 마지막 핸들이면 실시간 모드는 변경분을 지금 원격에
+    /// 반영하고 돌아오며, 백그라운드 모드는 업로드를 예약합니다.
     pub fn cleanup(&self, h: &FileHandle, delete: bool) -> Result<()> {
         let remaining = h.node.opens.fetch_sub(1, Ordering::SeqCst) - 1;
         let result = if delete { self.delete_node(h) } else { Ok(()) };
         if remaining == 0 {
-            self.s.schedule_upload(&h.node, Duration::ZERO);
-            self.s.release(&h.node);
+            self.settle(&h.node);
         }
         result
     }
 
-    /// 핸들 해제. Cleanup 뒤 페이징 쓰기로 다시 변경된 내용이 있으면 업로드를 예약합니다.
+    /// 핸들 해제. Cleanup 뒤 페이징 쓰기로 다시 변경된 내용이 있으면 반영합니다.
+    /// 정리 단계의 커밋이 실패해 백그라운드 재시도를 예약했으면 여기서 다시 기다리지 않습니다.
     pub fn close(&self, h: &FileHandle) {
-        if h.node.opens.load(Ordering::SeqCst) == 0 {
-            self.s.schedule_upload(&h.node, Duration::ZERO);
+        if h.node.opens.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        let retry_pending = self.through() && {
+            let st = h.node.state.lock();
+            st.upload.is_some() || st.failures > 0
+        };
+        if retry_pending {
             self.s.release(&h.node);
+        } else {
+            self.settle(&h.node);
         }
     }
 
+    fn settle(&self, node: &Arc<Node>) {
+        if self.through() {
+            // 실패는 알림과 저널로 처리했습니다. 정리 요청 자체는 성공으로 돌려줍니다.
+            let _ = self.s.commit_now(node, false);
+        } else {
+            self.s.schedule_upload(node, Duration::ZERO);
+        }
+        self.s.release(node);
+    }
+
+    /// 실시간 모드에서는 지금까지 보낸 데이터가 원격에 수락될 때까지 기다립니다.
     pub fn flush(&self, h: &FileHandle) -> Result<Entry> {
+        let wait = {
+            let st = h.node.state.lock();
+            st.stream.as_ref().map(|stream| {
+                let (reply, wait) = oneshot::channel();
+                (stream.tx.send(StreamCmd::Flush(reply)).is_ok(), wait)
+            })
+        };
+        if let Some((sent, wait)) = wait {
+            let r = if sent {
+                self.s
+                    .run(async { wait.await.unwrap_or(Err(Error::Cancelled)) })
+            } else {
+                Err(Error::Cancelled)
+            };
+            if let Err(e) = r {
+                let mut st = h.node.state.lock();
+                let e = st.stream.as_ref().and_then(StreamState::error).unwrap_or(e);
+                st.drop_stream();
+                return Err(e);
+            }
+        }
         Ok(self.info(h))
     }
 
@@ -1524,7 +2160,13 @@ impl Vfs {
         let path = h.path();
         let mut st = h.node.state.lock();
         st.begin_change();
-        s.run(s.backend.delete(&path, h.node.kind))?;
+        if let Some(stream) = st.stream.take() {
+            stream.abort();
+        }
+        // 원격에 아직 없는 새 파일은 로컬 상태만 지웁니다.
+        if !st.local_only {
+            s.run(s.backend.delete(&path, h.node.kind))?;
+        }
         st.staged = None;
         st.dirty = false;
         st.deleted = true;
@@ -1558,6 +2200,51 @@ impl Vfs {
                 st.dirty && !st.deleted
             })
             .count()
+    }
+
+    /// 업로드가 끝나지 않은 파일 수를 전송 중, 대기, 실패로 나눕니다. 트레이와 화면 표시에 씁니다.
+    ///
+    /// 에이전트가 tokio 작업 스레드에서 주기적으로 부르므로 어떤 잠금에서도 기다리지 않습니다.
+    /// 파일 시스템 요청이 상태 잠금을 쥔 채 원격 응답을 기다리는 동안 여기서 막히면, 그 작업 스레드가
+    /// 맡던 네트워크 이벤트 처리까지 멈춰 원격 응답이 영영 오지 않는 교착이 생깁니다.
+    /// 잠금이 바쁜 파일은 마지막으로 확인한 상태를, 노드 표가 바쁘면 직전 집계를 씁니다.
+    pub fn upload_counts(&self) -> UploadCounts {
+        let through = self.through();
+        let Some(nodes) = self.s.nodes.try_lock() else {
+            return *self.s.last_counts.lock();
+        };
+        let mut c = UploadCounts::default();
+        for n in nodes.values() {
+            let class = match n.state.try_lock() {
+                Some(st) => {
+                    let class = if !st.dirty || st.deleted {
+                        UPLOAD_NONE
+                    } else if st.stream.is_some()
+                        || st.committing
+                        || st.transferring
+                        || (through && n.opens.load(Ordering::SeqCst) > 0)
+                    {
+                        UPLOAD_ACTIVE
+                    } else if st.failures > 0 {
+                        UPLOAD_FAILED
+                    } else {
+                        UPLOAD_WAITING
+                    };
+                    n.upload_class.store(class, Ordering::Relaxed);
+                    class
+                }
+                None => n.upload_class.load(Ordering::Relaxed),
+            };
+            match class {
+                UPLOAD_ACTIVE => c.uploading += 1,
+                UPLOAD_WAITING => c.waiting += 1,
+                UPLOAD_FAILED => c.failed += 1,
+                _ => {}
+            }
+        }
+        drop(nodes);
+        *self.s.last_counts.lock() = c;
+        c
     }
 
     /// 모든 변경분을 업로드할 때까지 기다립니다. 마운트 해제 전에 호출합니다.

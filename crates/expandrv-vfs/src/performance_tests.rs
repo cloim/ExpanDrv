@@ -394,3 +394,110 @@ fn sequential_transfer_backends_prefetch_blocks_in_order() {
         "요청 순서가 거의 오름차순이어야 합니다: {offsets:?}"
     );
 }
+
+/// 탐색기 복사(생성, 크기 설정, 1 MiB 순차 쓰기, 수정 시각, 정리)를 흉내 내어
+/// 호출 프로그램이 완료를 보는 시점과 원격에 안착하는 시점을 잽니다.
+fn copy_files(f: &Fixture, files: &[(String, usize)]) -> (f64, f64) {
+    let started = Instant::now();
+    for (name, size) in files {
+        let path = p(&format!("/{name}"));
+        let h = f.vfs.create(&path, EntryKind::File).unwrap();
+        f.vfs.set_size(&h, *size as u64, false).unwrap();
+        let chunk = vec![7u8; 1 << 20];
+        let mut off = 0usize;
+        while off < *size {
+            let n = (*size - off).min(chunk.len());
+            f.vfs
+                .write(&h, off as u64, &chunk[..n], false, false)
+                .unwrap();
+            off += n;
+        }
+        f.vfs
+            .set_mtime(&h, UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+        f.vfs.cleanup(&h, false).unwrap();
+        f.vfs.close(&h);
+    }
+    let visible = started.elapsed().as_secs_f64() * 1000.0;
+    f.vfs.sync(Duration::from_secs(120)).unwrap();
+    let landed = started.elapsed().as_secs_f64() * 1000.0;
+    for (name, size) in files {
+        assert_eq!(
+            std::fs::metadata(f.root.path().join(name)).unwrap().len(),
+            *size as u64,
+            "{name}"
+        );
+    }
+    (visible, landed)
+}
+
+/// 왕복 20ms, 업로드 64 MiB/s 망에서 백그라운드 업로드와 실시간 업로드를 비교합니다.
+/// 백엔드 호출의 왕복 수는 SFTP를 따릅니다(조회 1회, 전체 쓰기 5회, 세션 열기 1~2회와 확정 3회).
+/// - 큰 파일 하나(48 MiB)와 작은 파일 여러 개(16 KiB x 40)
+/// - visible: 호출 프로그램이 완료를 보는 시간, landed: 원격에 모두 안착한 시간(각 3회 중앙값)
+#[test]
+#[ignore = "통제 쓰기 성능 비교: cargo test -p expandrv-vfs write_mode_comparison --release -- --ignored --nocapture"]
+fn write_mode_comparison() {
+    let scenarios: [(&str, Vec<(String, usize)>); 2] = [
+        ("big", vec![("big.bin".to_owned(), 48 << 20)]),
+        (
+            "many",
+            (0..40)
+                .map(|i| (format!("small-{i}.txt"), 16 << 10))
+                .collect(),
+        ),
+    ];
+    // Windows 타이머 흔들림을 줄이려고 두 모드를 번갈아 3회 재고 중앙값을 씁니다.
+    const ROUNDS: usize = 3;
+    let mut out = Vec::new();
+    for (tag, files) in &scenarios {
+        let mut samples: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
+        for _ in 0..ROUNDS {
+            for (i, mode) in [WriteMode::Back, WriteMode::Through]
+                .into_iter()
+                .enumerate()
+            {
+                let f = fixture_with(|o| o.write_mode = mode);
+                *f.backend.net_rtt.lock() = Duration::from_millis(20);
+                *f.backend.metadata_delay.lock() = Duration::from_millis(20);
+                f.backend.net_bps.store(64 << 20, Ordering::SeqCst);
+                samples[i].push(copy_files(&f, files));
+            }
+        }
+        for (i, name) in ["back", "through"].into_iter().enumerate() {
+            let mut visible: Vec<f64> = samples[i].iter().map(|s| s.0).collect();
+            let mut landed: Vec<f64> = samples[i].iter().map(|s| s.1).collect();
+            visible.sort_by(f64::total_cmp);
+            landed.sort_by(f64::total_cmp);
+            out.push((
+                format!("{tag}_{name}"),
+                visible[ROUNDS / 2],
+                landed[ROUNDS / 2],
+            ));
+        }
+    }
+    let json: Vec<String> = out
+        .iter()
+        .map(|(k, v, l)| {
+            format!(
+                "\"{k}_visible_ms\":{v:.1},\"{k}_landed_ms\":{l:.1},\"{k}_gap_ms\":{:.1}",
+                l - v
+            )
+        })
+        .collect();
+    println!("PERFORMANCE_WRITE {{{}}}", json.join(","));
+    for pair in out.chunks(2) {
+        let ((_, _, back_landed), (key, through_visible, through_landed)) = (&pair[0], &pair[1]);
+        // 실시간 모드는 완료가 보이는 시점에 이미 원격에 안착해 있습니다.
+        assert!(
+            through_landed - through_visible < 50.0,
+            "{key}: 완료 표시 뒤 남은 업로드 {:.1}ms",
+            through_landed - through_visible
+        );
+        // 원격 안착까지의 총 시간은 백그라운드 모드보다 늘지 않습니다(10% 허용).
+        assert!(
+            *through_landed <= back_landed * 1.1,
+            "{key}: 실시간 {through_landed:.1}ms, 백그라운드 {back_landed:.1}ms"
+        );
+    }
+}

@@ -7,7 +7,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use expandrv_core::{
-    Backend, Capabilities, Entry, EntryKind, Quota, RemotePath, Result, WriteSource,
+    Backend, Capabilities, Entry, EntryKind, Quota, RemotePath, Result, UploadHint, UploadSession,
+    WriteSource,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -53,8 +54,33 @@ impl TokenBucket {
 
 struct Throttled {
     inner: Arc<dyn Backend>,
-    up: Option<TokenBucket>,
-    down: Option<TokenBucket>,
+    up: Option<Arc<TokenBucket>>,
+    down: Option<Arc<TokenBucket>>,
+}
+
+/// 보내기 전에 토큰을 받아 스트리밍 업로드 속도를 제한합니다.
+struct ThrottledUpload {
+    inner: Box<dyn UploadSession>,
+    up: Option<Arc<TokenBucket>>,
+}
+
+#[async_trait]
+impl UploadSession for ThrottledUpload {
+    async fn write(&mut self, offset: u64, data: Bytes) -> Result<()> {
+        if let Some(b) = &self.up {
+            b.take(data.len() as u64).await;
+        }
+        self.inner.write(offset, data).await
+    }
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+    async fn finish(self: Box<Self>) -> Result<Entry> {
+        self.inner.finish().await
+    }
+    async fn abort(self: Box<Self>) {
+        self.inner.abort().await;
+    }
 }
 
 /// 제한이 없으면 원래 백엔드를 그대로 돌려줍니다.
@@ -64,8 +90,8 @@ pub fn throttle(inner: Arc<dyn Backend>, up_bytes: u64, down_bytes: u64) -> Arc<
     }
     Arc::new(Throttled {
         inner,
-        up: (up_bytes > 0).then(|| TokenBucket::new(up_bytes)),
-        down: (down_bytes > 0).then(|| TokenBucket::new(down_bytes)),
+        up: (up_bytes > 0).then(|| Arc::new(TokenBucket::new(up_bytes))),
+        down: (down_bytes > 0).then(|| Arc::new(TokenBucket::new(down_bytes))),
     })
 }
 
@@ -95,6 +121,17 @@ impl Backend for Throttled {
             b.take(source.len()).await;
         }
         self.inner.write(path, source).await
+    }
+    async fn begin_upload(
+        &self,
+        path: &RemotePath,
+        hint: UploadHint,
+    ) -> Result<Box<dyn UploadSession>> {
+        let inner = self.inner.begin_upload(path, hint).await?;
+        Ok(Box::new(ThrottledUpload {
+            inner,
+            up: self.up.clone(),
+        }))
     }
     async fn mkdir(&self, path: &RemotePath) -> Result<Entry> {
         self.inner.mkdir(path).await

@@ -14,6 +14,9 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
 pub use fs::{filetime, from_filetime};
 
+/// 대기 중인 요청의 시간 상한(ms). WinFsp가 허용하는 최대값입니다.
+const IRP_TIMEOUT_MS: u32 = 600_000;
+
 #[derive(Debug, Clone)]
 pub struct MountOptions {
     /// `X:` 형태의 드라이브 문자 또는 존재하지 않는 폴더 경로
@@ -61,6 +64,8 @@ impl MountedDrive {
             .unicode_on_disk(true)
             .persistent_acls(true)
             .read_only_volume(vfs.read_only())
+            // 닫을 때 원격 저장까지 기다리는 쓰기 모드에서 큰 파일의 커밋 대기를 보호합니다(WinFsp 상한 10분).
+            .irp_timeout(IRP_TIMEOUT_MS)
             // Cleanup 전에 캐시를 비워 업로드 시점에 모든 쓰기가 도착하게 합니다.
             .flush_and_purge_on_cleanup(true);
 
