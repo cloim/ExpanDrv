@@ -158,6 +158,7 @@ struct Shared {
     rt: tokio::runtime::Handle,
     opts: VfsOptions,
     meta: MetaCache,
+    metadata_epoch: Mutex<u64>,
     store: Option<MetaStore>,
     blocks: BlockCache,
     /// 짧은 임의 읽기용 [`PROBE_CHUNK`] 조각 캐시(메모리 전용)
@@ -474,6 +475,15 @@ fn offline(e: &Error) -> bool {
 }
 
 impl Shared {
+    /// 서버 시각 보정처럼 해석 기준이 바뀌면 이전 목록을 원격 변경 기준으로 쓰지 않습니다.
+    fn refresh_metadata_epoch(&self) {
+        let mut previous = self.metadata_epoch.lock();
+        let current = self.backend.metadata_epoch();
+        if *previous != current {
+            self.meta.clear();
+            *previous = current;
+        }
+    }
     fn run<T>(&self, fut: impl Future<Output = Result<T>>) -> Result<T> {
         self.rt.block_on(async {
             tokio::time::timeout(self.opts.op_timeout, fut)
@@ -725,6 +735,7 @@ impl Shared {
                 if let Some(m) = mtime.filter(|_| s.backend.capabilities().set_mtime) {
                     s.background_backend.set_mtime(&target, m).await?;
                     e.modified = Some(m);
+                    e.etag = None;
                 }
                 if let Some(remote) = remote_kept {
                     tracing::warn!(%path, conflict = %target, "원격 파일이 바뀌어 충돌 사본으로 올렸습니다");
@@ -781,6 +792,7 @@ impl Shared {
 
     /// 원격에 반영된 항목으로 노드 상태, 저널, 메타와 블록 캐시를 맞춥니다.
     fn finalize_upload(&self, path: &RemotePath, st: &mut NodeState, entry: Entry) {
+        self.refresh_metadata_epoch();
         st.entry = entry.clone();
         st.dirty = false;
         st.staged = None;
@@ -802,9 +814,8 @@ impl Shared {
         {
             tracing::warn!(%path, error = %e, "업로드 저널 정리 실패");
         }
-        self.meta.invalidate(path);
         self.persist_entry(path, &entry);
-        self.meta.put_entry(path, entry);
+        self.meta.upsert_child(path, entry);
         self.drop_blocks(path);
     }
 
@@ -915,7 +926,10 @@ impl Shared {
                 && let Some(m) = mtime.filter(|_| self.backend.capabilities().set_mtime)
             {
                 match self.run(self.backend.set_mtime(&path, m)) {
-                    Ok(()) => entry.modified = Some(m),
+                    Ok(()) => {
+                        entry.modified = Some(m);
+                        entry.etag = None;
+                    }
                     Err(e) => tracing::warn!(%path, error = %e, "수정 시각 반영 실패"),
                 }
             }
@@ -1168,9 +1182,15 @@ fn diff_listing(dir: &RemotePath, old: &[Entry], new: &[Entry]) -> Vec<Change> {
                 push(name, ChangeKind::Removed, o.is_dir());
                 push(name, ChangeKind::Added, e.is_dir());
             }
+            // 시각을 설정한 직후처럼 모르는 버전 값은 다음 목록으로 확인합니다.
             Some(o)
                 if !e.is_dir()
-                    && (o.size, &o.etag, o.modified) != (e.size, &e.etag, e.modified) =>
+                    && (o.size != e.size
+                        || o.modified.zip(e.modified).is_some_and(|(a, b)| a != b)
+                        || o.etag
+                            .as_ref()
+                            .zip(e.etag.as_ref())
+                            .is_some_and(|(a, b)| a != b)) =>
             {
                 push(name, ChangeKind::Modified, false)
             }
@@ -1262,6 +1282,7 @@ impl Shared {
 
     /// 최근 열거한 디렉터리를 다시 읽어 마지막 목록과 비교합니다.
     async fn poll_changes(&self) -> Vec<Change> {
+        self.refresh_metadata_epoch();
         let dirs: Vec<RemotePath> = {
             let mut watched = self.watched.lock();
             watched.retain(|_, at| at.elapsed() < WATCH_WINDOW);
@@ -1277,7 +1298,7 @@ impl Shared {
             let Some(old) = self.meta.snapshot(&dir) else {
                 continue;
             };
-            let new = match self
+            let mut new = match self
                 .remote_read(self.background_backend.list(&dir), true)
                 .await
             {
@@ -1291,6 +1312,26 @@ impl Shared {
                     continue;
                 }
             };
+            self.refresh_metadata_epoch();
+            // 작업 중인 로컬 항목은 비교 기준을 유지하고 원격의 중간 상태를 가져오지 않습니다.
+            // 노드 표와 상태 모두 기다리지 않으며 확정과의 경합은 replace_dir_if로 확인합니다.
+            let ignored: Vec<String> = {
+                let Some(nodes) = self.nodes.try_lock() else {
+                    continue;
+                };
+                nodes
+                    .iter()
+                    .filter(|(path, _)| path.parent().as_ref() == Some(&dir))
+                    .filter(|(_, node)| {
+                        node.state
+                            .try_lock()
+                            .is_none_or(|st| st.dirty || st.local_only)
+                    })
+                    .filter_map(|(path, _)| path.name().map(str::to_owned))
+                    .collect()
+            };
+            new.retain(|e| !ignored.contains(&e.name));
+            new.extend(old.iter().filter(|e| ignored.contains(&e.name)).cloned());
             let diff = diff_listing(&dir, &old, &new);
             if !self.meta.replace_dir_if(&dir, &old, Arc::new(new.clone())) || diff.is_empty() {
                 continue;
@@ -1305,6 +1346,11 @@ impl Shared {
                 if c.is_dir {
                     self.meta.invalidate_tree(&c.path);
                 }
+            }
+            for c in &diff {
+                let before = old.iter().find(|e| Some(e.name.as_str()) == c.path.name());
+                let after = new.iter().find(|e| Some(e.name.as_str()) == c.path.name());
+                tracing::debug!(path = %c.path, kind = ?c.kind, ?before, ?after, "원격 변경 비교");
             }
             tracing::debug!(%dir, count = diff.len(), "원격 변경 감지");
             out.extend(diff);
@@ -1323,6 +1369,7 @@ impl Vfs {
         let store = opts.meta_db.as_deref().map(MetaStore::open).transpose()?;
         let disk = opts.disk_cache.as_ref().map(DiskCache::open).transpose()?;
         let [backend, background_backend, speculative_backend] = scheduler::schedule(backend);
+        let metadata_epoch = backend.metadata_epoch();
         let s = Arc::new(Shared {
             backend,
             background_backend,
@@ -1330,6 +1377,7 @@ impl Vfs {
             prefetch_slots: Arc::new(Semaphore::new(2)),
             rt,
             meta: MetaCache::new(opts.metadata_ttl),
+            metadata_epoch: Mutex::new(metadata_epoch),
             store,
             blocks: BlockCache::new(opts.block_size, opts.memory_cache_bytes),
             probes: BlockCache::new(
@@ -1420,6 +1468,7 @@ impl Vfs {
 
     /// 실제 원격 경로(대소문자 보정)와 항목을 찾습니다.
     pub fn stat(&self, path: &RemotePath) -> Result<(RemotePath, Entry)> {
+        self.s.refresh_metadata_epoch();
         if path.is_root() {
             return Ok((RemotePath::root(), Entry::dir("")));
         }
@@ -1499,10 +1548,12 @@ impl Vfs {
     /// 디렉터리 목록. 열린 노드의 스테이징 크기와 시각을 반영합니다.
     pub fn list(&self, path: &RemotePath) -> Result<Arc<Vec<Entry>>> {
         let s = &self.s;
+        s.refresh_metadata_epoch();
         s.watched.lock().insert(path.clone(), Instant::now());
         let list = match s.meta.dir(path) {
             Some(l) => l,
             None => {
+                tracing::debug!(%path, "원격 폴더 목록 조회");
                 let saved = s
                     .store
                     .as_ref()
@@ -1639,22 +1690,21 @@ impl Vfs {
             entry.modified = Some(now);
             entry.created = Some(now);
             let staged = NamedTempFile::new_in(&s.opts.staging_dir)?;
-            let h = self.attach(path.clone(), entry);
+            let h = self.attach(path.clone(), entry.clone());
             {
                 let mut st = h.node.state.lock();
                 st.reset_fresh(staged);
                 st.local_only = true;
                 st.dirty = true;
             }
-            s.meta.invalidate(path);
+            s.meta.upsert_child(path, entry);
             return Ok(h);
         }
         let entry = match kind {
             EntryKind::Dir => s.run(s.backend.mkdir(path))?,
             EntryKind::File => s.run(s.backend.write(path, WriteSource::Bytes(Bytes::new())))?,
         };
-        s.meta.invalidate(path);
-        s.meta.put_entry(path, entry.clone());
+        s.meta.upsert_child(path, entry.clone());
         s.persist_entry(path, &entry);
         Ok(self.attach(path.clone(), entry))
     }
@@ -1939,6 +1989,7 @@ impl Vfs {
 
     pub fn set_mtime(&self, h: &FileHandle, mtime: SystemTime) -> Result<Entry> {
         let s = &self.s;
+        let mtime = s.backend.normalize_mtime(mtime);
         let mut st = h.node.state.lock();
         if st.dirty {
             st.pending_mtime = Some(mtime);
@@ -1946,7 +1997,10 @@ impl Vfs {
         } else if s.backend.capabilities().set_mtime && !s.opts.read_only {
             s.run(s.backend.set_mtime(&h.path(), mtime))?;
             st.entry.modified = Some(mtime);
-            s.meta.invalidate(&h.path());
+            // 시각 변경 전의 버전 표식은 유효하지 않으며 다음 폴링에서 다시 확인합니다.
+            st.entry.etag = None;
+            s.meta.upsert_child(&h.path(), st.entry.clone());
+            s.persist_entry(&h.path(), &st.entry);
         }
         Ok(st.entry.clone())
     }
@@ -2176,7 +2230,17 @@ impl Vfs {
             let _ = store.journal_remove(&path);
         }
         drop(st);
-        s.forget(&path);
+        if h.is_dir() {
+            s.forget(&path);
+        } else {
+            s.meta.remove_child(&path);
+            s.drop_blocks(&path);
+            if let Some(store) = &s.store
+                && let Err(e) = store.forget_tree(&path)
+            {
+                tracing::warn!(%path, error = %e, "메타 저장소 정리 실패");
+            }
+        }
         Ok(())
     }
 

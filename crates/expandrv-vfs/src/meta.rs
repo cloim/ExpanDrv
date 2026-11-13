@@ -111,6 +111,33 @@ impl MetaCache {
             .insert(path.clone(), (entry, Instant::now()));
     }
 
+    /// 로컬 변경을 부모 목록에도 반영하되 목록의 TTL은 늘리지 않습니다.
+    pub fn upsert_child(&self, path: &RemotePath, entry: Entry) {
+        let mut inner = self.inner.lock();
+        if let Some(parent) = path.parent()
+            && let Some((list, _)) = inner.dirs.get_mut(&parent)
+        {
+            let list = Arc::make_mut(list);
+            if let Some(slot) = list.iter_mut().find(|e| e.name == entry.name) {
+                *slot = entry.clone();
+            } else {
+                list.push(entry.clone());
+            }
+        }
+        inner.entries.insert(path.clone(), (entry, Instant::now()));
+    }
+
+    /// ファイル一つを項目と親の一覧から取り除き、一覧のTTLを保ちます。
+    pub fn remove_child(&self, path: &RemotePath) {
+        let mut inner = self.inner.lock();
+        inner.entries.remove(path);
+        if let Some(parent) = path.parent()
+            && let Some((list, _)) = inner.dirs.get_mut(&parent)
+        {
+            Arc::make_mut(list).retain(|e| Some(e.name.as_str()) != path.name());
+        }
+    }
+
     pub fn put_dir(&self, path: &RemotePath, list: Arc<Vec<Entry>>) {
         let now = Instant::now();
         let mut inner = self.inner.lock();
@@ -125,6 +152,14 @@ impl MetaCache {
     /// TTL과 무관하게 마지막으로 받은 목록. 원격 변경 비교 기준으로 씁니다.
     pub fn snapshot(&self, path: &RemotePath) -> Option<Arc<Vec<Entry>>> {
         self.inner.lock().dirs.get(path).map(|(d, _)| d.clone())
+    }
+
+    /// 시험에서 실제 대기 없이 목록의 TTL 만료를 재현합니다.
+    #[cfg(test)]
+    pub fn expire_dir(&self, path: &RemotePath) {
+        if let Some((_, at)) = self.inner.lock().dirs.get_mut(path) {
+            *at = Instant::now() - self.ttl;
+        }
     }
 
     /// 목록이 `expected` 그대로일 때만 새 목록으로 바꿉니다.
@@ -229,5 +264,45 @@ mod tests {
         let c = MetaCache::new(Duration::ZERO);
         c.put_entry(&p("/x"), Entry::file("x", 1));
         assert!(c.entry(&p("/x")).is_none());
+    }
+
+    #[test]
+    fn child_updates_preserve_listing_age_and_poll_snapshot() {
+        let c = MetaCache::new(Duration::from_secs(60));
+        let dir = p("/d");
+        c.put_dir(&dir, Arc::new(vec![Entry::file("f", 1)]));
+        let at = Instant::now() - Duration::from_secs(30);
+        c.inner.lock().dirs.get_mut(&dir).unwrap().1 = at;
+        let old = c.snapshot(&dir).unwrap();
+        c.upsert_child(&p("/d/f"), Entry::file("f", 2));
+        c.upsert_child(&p("/d/g"), Entry::file("g", 3));
+        assert_eq!(c.inner.lock().dirs[&dir].1, at);
+        assert_eq!(c.dir(&dir).unwrap().len(), 2);
+        assert_eq!(c.entry(&p("/d/f")).unwrap().size, 2);
+        assert_eq!(old[0].size, 1);
+        assert!(!c.replace_dir_if(&dir, &old, Arc::new(vec![])));
+        let old = c.snapshot(&dir).unwrap();
+        c.remove_child(&p("/d/f"));
+        assert_eq!(c.inner.lock().dirs[&dir].1, at);
+        assert!(c.entry(&p("/d/f")).is_none());
+        assert!(matches!(c.lookup(&p("/d/f")), Lookup::Missing));
+        assert_eq!(c.dir(&dir).unwrap().len(), 1);
+        assert!(!c.replace_dir_if(&dir, &old, Arc::new(vec![])));
+
+        // 이미 만료된 목록도 시각은 그대로 두고 폴링 기준만 갱신합니다.
+        c.inner.lock().dirs.get_mut(&dir).unwrap().1 = Instant::now() - Duration::from_secs(61);
+        c.upsert_child(&p("/d/h"), Entry::file("h", 4));
+        assert!(c.dir(&dir).is_none());
+        assert_eq!(c.snapshot(&dir).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn child_updates_without_listing_only_change_entries() {
+        let c = MetaCache::new(Duration::from_secs(60));
+        c.upsert_child(&p("/d/f"), Entry::file("f", 2));
+        assert_eq!(c.entry(&p("/d/f")).unwrap().size, 2);
+        assert!(c.snapshot(&p("/d")).is_none());
+        c.remove_child(&p("/d/f"));
+        assert!(c.entry(&p("/d/f")).is_none());
     }
 }

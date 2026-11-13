@@ -103,6 +103,12 @@ impl Backend for Throttled {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+    fn metadata_epoch(&self) -> u64 {
+        self.inner.metadata_epoch()
+    }
+    fn normalize_mtime(&self, mtime: SystemTime) -> SystemTime {
+        self.inner.normalize_mtime(mtime)
+    }
     async fn stat(&self, path: &RemotePath) -> Result<Entry> {
         self.inner.stat(path).await
     }

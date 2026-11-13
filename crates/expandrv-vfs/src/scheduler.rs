@@ -103,6 +103,12 @@ impl Backend for Scheduled {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+    fn metadata_epoch(&self) -> u64 {
+        self.inner.metadata_epoch()
+    }
+    fn normalize_mtime(&self, mtime: SystemTime) -> SystemTime {
+        self.inner.normalize_mtime(mtime)
+    }
     async fn stat(&self, path: &RemotePath) -> Result<Entry> {
         let _permit = self.enter().await?;
         self.inner.stat(path).await

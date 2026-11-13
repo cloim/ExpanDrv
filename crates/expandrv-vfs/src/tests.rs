@@ -12,6 +12,8 @@ struct TestBackend {
     write_delay: Mutex<Duration>,
     metadata_delay: Mutex<Duration>,
     metadata_calls: AtomicUsize,
+    case_sensitive: AtomicBool,
+    metadata_epoch: AtomicU64,
     offline: AtomicBool,
     fail_writes: AtomicU32,
     /// 다음 읽기 몇 번을 일시 오류로 실패시킵니다.
@@ -104,11 +106,15 @@ impl TestBackend {
 
 #[async_trait::async_trait]
 impl Backend for TestBackend {
+    fn metadata_epoch(&self) -> u64 {
+        self.metadata_epoch.load(Ordering::SeqCst)
+    }
     fn kind(&self) -> &'static str {
         "test"
     }
     fn capabilities(&self) -> expandrv_core::Capabilities {
         expandrv_core::Capabilities {
+            case_sensitive: self.case_sensitive.load(Ordering::SeqCst),
             sequential_transfer: self.sequential.load(Ordering::SeqCst),
             random_write: self.random_write.load(Ordering::SeqCst),
             ..self.inner.capabilities()
@@ -232,6 +238,8 @@ fn fixture_with(tune: impl FnOnce(&mut VfsOptions)) -> Fixture {
         write_delay: Mutex::new(Duration::ZERO),
         metadata_delay: Mutex::new(Duration::ZERO),
         metadata_calls: AtomicUsize::new(0),
+        case_sensitive: AtomicBool::new(false),
+        metadata_epoch: AtomicU64::new(0),
         offline: AtomicBool::new(false),
         fail_writes: AtomicU32::new(0),
         reads: AtomicUsize::new(0),
@@ -987,6 +995,137 @@ fn local_changes_are_not_reported_as_remote() {
     f.vfs.cleanup(&h, false).unwrap();
     sync(&f);
     assert!(f.vfs.poll_changes().is_empty());
+}
+
+/// 명시적 폴링을 제외한 메타데이터 호출이 파일 수에 비례하지 않는지 확인합니다.
+fn many_creates_keep_parent_listing(mode: WriteMode) {
+    let f = fixture_with(|o| o.write_mode = mode);
+    f.backend.case_sensitive.store(true, Ordering::SeqCst);
+    let dir = p("/many");
+    let dh = f.vfs.create(&dir, EntryKind::Dir).unwrap();
+    f.vfs.cleanup(&dh, false).unwrap();
+    f.vfs.close(&dh);
+    f.vfs.s.watched.lock().remove(&RemotePath::root());
+    f.vfs.list(&dir).unwrap();
+    let before = f.backend.metadata_calls.load(Ordering::SeqCst);
+    let body = vec![42; 16 * 1024];
+    let mtime = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+    let mut polls = 0;
+    for i in 0..20 {
+        let path = dir.join(&format!("f{i}.bin")).unwrap();
+        let h = f.vfs.create(&path, EntryKind::File).unwrap();
+        assert!(f.vfs.poll_changes().is_empty());
+        polls += 1;
+        // 크기 힌트가 있는 실시간 쓰기는 마지막 조각에서 확정됩니다.
+        f.vfs.set_size(&h, body.len() as u64, false).unwrap();
+        f.vfs.write(&h, 0, &body, false, false).unwrap();
+        f.vfs.set_mtime(&h, mtime).unwrap();
+        assert!(f.vfs.poll_changes().is_empty());
+        polls += 1;
+        f.vfs.cleanup(&h, false).unwrap();
+        f.vfs.close(&h);
+        sync(&f);
+        assert!(f.vfs.poll_changes().is_empty());
+        polls += 1;
+        assert_eq!(f.vfs.s.meta.entry(&path).unwrap().modified, Some(mtime));
+        assert_eq!(remote(&f, &format!("many/f{i}.bin")), body);
+    }
+    let extra = f.backend.metadata_calls.load(Ordering::SeqCst) - before - polls;
+    assert!(extra <= 2, "파일 20개의 추가 메타데이터 호출: {extra}");
+    // 삭제도 부모 목록을 보존하며 로컬 알림으로만 처리됩니다.
+    let h = f.vfs.open(&p("/many/f0.bin")).unwrap();
+    f.vfs.cleanup(&h, true).unwrap();
+    f.vfs.close(&h);
+    assert!(f.vfs.poll_changes().is_empty());
+    assert!(matches!(
+        f.vfs.stat(&p("/many/f0.bin")),
+        Err(Error::NotFound)
+    ));
+
+    // TTL이 지나도 마지막 비교 기준을 유지하여 다른 프로세스의 추가를 감지합니다.
+    f.vfs.s.meta.expire_dir(&dir);
+    assert!(f.vfs.s.meta.dir(&dir).is_none());
+    std::fs::write(f.root.path().join("many/external.bin"), b"remote").unwrap();
+    let changes = f.vfs.poll_changes();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].path, p("/many/external.bin"));
+    assert_eq!(changes[0].kind, ChangeKind::Added);
+    assert!(f.vfs.poll_changes().is_empty());
+}
+
+#[test]
+fn through_many_creates_keep_parent_listing() {
+    many_creates_keep_parent_listing(WriteMode::Through);
+}
+
+#[test]
+fn back_many_creates_keep_parent_listing() {
+    many_creates_keep_parent_listing(WriteMode::Back);
+}
+
+#[test]
+fn listing_diff_compares_known_versions_after_mtime_confirmation() {
+    let dir = p("/many");
+    let mut local = Entry::file("f", 3);
+    local.modified = Some(UNIX_EPOCH + Duration::from_secs(123));
+    let mut remote = local.clone();
+    remote.etag = Some("confirmed".into());
+    remote.modified = Some(UNIX_EPOCH + Duration::from_secs(123));
+    assert!(diff_listing(&dir, &[local], &[remote.clone()]).is_empty());
+    let mut wrong_clock = remote.clone();
+    wrong_clock.modified = remote.modified.map(|t| t + Duration::from_secs(9 * 3600));
+    assert_eq!(
+        diff_listing(&dir, &[remote.clone()], &[wrong_clock]).len(),
+        1
+    );
+    let mut changed = remote.clone();
+    changed.etag = Some("changed".into());
+    let diff = diff_listing(&dir, &[remote.clone()], &[changed]);
+    assert_eq!(diff.len(), 1);
+    assert_eq!(diff[0].kind, ChangeKind::Modified);
+    let mut changed_time = remote.clone();
+    changed_time.modified = remote.modified.map(|t| t + Duration::from_millis(1));
+    assert_eq!(diff_listing(&dir, &[remote], &[changed_time]).len(), 1);
+}
+
+#[test]
+fn poll_changes_skips_busy_node_locks() {
+    let f = through();
+    f.vfs.list(&RemotePath::root()).unwrap();
+    let h = f.vfs.create(&p("/busy.bin"), EntryKind::File).unwrap();
+    let state = h.node.state.lock();
+    assert!(f.vfs.poll_changes().is_empty());
+    drop(state);
+    let nodes = f.vfs.s.nodes.lock();
+    assert!(f.vfs.poll_changes().is_empty());
+    drop(nodes);
+    f.vfs.cleanup(&h, false).unwrap();
+    f.vfs.close(&h);
+    assert!(f.vfs.poll_changes().is_empty());
+}
+
+#[test]
+fn metadata_epoch_change_discards_old_listing_baseline() {
+    let f = fixture(false);
+    let dir = RemotePath::root();
+    let file = f.root.path().join("keep.txt");
+    std::fs::write(&file, b"same").unwrap();
+    f.vfs.list(&dir).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(123))
+        .unwrap();
+    f.backend.metadata_epoch.store(1, Ordering::SeqCst);
+    assert!(f.vfs.poll_changes().is_empty());
+    f.vfs.list(&dir).unwrap();
+    std::fs::write(f.root.path().join("external.txt"), b"new").unwrap();
+    let changes = f.vfs.poll_changes();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, ChangeKind::Added);
+    let throttled = throttle(f.backend.clone(), 1, 0);
+    assert_eq!(throttled.metadata_epoch(), 1);
 }
 
 #[test]
