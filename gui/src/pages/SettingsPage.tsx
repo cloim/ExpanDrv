@@ -240,7 +240,7 @@ export function SettingsPage() {
               <Section title="자동 실행">
                 <Switch
                   label="로그인할 때 에이전트 시작"
-                  hint="자동 마운트를 켠 드라이브를 함께 마운트합니다"
+                  hint="시작 앱으로 등록하여 부팅 시 자동 마운트를 켠 드라이브를 함께 마운트합니다"
                   checked={view?.autostart ?? false}
                   disabled={!view || busy === 'autostart' || (!view.cliFound && !view.autostart)}
                   onChange={(v) => void toggleAutostart(v)}

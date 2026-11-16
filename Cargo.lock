@@ -1369,6 +1369,7 @@ name = "expandrv-autostart"
 version = "0.1.11"
 dependencies = [
  "expandrv-core",
+ "tempfile",
  "windows 0.62.2",
 ]
 

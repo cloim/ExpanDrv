@@ -491,8 +491,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView> {
 async fn settings_view(state: &AppState) -> Result<SettingsView> {
     let config = state.load()?;
     let p = &state.paths;
-    let command =
-        expandrv_autostart::status(expandrv_autostart::RUN_KEY).map_err(|e| e.to_string())?;
+    let command = expandrv_autostart::status().map_err(|e| e.to_string())?;
     let link = agent::connect(&p.pipe).await?;
     Ok(SettingsView {
         lock_on_session_lock: config.security.lock_on_session_lock,
@@ -514,7 +513,7 @@ async fn settings_view(state: &AppState) -> Result<SettingsView> {
 /// 로그인 자동 실행을 켜거나 끕니다. 등록 명령은 CLI 에이전트를 가리킵니다(`expandrv autostart enable`과 같음).
 #[tauri::command]
 pub async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<SettingsView> {
-    use expandrv_autostart::{RUN_KEY, command_line, disable, enable};
+    use expandrv_autostart::{disable, enable};
     let p = &state.paths;
     let r = if enabled {
         if !p.cli.is_file() {
@@ -522,9 +521,9 @@ pub async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<
         }
         let exe = std::path::absolute(&p.cli).map_err(|e| e.to_string())?;
         let cfg = std::path::absolute(&p.config).map_err(|e| e.to_string())?;
-        enable(RUN_KEY, &command_line(&exe, &cfg))
+        enable(&exe, &cfg)
     } else {
-        disable(RUN_KEY)
+        disable()
     };
     r.map_err(|e| e.to_string())?;
     settings_view(&state).await

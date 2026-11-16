@@ -820,23 +820,22 @@ fn secret(action: SecretAction) -> Result<()> {
 }
 
 fn autostart_cmd(action: AutostartAction, cfg_path: &Path) -> Result<()> {
-    use autostart::RUN_KEY;
     match action {
         AutostartAction::Enable => {
             let exe = std::env::current_exe()?;
             let cfg_abs = std::path::absolute(cfg_path)?;
-            autostart::enable(RUN_KEY, &autostart::command_line(&exe, &cfg_abs))?;
-            println!("로그인할 때 에이전트를 자동으로 시작합니다.");
+            autostart::enable(&exe, &cfg_abs)?;
+            println!("로그인할 때 에이전트를 자동으로 시작합니다(시작 앱).");
             let cfg = Config::load(cfg_path)?;
             if !cfg.drives.iter().any(|d| d.auto_mount) {
                 println!("auto_mount가 켜진 드라이브가 없어 시작만 하고 마운트하지 않습니다.");
             }
         }
         AutostartAction::Disable => {
-            autostart::disable(RUN_KEY)?;
+            autostart::disable()?;
             println!("자동 시작을 껐습니다.");
         }
-        AutostartAction::Status => match autostart::status(RUN_KEY)? {
+        AutostartAction::Status => match autostart::status()? {
             Some(cmd) => println!("켜짐: {cmd}"),
             None => println!("꺼짐"),
         },
