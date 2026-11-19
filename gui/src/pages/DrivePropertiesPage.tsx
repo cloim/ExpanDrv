@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { KeyRound, Loader2, Play, PlugZap, RotateCcw, Save, Square } from 'lucide-react';
+import { KeyRound, Loader2, LogIn, Play, PlugZap, RotateCcw, Save, Square } from 'lucide-react';
 import { Modal } from '../components/Modal';
 import SelectControl from '../components/SelectControl';
 import { ConnectionEditor } from './ConnectionEditor';
@@ -74,11 +74,15 @@ const TRANSFER_FIELDS: { key: keyof TransferSettings; label: string }[] = [
   { key: 'downloadKibPerSec', label: '다운로드 제한' },
 ];
 
-function SecretRow({ info, onChange }: { info: SecretInfo; onChange: () => void }) {
+function SecretRow({ info, onChange, busy = false }: { info: SecretInfo; onChange: () => void; busy?: boolean }) {
+  // Google 로그인은 값을 직접 입력하지 않고 브라우저로 다시 로그인합니다.
+  const login = info.field === 'refresh_token';
   const state =
-    info.source === 'credential'
+    login && busy
+      ? { text: '브라우저에서 로그인을 기다리는 중입니다', tone: 'text-ink-2' }
+      : info.source === 'credential'
       ? info.stored
-        ? { text: '자격 증명 관리자에 저장됨', tone: 'text-ok' }
+        ? { text: login ? '로그인됨, 자격 증명 관리자에 저장됨' : '자격 증명 관리자에 저장됨', tone: 'text-ok' }
         : { text: '저장된 값이 없습니다', tone: 'text-danger' }
       : info.source === 'env'
         ? { text: `환경 변수 ${info.reference}`, tone: 'text-ink-2' }
@@ -90,8 +94,8 @@ function SecretRow({ info, onChange }: { info: SecretInfo; onChange: () => void 
         <div className={`truncate text-xs ${state.tone}`}>{state.text}</div>
       </div>
       <button type="button" className="btn btn-ghost h-8 flex-none px-3 text-xs" onClick={onChange}>
-        <KeyRound size={14} aria-hidden="true" />
-        {info.source === 'none' ? '설정' : '변경'}
+        {login ? busy ? <Loader2 size={14} className="spin" aria-hidden="true" /> : <LogIn size={14} aria-hidden="true" /> : <KeyRound size={14} aria-hidden="true" />}
+        {login ? (busy ? '로그인 취소' : '다시 로그인') : info.source === 'none' ? '설정' : '변경'}
       </button>
     </div>
   );
@@ -108,6 +112,7 @@ export function DrivePropertiesPage() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [reauthing, setReauthing] = useState(false);
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [connectionError, setConnectionError] = useState('');
   const [toggling, setToggling] = useState(false);
@@ -232,6 +237,34 @@ export function DrivePropertiesPage() {
     }
   };
 
+  /** Google Drive는 브라우저로 다시 로그인하고, 다른 저장소는 첫 비밀 값 입력 창을 엽니다. */
+  const openCredentials = () => {
+    if (detail?.backend === 'gdrive') {
+      void reauthorize();
+      return;
+    }
+    setSecretValue('');
+    setSecretFor(detail?.secrets[0] ?? null);
+  };
+
+  const reauthorize = async () => {
+    if (reauthing) {
+      await api.googleCancelSignIn().catch(() => false);
+      return;
+    }
+    setReauthing(true);
+    try {
+      toast.ok(await api.googleReauthorize(id));
+      setConnectionError('');
+      await load();
+    } catch (e) {
+      toast.error(errorText(e));
+    } finally {
+      setReauthing(false);
+      void refresh();
+    }
+  };
+
   const saveSecret = async () => {
     if (!secretFor || !secretValue) return;
     setSecretSaving(true);
@@ -323,7 +356,7 @@ export function DrivePropertiesPage() {
         <div className="rise mx-auto grid w-full max-w-[1100px] grid-cols-1 gap-4 p-5 lg:grid-cols-2">
           {connectionError || (live?.state === 'failed' && live.message) ? <div className="lg:col-span-2"><RecoveryPanel message={connectionError || live?.message || ''} busy={checking || toggling} onAction={(action) => {
             if (action === 'retry') { void check(); return; }
-            if (action === 'credentials') { setSecretFor(detail?.secrets[0] ?? null); return; }
+            if (action === 'credentials') { openCredentials(); return; }
             if (action === 'mountPoint') { document.querySelector<HTMLInputElement>('[data-mount-point]')?.focus(); return; }
             document.getElementById('drive-connection')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
           }} /></div> : null}
@@ -420,7 +453,12 @@ export function DrivePropertiesPage() {
                   <SecretRow
                     key={s.field}
                     info={s}
+                    busy={s.field === 'refresh_token' && reauthing}
                     onChange={() => {
+                      if (s.field === 'refresh_token') {
+                        void reauthorize();
+                        return;
+                      }
                       setSecretValue('');
                       setSecretFor(s);
                     }}
@@ -543,7 +581,7 @@ export function DrivePropertiesPage() {
         </div>
       )}
 
-      {connectionOpen && detail ? <ConnectionEditor detail={detail} onClose={() => setConnectionOpen(false)} onCredentials={() => setSecretFor(detail.secrets[0] ?? null)} onSaved={async () => { await load(); await refresh(); setConnectionError(''); }} /> : null}
+      {connectionOpen && detail ? <ConnectionEditor detail={detail} onClose={() => setConnectionOpen(false)} onCredentials={openCredentials} onSaved={async () => { await load(); await refresh(); setConnectionError(''); }} /> : null}
       <Modal
         isOpen={secretFor !== null}
         onClose={() => {

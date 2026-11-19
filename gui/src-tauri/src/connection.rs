@@ -63,6 +63,13 @@ pub fn connection_fields(backend: &BackendConfig) -> BTreeMap<String, String> {
                 .into(),
             ),
         ],
+        BackendConfig::GoogleDrive(c) => vec![
+            (
+                "sharedDriveId",
+                c.shared_drive_id.clone().unwrap_or_default(),
+            ),
+            ("rootFolderId", c.root_folder_id.clone().unwrap_or_default()),
+        ],
     };
     fields
         .into_iter()
@@ -184,6 +191,10 @@ pub fn edited_backend(
             if c.tls == FtpTls::None && c.pinned_cert_sha256.is_some() {
                 return Err(bad("인증서 지문을 사용하려면 TLS를 선택하세요"));
             }
+        }
+        BackendConfig::GoogleDrive(c) => {
+            c.shared_drive_id = drive_item_id("공유 드라이브 ID", Some(v("sharedDriveId")))?;
+            c.root_folder_id = drive_item_id("루트 폴더 ID", Some(v("rootFolderId")))?;
         }
     }
     Ok(out)

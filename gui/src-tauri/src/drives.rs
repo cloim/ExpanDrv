@@ -1,8 +1,9 @@
 //! 드라이브 설정 입력 검증, 설정 파일 반영, 비밀 값 저장. 화면 입력은 여기서 모두 다시 검사합니다.
 
 use expandrv_core::config::{
-    BackendConfig, CacheConfig, Config, DriveConfig, FtpConfig, FtpTls, ProxyConfig, S3Config,
-    SecretResolver, SecretSource, SftpConfig, TransferConfig, WebDavConfig, WriteMode,
+    BackendConfig, CacheConfig, Config, DriveConfig, FtpConfig, FtpTls, GoogleDriveConfig,
+    ProxyConfig, S3Config, SecretResolver, SecretSource, SftpConfig, TransferConfig, WebDavConfig,
+    WriteMode,
 };
 use expandrv_core::{Error, Result};
 use expandrv_secrets::{CredentialStore, MAX_SECRET_BYTES, target_for};
@@ -30,6 +31,11 @@ impl Secret {
     /// 빈 값은 입력하지 않은 것으로 봅니다.
     fn provided(&self) -> bool {
         !self.0.expose_secret().is_empty()
+    }
+
+    /// 입력한 값. 비어 있으면 `None`입니다.
+    pub fn into_value(self) -> Option<SecretString> {
+        self.provided().then_some(self.0)
     }
 }
 
@@ -158,6 +164,59 @@ pub enum BackendInput {
         encoding: String,
         root: String,
     },
+    Gdrive {
+        client_id: String,
+        client_secret: Option<Secret>,
+        /// `google_sign_in`이 돌려준 로그인 세션 표식. 갱신 토큰은 화면으로 보내지 않습니다.
+        session: String,
+        #[serde(default)]
+        shared_drive_id: Option<String>,
+        #[serde(default)]
+        root_folder_id: Option<String>,
+        /// 명령이 로그인 세션에서 채웁니다.
+        #[serde(skip)]
+        login: Option<GoogleLogin>,
+    },
+}
+
+/// 브라우저 로그인으로 받은 값. 화면 입력에서는 만들 수 없습니다.
+#[derive(Clone)]
+pub struct GoogleLogin {
+    pub client_id: String,
+    pub refresh_token: SecretString,
+    pub account: Option<String>,
+}
+
+impl std::fmt::Debug for GoogleLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleLogin")
+            .field("client_id", &self.client_id)
+            .field("account", &self.account)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Google Drive 항목 ID(영문, 숫자, `-`, `_`). 비우면 `None`입니다.
+pub fn drive_item_id(what: &str, value: Option<String>) -> Result<Option<String>> {
+    let Some(v) = optional(what, value, 256)? else {
+        return Ok(None);
+    };
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(bad(format!("{what}에는 영문, 숫자, -, _만 쓸 수 있습니다")));
+    }
+    Ok(Some(v))
+}
+
+/// OAuth 클라이언트 ID
+pub fn check_client_id(value: &str) -> Result<String> {
+    let v = required("OAuth 클라이언트 ID", value, 256)?;
+    if v.contains(char::is_whitespace) {
+        return Err(bad("OAuth 클라이언트 ID에 공백을 넣을 수 없습니다"));
+    }
+    Ok(v)
 }
 
 /// 드라이브 id: 캐시 폴더와 자격 증명 대상 이름에 쓰므로 영문, 숫자, `-`, `_`만 받습니다.
@@ -468,6 +527,35 @@ pub fn build_backend(
                 root: remote_root(&root)?,
             })
         }
+        BackendInput::Gdrive {
+            client_id,
+            client_secret,
+            session: _,
+            shared_drive_id,
+            root_folder_id,
+            login,
+        } => {
+            let client_id = check_client_id(&client_id)?;
+            let login = login.ok_or_else(|| bad("Google 계정으로 로그인하세요"))?;
+            if login.client_id != client_id {
+                return Err(bad(
+                    "로그인한 뒤 OAuth 클라이언트 ID가 바뀌었습니다. 다시 로그인하세요",
+                ));
+            }
+            let target = target_for(id, "refresh_token");
+            pending.push(PendingSecret {
+                target: target.clone(),
+                value: login.refresh_token,
+            });
+            BackendConfig::GoogleDrive(GoogleDriveConfig {
+                client_id,
+                client_secret: secret_ref(id, "client_secret", client_secret, pending)?,
+                refresh_token: SecretSource::Credential { target },
+                shared_drive_id: drive_item_id("공유 드라이브 ID", shared_drive_id)?,
+                root_folder_id: drive_item_id("루트 폴더 ID", root_folder_id)?,
+                account: login.account,
+            })
+        }
     })
 }
 
@@ -693,6 +781,12 @@ fn stale_proxy_target(
 /// 드라이브 설정에서 비밀 값 참조 칸을 찾습니다.
 fn secret_slot<'a>(d: &'a mut DriveConfig, field: &str) -> Result<&'a mut Option<SecretSource>> {
     let missing = || bad(format!("이 드라이브에는 {field} 항목이 없습니다"));
+    if field == "client_secret" {
+        return match &mut d.backend {
+            BackendConfig::GoogleDrive(c) => Ok(&mut c.client_secret),
+            _ => Err(missing()),
+        };
+    }
     match (field, &mut d.backend) {
         ("password", BackendConfig::Webdav(c)) => Ok(&mut c.password),
         ("password", BackendConfig::Sftp(c)) => Ok(&mut c.password),
@@ -754,6 +848,45 @@ pub fn set_drive_secret(
         &[PendingSecret {
             target,
             value: value.0,
+        }],
+    )
+}
+
+/// 다시 로그인해 받은 갱신 토큰을 저장하고 계정 표시를 바꿉니다.
+pub fn set_google_login(
+    cfg_path: &Path,
+    store: &dyn SecretStore,
+    id: &str,
+    login: GoogleLogin,
+) -> Result<()> {
+    let mut cfg = Config::load(cfg_path)?;
+    let d = cfg
+        .drives
+        .iter_mut()
+        .find(|d| d.id == id)
+        .ok_or_else(|| bad(format!("드라이브 {id}가 없습니다")))?;
+    let BackendConfig::GoogleDrive(c) = &mut d.backend else {
+        return Err(bad("Google Drive 드라이브가 아닙니다"));
+    };
+    if c.client_id != login.client_id {
+        return Err(bad(
+            "드라이브의 OAuth 클라이언트 ID와 로그인한 클라이언트가 다릅니다",
+        ));
+    }
+    let target = target_for(id, "refresh_token");
+    c.refresh_token = SecretSource::Credential {
+        target: target.clone(),
+    };
+    if login.account.is_some() {
+        c.account = login.account;
+    }
+    commit(
+        &cfg,
+        cfg_path,
+        store,
+        &[PendingSecret {
+            target,
+            value: login.refresh_token,
         }],
     )
 }
@@ -958,6 +1091,32 @@ pub fn drive_detail(d: &DriveConfig, stored: &[String]) -> DriveDetail {
                     c.pinned_cert_sha256.as_deref().unwrap_or("-"),
                 ),
                 f("원격 루트", &c.root),
+            ]
+        }
+        BackendConfig::GoogleDrive(c) => {
+            secrets.push(secret_info(
+                "refresh_token",
+                "Google 로그인",
+                Some(&c.refresh_token),
+                stored,
+            ));
+            secrets.push(secret_info(
+                "client_secret",
+                "클라이언트 보안 비밀",
+                c.client_secret.as_ref(),
+                stored,
+            ));
+            vec![
+                f("계정", c.account.as_deref().unwrap_or("-")),
+                f(
+                    "드라이브",
+                    match &c.shared_drive_id {
+                        Some(id) => id,
+                        None => "내 드라이브",
+                    },
+                ),
+                f("루트 폴더 ID", c.root_folder_id.as_deref().unwrap_or("-")),
+                f("OAuth 클라이언트 ID", &c.client_id),
             ]
         }
     };

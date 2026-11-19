@@ -23,6 +23,9 @@ const COMMANDS: &[&str] = &[
     "lock_drives",
     "unlock_drives",
     "set_lock_pin",
+    "google_sign_in",
+    "google_cancel_sign_in",
+    "google_reauthorize",
 ];
 
 fn main() {

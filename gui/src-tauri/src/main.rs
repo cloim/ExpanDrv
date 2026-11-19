@@ -45,6 +45,7 @@ fn main() {
         .manage(AppState {
             paths,
             config_lock: Default::default(),
+            google: Default::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::agent_status,
@@ -70,6 +71,9 @@ fn main() {
             commands::lock_drives,
             commands::unlock_drives,
             commands::set_lock_pin,
+            commands::google_sign_in,
+            commands::google_cancel_sign_in,
+            commands::google_reauthorize,
         ])
         // 앱 자산 밖의 주소로 이동하지 않습니다(외부 링크 차단).
         .plugin(navigation_guard())

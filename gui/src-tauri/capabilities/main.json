@@ -28,6 +28,9 @@
     "allow-set-explorer-menu",
     "allow-launch-drive",
     "allow-set-auto-lock",
-    "allow-set-notifications"
+    "allow-set-notifications",
+    "allow-google-sign-in",
+    "allow-google-cancel-sign-in",
+    "allow-google-reauthorize"
   ]
 }

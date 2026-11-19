@@ -22,7 +22,7 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 expandrv-core.workspace = true
-expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp"] }
+expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp", "gdrive"] }
 expandrv-ipc.workspace = true
 expandrv-secrets.workspace = true
 expandrv-autostart.workspace = true

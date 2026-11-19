@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CircleAlert, CircleCheck, Cloud, Folder, Loader2, PlugZap, Server, Database, Network } from 'lucide-react';
+import { CircleAlert, CircleCheck, Cloud, Folder, HardDrive, Loader2, LogIn, PlugZap, Server, Database, Network } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { Modal } from '../components/Modal';
 import SelectControl from '../components/SelectControl';
@@ -17,6 +17,7 @@ const KINDS: { kind: BackendKind; title: string; desc: string; icon: LucideIcon 
   { kind: 'sftp', title: 'SSH / SFTP', desc: 'SSH 셸 또는 SFTP로 서버 폴더 연결', icon: Server },
   { kind: 's3', title: 'S3 호환', desc: '버킷과 접두사 단위 객체 저장소', icon: Database },
   { kind: 'ftp', title: 'FTP, FTPS', desc: '명시적, 암묵적 TLS 지원', icon: Network },
+  { kind: 'gdrive', title: 'Google Drive', desc: '내 드라이브, 공유 드라이브. 브라우저로 로그인', icon: HardDrive },
   { kind: 'local', title: '로컬 폴더', desc: '테스트와 검증용', icon: Folder },
 ];
 
@@ -48,12 +49,21 @@ const DEFAULTS: Form = {
   secretAccessKey: '',
   tls: 'explicit',
   encoding: 'utf-8',
+  clientId: '',
+  clientSecret: '',
+  sharedDriveId: '',
+  rootFolderId: '',
 };
+
+/** Google 로그인 진행 상태. 갱신 토큰은 Rust 쪽에 두고 화면은 표식만 받습니다. */
+type GoogleState = { phase: 'idle' | 'running' | 'ok' | 'fail'; session: string; account: string | null; message: string };
+const GOOGLE_IDLE: GoogleState = { phase: 'idle', session: '', account: null, message: '' };
+const DRIVE_ITEM_ID = /^[A-Za-z0-9_-]*$/;
 
 const DEFAULT_PORT: Partial<Record<BackendKind, string>> = { sftp: '22', ftp: '21' };
 
 /** 단계별 필수 입력 확인. 최종 검증은 Rust 쪽에서 다시 합니다. */
-function validateConnection(kind: BackendKind, f: Form, proxyOn: boolean, proxy: ProxyInput): Record<string, string> {
+function validateConnection(kind: BackendKind, f: Form, proxyOn: boolean, proxy: ProxyInput, signedIn = false): Record<string, string> {
   const e: Record<string, string> = {};
   const need = (key: string, msg: string) => {
     if (!f[key]?.trim()) e[key] = msg;
@@ -92,6 +102,13 @@ function validateConnection(kind: BackendKind, f: Form, proxyOn: boolean, proxy:
       need('username', '사용자를 입력하세요');
       port();
       break;
+    case 'gdrive':
+      need('clientId', 'OAuth 클라이언트 ID를 입력하세요');
+      need('clientSecret', '클라이언트 보안 비밀을 입력하세요');
+      if (!DRIVE_ITEM_ID.test(f.sharedDriveId.trim())) e.sharedDriveId = '영문, 숫자, -, _만 쓸 수 있습니다';
+      if (!DRIVE_ITEM_ID.test(f.rootFolderId.trim())) e.rootFolderId = '영문, 숫자, -, _만 쓸 수 있습니다';
+      if (!signedIn) e.signIn = 'Google 계정으로 로그인하세요';
+      break;
   }
   if (proxyOn && kind !== 'local') {
     if (!/^(socks5h?|http):\/\/[^/@\s]+:\d+\/?$/i.test(proxy.url.trim()))
@@ -100,7 +117,7 @@ function validateConnection(kind: BackendKind, f: Form, proxyOn: boolean, proxy:
   return e;
 }
 
-function toBackend(kind: BackendKind, f: Form): BackendInput {
+function toBackend(kind: BackendKind, f: Form, googleSession = ''): BackendInput {
   switch (kind) {
     case 'local':
       return { type: 'local', root: f.root };
@@ -149,6 +166,15 @@ function toBackend(kind: BackendKind, f: Form): BackendInput {
         encoding: f.encoding,
         root: f.remoteRoot,
       };
+    case 'gdrive':
+      return {
+        type: 'gdrive',
+        clientId: f.clientId.trim(),
+        clientSecret: f.clientSecret,
+        session: googleSession,
+        sharedDriveId: f.sharedDriveId.trim(),
+        rootFolderId: f.rootFolderId.trim(),
+      };
   }
 }
 
@@ -175,6 +201,7 @@ export function AddDriveWizard() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [test, setTest] = useState<TestState>({ phase: 'idle', message: '' });
   const [saving, setSaving] = useState(false);
+  const [google, setGoogle] = useState<GoogleState>(GOOGLE_IDLE);
   const firstField = useRef<HTMLInputElement>(null);
   const kindField = useRef<HTMLInputElement>(null);
 
@@ -195,6 +222,11 @@ export function AddDriveWizard() {
     if (step > 0) window.setTimeout(() => firstField.current?.focus(), 0);
   }, [step]);
 
+  // 창을 닫으면 브라우저 로그인 대기도 멈춥니다.
+  useEffect(() => () => void api.googleCancelSignIn().catch(() => false), []);
+
+  const signedIn = google.phase === 'ok' && google.session !== '';
+
   const set = (key: string) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const value = e.target.value;
     setForm((f) => {
@@ -206,6 +238,11 @@ export function AddDriveWizard() {
     });
     setErrors(({ [key]: _, ...rest }) => rest);
     setTest({ phase: 'idle', message: '' });
+    // 로그인은 OAuth 클라이언트에 묶이므로 클라이언트를 바꾸면 다시 로그인합니다.
+    if (key === 'clientId' || key === 'clientSecret') {
+      if (google.phase === 'running') void api.googleCancelSignIn().catch(() => false);
+      setGoogle(GOOGLE_IDLE);
+    }
   };
 
   const chooseKind = (k: BackendKind) => {
@@ -217,13 +254,31 @@ export function AddDriveWizard() {
 
   const proxyInput = (): ProxyInput | null => (proxyOn && kind !== 'local' ? proxy : null);
 
+  const signIn = async () => {
+    if (google.phase === 'running') {
+      await api.googleCancelSignIn().catch(() => false);
+      return;
+    }
+    const e = validateConnection(kind, form, proxyOn, proxy, true);
+    setErrors(e);
+    if (Object.keys(e).length) return;
+    setGoogle({ ...GOOGLE_IDLE, phase: 'running' });
+    setTest({ phase: 'idle', message: '' });
+    try {
+      const r = await api.googleSignIn(form.clientId.trim(), form.clientSecret, proxyInput());
+      setGoogle({ phase: 'ok', session: r.session, account: r.account, message: '' });
+    } catch (err) {
+      setGoogle({ ...GOOGLE_IDLE, phase: 'fail', message: errorText(err) });
+    }
+  };
+
   const runTest = async () => {
-    const e = validateConnection(kind, form, proxyOn, proxy);
+    const e = validateConnection(kind, form, proxyOn, proxy, signedIn);
     setErrors(e);
     if (Object.keys(e).length) return;
     setTest({ phase: 'running', message: '' });
     try {
-      setTest({ phase: 'ok', message: await api.testConnection(toBackend(kind, form), proxyInput()) });
+      setTest({ phase: 'ok', message: await api.testConnection(toBackend(kind, form, google.session), proxyInput()) });
     } catch (err) {
       setTest({ phase: 'fail', message: errorText(err) });
     }
@@ -240,7 +295,7 @@ export function AddDriveWizard() {
 
   const next = () => {
     if (step === 1) {
-      const e = validateConnection(kind, form, proxyOn, proxy);
+      const e = validateConnection(kind, form, proxyOn, proxy, signedIn);
       setErrors(e);
       if (Object.keys(e).length) return;
     }
@@ -258,7 +313,7 @@ export function AddDriveWizard() {
       readOnly,
       autoMount,
       proxy: proxyInput(),
-      backend: toBackend(kind, form),
+      backend: toBackend(kind, form, google.session),
     };
     setSaving(true);
     try {
@@ -401,6 +456,48 @@ export function AddDriveWizard() {
           {input('pinnedCertSha256', '인증서 SHA-256 지문', { hint: '선택', mono: true })}
           <p className="text-xs leading-relaxed text-ink-2">자체 서명 인증서나 사설 인증서를 사용하면 서버 관리자에게 확인한 SHA-256 지문을 입력하세요<br />비우면 Windows의 신뢰 저장소로 검증합니다</p>
         </div> : null}
+      </>
+    ),
+    gdrive: (
+      <>
+        <div className="grid grid-cols-2 gap-4">
+          {input('clientId', 'OAuth 클라이언트 ID', { placeholder: '1234-abc.apps.googleusercontent.com', mono: true, first: true })}
+          {input('clientSecret', '클라이언트 보안 비밀', { type: 'password' })}
+        </div>
+        <p className="break-keep text-xs leading-relaxed text-ink-3">
+          Google Cloud 콘솔에서 Google Drive API를 사용 설정하고 데스크톱 앱 유형의 OAuth 클라이언트를 만드세요
+          <br />
+          로그인 정보는 이 컴퓨터의 Windows 자격 증명 관리자에만 저장합니다
+        </p>
+        <div className="flex min-h-[44px] items-start gap-3 rounded-xl border border-line p-3">
+          <button type="button" className={`btn flex-none ${signedIn ? 'btn-ghost' : 'btn-primary'}`} onClick={() => void signIn()}>
+            {google.phase === 'running' ? <Loader2 size={16} className="spin" aria-hidden="true" /> : <LogIn size={16} aria-hidden="true" />}
+            {google.phase === 'running' ? '로그인 취소' : signedIn ? '다른 계정으로 로그인' : 'Google 계정으로 로그인'}
+          </button>
+          <p className="min-w-0 self-center text-[13px]" role="status" aria-live="polite">
+            {google.phase === 'running' ? (
+              <span className="text-ink-2">브라우저에서 로그인하고 Drive 접근을 허용하세요</span>
+            ) : signedIn ? (
+              <span className="inline-flex items-center gap-1.5 font-semibold text-ok">
+                <CircleCheck size={16} aria-hidden="true" />
+                {google.account ? `${google.account} 계정으로 로그인했습니다` : '로그인했습니다'}
+              </span>
+            ) : google.phase === 'fail' ? (
+              <span className="inline-flex items-start gap-1.5 break-all text-danger">
+                <CircleAlert size={16} className="mt-0.5 flex-none" aria-hidden="true" />
+                {google.message}
+              </span>
+            ) : errors.signIn ? (
+              <span className="text-danger">{errors.signIn}</span>
+            ) : (
+              <span className="text-ink-3">기본 브라우저에서 Google 로그인 창이 열립니다</span>
+            )}
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          {input('sharedDriveId', '공유 드라이브 ID', { hint: '비우면 내 드라이브', mono: true })}
+          {input('rootFolderId', '루트 폴더 ID', { hint: '선택, 폴더 주소의 마지막 부분', mono: true })}
+        </div>
       </>
     ),
   };

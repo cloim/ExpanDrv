@@ -458,3 +458,122 @@ fn typed_secrets_resolve_only_entered_values() {
             .is_err()
     );
 }
+
+fn google_input(client_id: &str, login: Option<GoogleLogin>) -> NewDrive {
+    let mut d: NewDrive = json(serde_json::json!({
+        "id": "gd", "label": "Google", "mountPoint": "g:", "readOnly": false, "autoMount": true,
+        "proxy": null,
+        "backend": {
+            "type": "gdrive", "clientId": client_id, "clientSecret": "cs-value",
+            "session": "google-0", "sharedDriveId": " 0AbC ", "rootFolderId": ""
+        }
+    }));
+    if let BackendInput::Gdrive { login: slot, .. } = &mut d.backend {
+        *slot = login;
+    }
+    d
+}
+
+fn login(client_id: &str, token: &str) -> GoogleLogin {
+    GoogleLogin {
+        client_id: client_id.into(),
+        refresh_token: SecretString::from(token),
+        account: Some("me@example.com".into()),
+    }
+}
+
+#[test]
+fn google_drive_needs_a_login_and_stores_tokens_as_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    let store = MemStore::default();
+    // 화면 입력만으로는 로그인 결과를 만들 수 없습니다.
+    assert!(add_drive(&cfg_path, &store, google_input("cid", None)).is_err());
+    let bad: std::result::Result<NewDrive, _> = serde_json::from_value(serde_json::json!({
+        "id": "gd", "label": "G", "mountPoint": "G:", "readOnly": false, "autoMount": false, "proxy": null,
+        "backend": { "type": "gdrive", "clientId": "c", "session": "s", "login": {"refreshToken": "x"} }
+    }));
+    assert!(bad.is_err(), "login 필드는 화면에서 받지 않습니다");
+    assert!(
+        add_drive(
+            &cfg_path,
+            &store,
+            google_input("other", Some(login("cid", "1//rt")))
+        )
+        .is_err()
+    );
+    assert!(store.items.borrow().is_empty());
+
+    add_drive(
+        &cfg_path,
+        &store,
+        google_input("cid", Some(login("cid", "1//rt"))),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        !text.contains("1//rt") && !text.contains("cs-value"),
+        "{text}"
+    );
+    let cfg = Config::load(&cfg_path).unwrap();
+    let d = cfg.drive("gd").unwrap();
+    let BackendConfig::GoogleDrive(g) = &d.backend else {
+        panic!()
+    };
+    assert_eq!(g.shared_drive_id.as_deref(), Some("0AbC"));
+    assert_eq!(g.root_folder_id, None);
+    assert_eq!(g.account.as_deref(), Some("me@example.com"));
+    assert_eq!(store.items.borrow()["ExpanDrv/gd/refresh_token"], "1//rt");
+    assert_eq!(
+        store.items.borrow()["ExpanDrv/gd/client_secret"],
+        "cs-value"
+    );
+
+    let detail = drive_detail(d, &store.list("ExpanDrv/gd/").unwrap());
+    assert_eq!(detail.backend, "gdrive");
+    assert!(detail.secrets.iter().all(|s| s.stored));
+    assert!(!serde_json::to_string(&detail).unwrap().contains("1//rt"));
+
+    // 공개 연결 필드는 공유 드라이브와 루트 폴더만 고칩니다.
+    let mut fields = connection::connection_fields(&d.backend);
+    assert_eq!(
+        fields.keys().collect::<Vec<_>>(),
+        ["rootFolderId", "sharedDriveId"]
+    );
+    fields.insert("sharedDriveId".into(), String::new());
+    fields.insert("rootFolderId".into(), "1FoLdEr_x".into());
+    let BackendConfig::GoogleDrive(edited) =
+        connection::edited_backend(&d.backend, &fields).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(edited.shared_drive_id, None);
+    assert_eq!(edited.root_folder_id.as_deref(), Some("1FoLdEr_x"));
+    assert_eq!(edited.refresh_token, g.refresh_token);
+    fields.insert("rootFolderId".into(), "../x".into());
+    assert!(connection::edited_backend(&d.backend, &fields).is_err());
+
+    // 다시 로그인하면 같은 대상에 새 토큰을 저장합니다.
+    assert!(set_google_login(&cfg_path, &store, "gd", login("other", "1//x")).is_err());
+    set_google_login(&cfg_path, &store, "gd", login("cid", "1//new")).unwrap();
+    assert_eq!(store.items.borrow()["ExpanDrv/gd/refresh_token"], "1//new");
+    set_drive_secret(
+        &cfg_path,
+        &store,
+        "gd",
+        "client_secret",
+        Secret(SecretString::from("cs2")),
+    )
+    .unwrap();
+    assert_eq!(store.items.borrow()["ExpanDrv/gd/client_secret"], "cs2");
+    assert!(
+        set_drive_secret(
+            &cfg_path,
+            &store,
+            "gd",
+            "password",
+            Secret(SecretString::from("x"))
+        )
+        .is_err()
+    );
+}

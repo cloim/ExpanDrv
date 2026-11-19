@@ -9,6 +9,7 @@ use expandrv_core::config::{
 use expandrv_ipc::{AgentStatus, DriveState, Request};
 use expandrv_secrets::{CredentialStore, Secrets};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -55,6 +56,56 @@ pub struct AppState {
     pub paths: Paths,
     /// 설정 파일 읽기, 고치기, 쓰기를 한 번에 하나만 합니다.
     pub config_lock: Mutex<()>,
+    pub google: GoogleAuth,
+}
+
+/// 브라우저 로그인 상태. 받은 갱신 토큰은 이 프로세스 메모리에만 두고 화면에는 표식만 줍니다.
+#[derive(Default)]
+pub struct GoogleAuth {
+    sessions: Mutex<HashMap<String, drives::GoogleLogin>>,
+    next: std::sync::atomic::AtomicU64,
+    /// 진행 중인 로그인. 새 로그인이나 취소가 오면 멈춥니다.
+    pending: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl GoogleAuth {
+    fn cancel(&self) -> bool {
+        match self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(h) => {
+                h.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 화면이 보낸 표식으로 로그인 결과를 붙입니다.
+    fn attach(&self, backend: &mut BackendInput) -> Result<()> {
+        if let BackendInput::Gdrive { session, login, .. } = backend {
+            *login = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session.as_str())
+                .cloned();
+            if login.is_none() {
+                return Err("Google 계정으로 다시 로그인하세요".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn forget(&self, session: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
+    }
 }
 
 impl AppState {
@@ -281,10 +332,160 @@ pub async fn get_drive(state: State<'_, AppState>, id: String) -> Result<DriveDe
 }
 
 #[tauri::command]
-pub async fn add_drive(state: State<'_, AppState>, drive: NewDrive) -> Result<String> {
+pub async fn add_drive(state: State<'_, AppState>, mut drive: NewDrive) -> Result<String> {
+    state.google.attach(&mut drive.backend)?;
+    let session = match &drive.backend {
+        BackendInput::Gdrive { session, .. } => Some(session.clone()),
+        _ => None,
+    };
     let id = state.edit(|p| drives::add_drive(p, &CredentialStore, drive))?;
+    // 저장한 갱신 토큰은 자격 증명 관리자에만 남깁니다.
+    if let Some(session) = session {
+        state.google.forget(&session);
+    }
     state.reload().await?;
     Ok(id)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSignIn {
+    /// 드라이브 추가와 연결 확인에 넘길 로그인 표식
+    pub session: String,
+    pub account: Option<String>,
+}
+
+/// 기본 브라우저로 Google 로그인을 진행합니다. 루프백 리다이렉트를 받을 때까지 기다립니다.
+async fn sign_in(
+    state: &AppState,
+    http: expandrv_backends::gdrive::HttpClient,
+    client: expandrv_backends::gdrive::oauth::OAuthClient,
+) -> Result<drives::GoogleLogin> {
+    use expandrv_backends::gdrive::{self, oauth};
+    let client_id = client.id.clone();
+    let task = tokio::spawn(async move {
+        let auth = oauth::sign_in(&http, &client, |url| {
+            if let Err(e) = oauth::open_browser(url) {
+                eprintln!("브라우저를 열지 못했습니다: {e}");
+            }
+        })
+        .await?;
+        let account = gdrive::account_for(&http, &client, &auth).await;
+        Ok::<_, expandrv_core::Error>((auth.refresh_token, account))
+    });
+    if let Some(old) = state
+        .google
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(task.abort_handle())
+    {
+        old.abort();
+    }
+    let done = task.await;
+    state
+        .google
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_if(|h| h.is_finished());
+    match done {
+        Ok(Ok((refresh_token, account))) => Ok(drives::GoogleLogin {
+            client_id,
+            refresh_token,
+            account,
+        }),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) if e.is_cancelled() => Err("Google 로그인을 취소했습니다".into()),
+        Err(e) => Err(format!("Google 로그인 작업이 중단되었습니다: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn google_sign_in(
+    state: State<'_, AppState>,
+    client_id: String,
+    client_secret: Option<Secret>,
+    proxy: Option<ProxyInput>,
+) -> Result<GoogleSignIn> {
+    require_unlocked(&state).await?;
+    let client_id = drives::check_client_id(&client_id).map_err(|e| e.to_string())?;
+    let mut pending = Vec::new();
+    let proxy = drives::build_proxy("google-sign-in", proxy, None, &mut pending)
+        .map_err(|e| e.to_string())?;
+    let http = expandrv_backends::gdrive::sign_in_client(
+        proxy.as_ref(),
+        &drives::TypedSecrets::new(pending),
+    )
+    .map_err(|e| e.to_string())?;
+    let client = expandrv_backends::gdrive::oauth::OAuthClient {
+        id: client_id,
+        secret: client_secret.and_then(Secret::into_value),
+    };
+    let login = sign_in(&state, http, client).await?;
+    let n = state
+        .google
+        .next
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let session = format!("google-{n}");
+    let account = login.account.clone();
+    state
+        .google
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session.clone(), login);
+    Ok(GoogleSignIn { session, account })
+}
+
+/// 진행 중인 Google 로그인을 멈춥니다. 멈춘 로그인이 있었으면 true입니다.
+#[tauri::command]
+pub async fn google_cancel_sign_in(state: State<'_, AppState>) -> Result<bool> {
+    Ok(state.google.cancel())
+}
+
+/// 저장한 Google Drive 드라이브에 다시 로그인해 갱신 토큰을 바꿉니다.
+#[tauri::command]
+pub async fn google_reauthorize(state: State<'_, AppState>, id: String) -> Result<String> {
+    require_unlocked(&state).await?;
+    let cfg = state.load()?;
+    let d = cfg
+        .drive(&id)
+        .ok_or_else(|| format!("드라이브 {id}가 없습니다"))?;
+    let BackendConfig::GoogleDrive(g) = &d.backend else {
+        return Err("Google Drive 드라이브가 아닙니다".into());
+    };
+    let secret = g
+        .client_secret
+        .as_ref()
+        .map(|s| Secrets.resolve(s))
+        .transpose()
+        .map_err(|e| format!("클라이언트 보안 비밀을 읽지 못했습니다: {e}"))?;
+    let http = expandrv_backends::gdrive::sign_in_client(d.proxy.as_ref(), &Secrets)
+        .map_err(|e| e.to_string())?;
+    let client = expandrv_backends::gdrive::oauth::OAuthClient {
+        id: g.client_id.clone(),
+        secret,
+    };
+    let login = sign_in(&state, http, client).await?;
+    let account = login.account.clone();
+    state.edit(|p| drives::set_google_login(p, &CredentialStore, &id, login))?;
+    let mounted = match agent::connect(&state.paths.pipe).await? {
+        Some(mut link) => link
+            .status()
+            .await?
+            .drives
+            .iter()
+            .any(|d| d.id == id && d.state == DriveState::Mounted),
+        None => false,
+    };
+    state.reload().await?;
+    let who = account.map(|a| format!(": {a}")).unwrap_or_default();
+    Ok(if mounted {
+        format!("다시 로그인했습니다{who} | 해제한 뒤 다시 마운트하면 적용됩니다")
+    } else {
+        format!("다시 로그인했습니다{who}")
+    })
 }
 
 #[tauri::command]
@@ -388,6 +589,8 @@ pub async fn test_connection(
     proxy: Option<ProxyInput>,
 ) -> Result<String> {
     require_unlocked(&state).await?;
+    let mut backend = backend;
+    state.google.attach(&mut backend)?;
     // 대상 이름은 메모리 안에서 참조를 잇는 데만 씁니다.
     const ID: &str = "connection-test";
     let mut pending = Vec::new();

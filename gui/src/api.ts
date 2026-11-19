@@ -2,7 +2,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export type DriveState = 'mounted' | 'unmounted' | 'failed';
-export type BackendKind = 'local' | 'webdav' | 'sftp' | 's3' | 'ftp';
+export type BackendKind = 'local' | 'webdav' | 'sftp' | 's3' | 'ftp' | 'gdrive';
 
 export interface DriveRow {
   id: string;
@@ -125,7 +125,21 @@ export type BackendInput =
       pinnedCertSha256?: string;
       encoding: string;
       root: string;
+    }
+  | {
+      type: 'gdrive';
+      clientId: string;
+      clientSecret: string;
+      /** googleSignIn이 돌려준 로그인 표식 */
+      session: string;
+      sharedDriveId: string;
+      rootFolderId: string;
     };
+
+export interface GoogleSignIn {
+  session: string;
+  account: string | null;
+}
 
 export interface NewDrive {
   id: string;
@@ -208,6 +222,11 @@ export const api = {
   setNotifications: (notifications: NotificationSettings) =>
     call<SettingsView>('set_notifications', { notifications }),
   stopAgent: () => call<boolean>('stop_agent'),
+  /** 기본 브라우저로 Google 로그인을 열고 끝날 때까지 기다립니다. */
+  googleSignIn: (clientId: string, clientSecret: string, proxy: ProxyInput | null) =>
+    call<GoogleSignIn>('google_sign_in', { clientId, clientSecret, proxy }),
+  googleCancelSignIn: () => call<boolean>('google_cancel_sign_in'),
+  googleReauthorize: (id: string) => call<string>('google_reauthorize', { id }),
 };
 
 export const BACKEND_LABEL: Record<string, string> = {
@@ -216,6 +235,7 @@ export const BACKEND_LABEL: Record<string, string> = {
   sftp: 'SSH / SFTP',
   s3: 'S3 호환',
   ftp: 'FTP',
+  gdrive: 'Google Drive',
 };
 
 export const STATE_LABEL: Record<DriveState, string> = {

@@ -6,7 +6,9 @@ export function recoveryAdvice(message: string): RecoveryAdvice {
     return { title: '서버 인증서 확인', text: '인증서 발급자를 신뢰할 수 없습니다. 서버 관리자에게 확인한 SHA-256 지문을 연결 정보에 입력하거나 신뢰할 수 있는 인증서를 서버에 설치하세요', action: 'connection' };
   if (/인증서|certificate|known.?hosts|호스트.?키|host key|fingerprint/i.test(message))
     return { title: '서버 신원 확인', text: '서버 관리자에게 인증서 지문 또는 호스트 키를 확인한 뒤 연결 정보를 수정하세요', action: 'connection' };
-  if (/인증|암호|비밀번호|401|403|authentication|permission denied|권한/i.test(message))
+  if (/Drive API를 사용 설정/i.test(message))
+    return { title: 'Google Cloud 설정 확인', text: 'OAuth 클라이언트를 만든 Google Cloud 프로젝트에서 Google Drive API를 사용 설정한 뒤 다시 검사하세요', action: 'retry' };
+  if (/인증|암호|비밀번호|로그인|401|403|authentication|permission denied|권한/i.test(message))
     return { title: '계정과 접근 권한 확인', text: '저장된 자격 증명을 갱신하고 계정의 폴더 접근 권한을 확인하세요', action: 'credentials' };
   if (/마운트.*(사용|중복|존재)|drive.*(used|exists)|지점.*(사용|중복)|드라이브 문자/i.test(message))
     return { title: '마운트 지점 확인', text: '사용 가능한 드라이브 문자 또는 빈 폴더 경로를 지정하고 다시 연결하세요', action: 'mountPoint' };
