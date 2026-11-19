@@ -2,7 +2,7 @@
 
 원격 스토리지를 Windows 드라이브 문자 또는 폴더로 마운트하는 Rust 네이티브 앱입니다. 탐색기와 일반 프로그램에서 로컬 디스크처럼 읽고 쓸 수 있습니다.
 
-> CLI, 상주 에이전트와 데스크톱 GUI(Tauri 2), 트레이 상태와 알림, PIN 잠금과 Windows 자동 잠금을 지원합니다. Windows 설치 EXE와 MSI를 만들 수 있습니다. OneDrive와 Google Drive OAuth 연동은 후속 작업입니다.
+> CLI, 상주 에이전트와 데스크톱 GUI(Tauri 2), 트레이 상태와 알림, PIN 잠금과 Windows 자동 잠금을 지원합니다. Windows 설치 EXE와 MSI를 만들 수 있습니다. Google Drive는 OAuth 2.0 PKCE로 연결하며, OneDrive 연동은 후속 작업입니다.
 
 ## 지원 스토리지
 
@@ -13,7 +13,8 @@
 | SFTP | 지원 | 암호와 OpenSSH 개인키(암호문 포함), known_hosts 검증 |
 | S3 호환 | 지원 | 경로 방식과 가상 호스트 방식, 멀티파트 업로드 |
 | FTP, FTPS | 지원 | 명시적과 암묵적 TLS, 인증서 SHA-256 고정, 서버 문자셋 선택 |
-| OneDrive, Google Drive 등 | 계획 | OAuth 2.0 PKCE |
+| Google Drive | 지원 | 내 드라이브와 공유 드라이브, OAuth 2.0 PKCE 브라우저 로그인, 재개 가능 업로드 |
+| OneDrive 등 | 계획 | OAuth 2.0 PKCE |
 
 FTPS에서 `UnknownIssuer`가 표시되면 서버 인증서의 발급자를 Windows가 신뢰하지 못한 상태입니다. 드라이브 추가 또는 연결 정보 수정에서 서버 관리자에게 확인한 **인증서 SHA-256 지문**을 입력하면 해당 인증서만 허용합니다. 지문을 비우면 기존 Windows 신뢰 저장소 검증을 사용하며, 서버 인증서가 바뀌면 지문을 다시 확인해야 합니다. CLI에서는 `ftp --pin-sha256 <SHA-256 지문>`, 설정 파일에서는 FTP 백엔드의 `pinned_cert_sha256`을 사용합니다.
 
@@ -122,6 +123,10 @@ expandrv add bucket B: --proxy socks5h://proxy.example.com:1080 s3 https://s3.ex
 # 환경 변수 참조도 쓸 수 있습니다(--password-env, --secret-env 등)
 expandrv add ftp1 F: ftp ftp.example.com --user me --password-env FTP_PASSWORD
 
+# Google Drive: 클라이언트 보안 비밀을 입력받은 뒤 기본 브라우저로 로그인
+expandrv add gd G: --label Google gdrive --client-id 1234-abc.apps.googleusercontent.com --ask-client-secret
+expandrv login gd           # 로그인이 만료되거나 취소되었을 때 다시 로그인
+
 expandrv list               # 드라이브와 마운트 상태
 expandrv check nas          # 연결과 인증만 확인
 expandrv mount              # 전체 마운트(에이전트가 없으면 백그라운드로 시작)
@@ -162,6 +167,34 @@ password = { from = "env", var = "NAS_PASSWORD" }
 ```
 
 `--ask-password`로 추가하면 `password = { from = "credential", target = "ExpanDrv/nas/password" }`처럼 기록됩니다. 드라이브별 `auto_mount = true`와 `[drive.proxy]`(`url`, `username`, `password`)도 설정할 수 있습니다. `auto_mount` 드라이브는 에이전트가 시작될 때마다 마운트합니다. 로그인 자동 실행, GUI 실행과 CLI 명령 중 어느 경로로 시작해도 같습니다.
+
+### Google Drive
+
+Google Drive는 사용자가 만든 OAuth 클라이언트로 연결합니다. 처음 한 번 아래처럼 준비합니다.
+
+1. [Google Cloud 콘솔](https://console.cloud.google.com/)에서 프로젝트를 만들고 **Google Drive API**를 사용 설정합니다.
+2. **OAuth 동의 화면**을 구성합니다. 외부 앱을 테스트 상태로 두면 테스트 사용자로 등록한 계정만 로그인할 수 있고, 갱신 토큰이 7일 뒤 만료됩니다. 계속 쓰려면 앱을 게시하세요.
+3. **사용자 인증 정보 → OAuth 클라이언트 ID 만들기**에서 유형을 **데스크톱 앱**으로 선택하고 클라이언트 ID와 보안 비밀을 복사합니다.
+4. GUI의 **드라이브 추가 → Google Drive**에서 두 값을 입력하고 **Google 계정으로 로그인**을 누릅니다. 기본 브라우저에서 로그인하고 Drive 접근을 허용하면 `127.0.0.1` 루프백 주소로 결과를 받습니다. 완료 페이지가 보이면 브라우저 창을 닫아도 됩니다.
+
+갱신 토큰과 클라이언트 보안 비밀은 자격 증명 관리자(`ExpanDrv/<id>/refresh_token`, `ExpanDrv/<id>/client_secret`)에 저장하고, 설정 파일에는 참조와 계정 이메일만 남깁니다. 접근 토큰은 메모리에만 두고 만료 전에 갱신합니다. 로그인이 만료되면 드라이브 속성의 **다시 로그인** 또는 `expandrv login <id>`를 사용하고, 마운트 중이면 해제한 뒤 다시 마운트하세요.
+
+- **공유 드라이브 ID**를 입력하면 해당 공유 드라이브를, **루트 폴더 ID**를 입력하면 그 폴더를 드라이브 루트로 씁니다. 폴더 ID는 Drive 웹 주소 `folders/` 뒤의 값입니다.
+- Google 문서, 스프레드시트, 프레젠테이션 같은 Workspace 파일과 바로가기는 내려받을 원본 파일이 없어 목록에 보이지 않습니다. 이런 파일이 든 폴더는 비어 있지 않은 것으로 보고 지우지 않습니다.
+- Drive는 같은 폴더에 같은 이름을 여러 개 둘 수 있습니다. ExpanDrv는 가장 최근에 수정한 항목 하나만 보여 줍니다. `/` 등 Windows에서 쓸 수 없는 문자가 든 이름도 보이지 않습니다.
+- 삭제한 파일과 덮어쓴 파일은 Drive 휴지통으로 옮기므로 Drive 웹에서 되살릴 수 있습니다.
+- 업로드는 5MiB 이하이면 한 번의 요청으로, 그보다 크면 재개 가능 업로드로 보냅니다. 실시간 업로드 모드에서는 쓰는 동안 8MiB 조각으로 전송합니다.
+
+```toml
+[drive.backend]
+type = "gdrive"
+client_id = "1234-abc.apps.googleusercontent.com"
+client_secret = { from = "credential", target = "ExpanDrv/gd/client_secret" }
+refresh_token = { from = "credential", target = "ExpanDrv/gd/refresh_token" }
+shared_drive_id = "0AbCdEf..."   # 선택: 공유 드라이브
+root_folder_id = "1FoLdEr..."    # 선택: 드라이브 루트로 쓸 폴더
+account = "me@example.com"       # 표시용
+```
 
 로그는 `EXPANDRV_LOG` 환경 변수로 조정합니다(예: `EXPANDRV_LOG=expandrv=debug`). 백그라운드 에이전트 로그는 `%LOCALAPPDATA%\ExpanDrv\logs`에 하루 단위로 7개까지 남습니다.
 
