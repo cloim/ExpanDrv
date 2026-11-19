@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "ftp")]
 pub mod ftp;
+#[cfg(feature = "gdrive")]
+pub mod gdrive;
 pub mod local;
 pub mod proxy;
 #[cfg(feature = "s3")]
@@ -19,7 +21,7 @@ pub mod webdav;
 mod tls;
 
 /// reqwest가 쓸 프로세스 기본 rustls 프로바이더로 ring을 설치합니다. HTTP 클라이언트를 만들기 전에 호출합니다.
-#[cfg(any(feature = "webdav", feature = "s3"))]
+#[cfg(any(feature = "webdav", feature = "s3", feature = "gdrive"))]
 pub(crate) fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -60,6 +62,10 @@ pub async fn connect(
         #[cfg(feature = "ftp")]
         BackendConfig::Ftp(c) => Ok(Arc::new(
             ftp::FtpBackend::connect_via(c, secrets, proxy).await?,
+        )),
+        #[cfg(feature = "gdrive")]
+        BackendConfig::GoogleDrive(c) => Ok(Arc::new(
+            gdrive::GoogleDriveBackend::connect_via(c, secrets, proxy).await?,
         )),
         #[allow(unreachable_patterns)]
         other => {
