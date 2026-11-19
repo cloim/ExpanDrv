@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 expandrv-core.workspace = true
-expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp"] }
+expandrv-backends = { workspace = true, features = ["webdav", "sftp", "s3", "ftp", "gdrive"] }
 expandrv-vfs.workspace = true
 expandrv-winfsp.workspace = true
 expandrv-ipc.workspace = true

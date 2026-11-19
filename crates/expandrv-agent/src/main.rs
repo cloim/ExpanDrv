@@ -10,8 +10,9 @@ use clap::{Args, Parser, Subcommand};
 use control::{AgentLink, expect_ok};
 use expandrv_autostart as autostart;
 use expandrv_core::config::{
-    BackendConfig, CacheConfig, Config, DriveConfig, FtpConfig, FtpTls, ProxyConfig, S3Config,
-    SecretSource, SftpConfig, TransferConfig, WebDavConfig,
+    BackendConfig, CacheConfig, Config, DriveConfig, EnvSecrets, FtpConfig, FtpTls,
+    GoogleDriveConfig, ProxyConfig, S3Config, SecretResolver, SecretSource, SftpConfig,
+    TransferConfig, WebDavConfig,
 };
 use expandrv_core::{Error, Result};
 use expandrv_ipc::{DriveState, ErrorCode, Request, Response};
@@ -51,6 +52,8 @@ enum Command {
     List,
     /// 연결과 인증만 확인합니다
     Check { id: String },
+    /// Google Drive 드라이브에 브라우저로 다시 로그인합니다
+    Login { id: String },
     /// 드라이브를 마운트합니다. 에이전트가 없으면 백그라운드로 시작합니다
     Mount {
         /// 마운트할 드라이브 id(생략하면 전체)
@@ -236,6 +239,24 @@ enum AddBackend {
         #[arg(long, default_value = "/")]
         root: String,
     },
+    /// Google Drive(브라우저로 로그인)
+    Gdrive {
+        /// Google Cloud 콘솔에서 만든 OAuth 클라이언트 ID(데스크톱 앱)
+        #[arg(long)]
+        client_id: String,
+        /// 클라이언트 보안 비밀을 담은 환경 변수 이름
+        #[arg(long, conflicts_with = "ask_client_secret")]
+        client_secret_env: Option<String>,
+        /// 클라이언트 보안 비밀을 입력받아 자격 증명 관리자에 저장
+        #[arg(long)]
+        ask_client_secret: bool,
+        /// 공유 드라이브 ID(비우면 내 드라이브)
+        #[arg(long)]
+        shared_drive: Option<String>,
+        /// 드라이브 루트로 쓸 폴더 ID
+        #[arg(long)]
+        root_folder: Option<String>,
+    },
 }
 
 /// 입력받아 저장할 비밀 값(대상 이름, 안내 문구)
@@ -377,6 +398,92 @@ fn backend_config(id: &str, b: AddBackend, asks: &mut Vec<Ask>) -> Result<Backen
             encoding,
             root,
         }),
+        AddBackend::Gdrive {
+            client_id,
+            client_secret_env,
+            ask_client_secret,
+            shared_drive,
+            root_folder,
+        } => BackendConfig::GoogleDrive(GoogleDriveConfig {
+            client_id: client_id.trim().to_owned(),
+            client_secret: secret_ref(
+                id,
+                "client_secret",
+                client_secret_env,
+                ask_client_secret,
+                asks,
+            ),
+            // 로그인으로 받은 값을 저장합니다.
+            refresh_token: SecretSource::Credential {
+                target: target_for(id, "refresh_token"),
+            },
+            shared_drive_id: drive_id_arg("공유 드라이브 ID", shared_drive)?,
+            root_folder_id: drive_id_arg("루트 폴더 ID", root_folder)?,
+            account: None,
+        }),
+    })
+}
+
+/// Google Drive 항목 ID(영문, 숫자, `-`, `_`). 비우면 `None`입니다.
+fn drive_id_arg(what: &str, value: Option<String>) -> Result<Option<String>> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v)
+            if v.len() <= 256
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) =>
+        {
+            Ok(Some(v.to_owned()))
+        }
+        Some(v) => Err(Error::Config(format!("{what} {v:?}가 올바르지 않습니다"))),
+    }
+}
+
+/// 입력은 했지만 아직 저장하지 않은 비밀 값을 먼저 쓰고, 없으면 환경 변수와 자격 증명 관리자에서 찾습니다.
+struct TypedFirst<'a>(&'a [(String, SecretString)]);
+
+impl SecretResolver for TypedFirst<'_> {
+    fn resolve(&self, source: &SecretSource) -> Result<SecretString> {
+        if let SecretSource::Credential { target } = source
+            && let Some((_, v)) = self.0.iter().find(|(t, _)| t == target)
+        {
+            return Ok(v.clone());
+        }
+        match source {
+            SecretSource::Env { .. } => EnvSecrets.resolve(source),
+            SecretSource::Credential { .. } => Secrets.resolve(source),
+        }
+    }
+}
+
+/// 브라우저로 Google 계정에 로그인하고 갱신 토큰과 계정 이메일을 받습니다.
+fn google_sign_in(
+    g: &GoogleDriveConfig,
+    proxy: Option<&ProxyConfig>,
+    secrets: &dyn SecretResolver,
+) -> Result<(SecretString, Option<String>)> {
+    use expandrv_backends::gdrive::{self, oauth};
+    let client = oauth::OAuthClient {
+        id: g.client_id.clone(),
+        secret: g
+            .client_secret
+            .as_ref()
+            .map(|s| secrets.resolve(s))
+            .transpose()?,
+    };
+    let http = gdrive::sign_in_client(proxy, secrets)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let auth = oauth::sign_in(&http, &client, |url| {
+            println!("브라우저에서 Google 계정으로 로그인하고 Drive 접근을 허용하세요.");
+            println!("브라우저가 열리지 않으면 이 주소를 여세요:\n{url}");
+            if let Err(e) = oauth::open_browser(url) {
+                eprintln!("브라우저를 열지 못했습니다: {e}");
+            }
+        })
+        .await?;
+        let account = gdrive::account_for(&http, &client, &auth).await;
+        Ok((auth.refresh_token, account))
     })
 }
 
@@ -481,13 +588,29 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
     });
     cfg.validate()?;
 
+    // 입력할 비밀 값을 모두 받은 뒤 Google 로그인을 진행합니다.
+    let mut values = Vec::new();
+    for ask in &asks {
+        values.push((ask.target.clone(), read_secret(&ask.prompt)?));
+    }
+    let drive = cfg.drives.last_mut().expect("방금 추가한 드라이브");
+    let proxy = drive.proxy.clone();
+    if let BackendConfig::GoogleDrive(g) = &mut drive.backend {
+        let (token, account) = google_sign_in(g, proxy.as_ref(), &TypedFirst(&values))?;
+        if let Some(a) = &account {
+            println!("로그인했습니다: {a}");
+        }
+        g.account = account;
+        values.push((target_for(&id, "refresh_token"), token));
+    }
+
     // 비밀 값을 먼저 저장하고, 설정 저장이 실패하면 되돌립니다.
     let store = CredentialStore;
     let mut stored = Vec::new();
     let saved = (|| {
-        for ask in &asks {
-            store.set(&ask.target, &read_secret(&ask.prompt)?)?;
-            stored.push(ask.target.clone());
+        for (target, value) in &values {
+            store.set(target, value)?;
+            stored.push(target.clone());
         }
         cfg.save(cfg_path)
     })();
@@ -501,6 +624,33 @@ fn add(cfg_path: &Path, a: AddArgs) -> Result<()> {
     for t in &stored {
         println!("비밀 값을 자격 증명 관리자에 저장했습니다: {t}");
     }
+    Ok(())
+}
+
+/// Google Drive 드라이브의 갱신 토큰을 새로 받습니다.
+fn login(cfg_path: &Path, id: &str) -> Result<()> {
+    let mut cfg = Config::load(cfg_path)?;
+    let d = cfg
+        .drives
+        .iter_mut()
+        .find(|d| d.id == id)
+        .ok_or_else(|| Error::Config(format!("드라이브 {id}가 없습니다")))?;
+    let proxy = d.proxy.clone();
+    let BackendConfig::GoogleDrive(g) = &mut d.backend else {
+        return Err(Error::Config(
+            "Google Drive 드라이브만 다시 로그인할 수 있습니다".into(),
+        ));
+    };
+    let (token, account) = google_sign_in(g, proxy.as_ref(), &Secrets)?;
+    let target = target_for(id, "refresh_token");
+    CredentialStore.set(&target, &token)?;
+    g.refresh_token = SecretSource::Credential { target };
+    if account.is_some() {
+        g.account = account;
+    }
+    cfg.save(cfg_path)?;
+    println!("다시 로그인했습니다: {id}");
+    println!("마운트 중이면 해제한 뒤 다시 마운트해야 새 로그인을 씁니다.");
     Ok(())
 }
 
@@ -722,6 +872,11 @@ fn run(cli: Cli) -> Result<()> {
                 println!("연결 성공: {} 루트 항목 {n}개", be.kind());
                 Ok(())
             })
+        }
+        Command::Login { id } => {
+            login(&cfg_path, &id)?;
+            notify_reload(&pipe);
+            Ok(())
         }
         Command::Mount { ids } => mount(&cfg_path, &pipe, &ids),
         Command::Unmount { id } => unmount(&pipe, &id),
@@ -1051,6 +1206,60 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_parses_google_drive_add() {
+        let cli = Cli::try_parse_from([
+            "expandrv",
+            "add",
+            "gd",
+            "G:",
+            "gdrive",
+            "--client-id",
+            " 123.apps.googleusercontent.com ",
+            "--ask-client-secret",
+            "--shared-drive",
+            "0AbC_d-1",
+        ])
+        .unwrap();
+        let Command::Add(a) = cli.command else {
+            panic!()
+        };
+        let mut asks = Vec::new();
+        let BackendConfig::GoogleDrive(g) = backend_config(&a.id, a.backend, &mut asks).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(g.client_id, "123.apps.googleusercontent.com");
+        assert_eq!(g.shared_drive_id.as_deref(), Some("0AbC_d-1"));
+        assert_eq!(
+            g.refresh_token,
+            SecretSource::Credential {
+                target: "ExpanDrv/gd/refresh_token".into()
+            }
+        );
+        // 클라이언트 보안 비밀만 입력받고 갱신 토큰은 로그인으로 받습니다.
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].target, "ExpanDrv/gd/client_secret");
+
+        let cli = Cli::try_parse_from([
+            "expandrv",
+            "add",
+            "gd",
+            "G:",
+            "gdrive",
+            "--client-id",
+            "c",
+            "--root-folder",
+            "../x",
+        ])
+        .unwrap();
+        let Command::Add(a) = cli.command else {
+            panic!()
+        };
+        assert!(backend_config(&a.id, a.backend, &mut Vec::new()).is_err());
+        assert!(Cli::try_parse_from(["expandrv", "login", "gd"]).is_ok());
     }
 
     #[test]
