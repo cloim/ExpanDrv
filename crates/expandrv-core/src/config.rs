@@ -221,11 +221,15 @@ pub struct TransferConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum BackendConfig {
-    Local { root: PathBuf },
+    Local {
+        root: PathBuf,
+    },
     Webdav(WebDavConfig),
     Sftp(SftpConfig),
     S3(S3Config),
     Ftp(FtpConfig),
+    #[serde(rename = "gdrive")]
+    GoogleDrive(GoogleDriveConfig),
 }
 
 impl BackendConfig {
@@ -236,8 +240,31 @@ impl BackendConfig {
             BackendConfig::Sftp(_) => "sftp",
             BackendConfig::S3(_) => "s3",
             BackendConfig::Ftp(_) => "ftp",
+            BackendConfig::GoogleDrive(_) => "gdrive",
         }
     }
+}
+
+/// Google Drive(API v3). OAuth 2.0 PKCE로 받은 갱신 토큰으로 접근 토큰을 발급받습니다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoogleDriveConfig {
+    /// Google Cloud 콘솔에서 만든 OAuth 클라이언트 ID(데스크톱 앱 유형)
+    pub client_id: String,
+    /// 데스크톱 앱 클라이언트 보안 비밀. Google 토큰 엔드포인트가 PKCE와 함께 요구합니다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SecretSource>,
+    /// 로그인으로 받은 OAuth 갱신 토큰
+    pub refresh_token: SecretSource,
+    /// 공유 드라이브 ID. 비우면 내 드라이브입니다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_drive_id: Option<String>,
+    /// 드라이브 루트로 쓸 폴더 ID. 비우면 내 드라이브 또는 공유 드라이브의 최상위입니다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_folder_id: Option<String>,
+    /// 표시용 계정 이메일
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -809,6 +836,40 @@ root = 'C:\tmp'
         assert_eq!(loaded.notifications, cfg.notifications);
         assert!(!loaded.notifications.allows(NotificationKind::LockRecovery));
         assert!(loaded.notifications.allows(NotificationKind::MountStatus));
+    }
+
+    #[test]
+    fn google_drive_backend_roundtrips_with_references_only() {
+        let text = r#"
+[[drive]]
+id = "gd"
+label = "Google"
+mount_point = "G:"
+[drive.backend]
+type = "gdrive"
+client_id = "123.apps.googleusercontent.com"
+client_secret = { from = "credential", target = "ExpanDrv/gd/client_secret" }
+refresh_token = { from = "credential", target = "ExpanDrv/gd/refresh_token" }
+shared_drive_id = "0AbCdEf"
+"#;
+        let mut cfg: Config = toml::from_str(text).unwrap();
+        cfg.version = CONFIG_VERSION;
+        let BackendConfig::GoogleDrive(g) = &cfg.drives[0].backend else {
+            panic!("Google Drive 설정이 아닙니다");
+        };
+        assert_eq!(cfg.drives[0].backend.kind(), "gdrive");
+        assert_eq!(g.shared_drive_id.as_deref(), Some("0AbCdEf"));
+        assert!(g.root_folder_id.is_none());
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(saved.contains("type = \"gdrive\""), "{saved}");
+        assert!(!saved.contains("root_folder_id"), "{saved}");
+        assert_eq!(toml::from_str::<Config>(&saved).unwrap(), cfg);
+        // 갱신 토큰을 값으로 직접 넣을 수 없습니다.
+        let inline = text.replace(
+            r#"refresh_token = { from = "credential", target = "ExpanDrv/gd/refresh_token" }"#,
+            r#"refresh_token = "1//plain""#,
+        );
+        assert!(toml::from_str::<Config>(&inline).is_err());
     }
 
     #[test]
