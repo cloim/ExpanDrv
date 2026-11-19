@@ -27,6 +27,19 @@ fn main() {
     if let Some(config) = &launch.config {
         paths.config = expandrv_core::config::expand_tilde(config);
     }
+    if launch.autostart {
+        // 시작 앱: 창을 만들지 않고 에이전트만 띄운 뒤 끝냅니다.
+        let r = tauri::async_runtime::block_on(agent::launch_autostart(
+            &paths.pipe,
+            &paths.config,
+            &paths.cli,
+        ));
+        if let Err(e) = r {
+            log_autostart_error(&paths.log_dir, &e);
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .manage(launch)
         .manage(AppState {
@@ -62,6 +75,23 @@ fn main() {
         .plugin(navigation_guard())
         .run(tauri::generate_context!())
         .expect("ExpanDrv GUI 실행 실패");
+}
+
+/// 콘솔이 없으므로 자동 실행 실패를 로그 폴더에 남깁니다.
+fn log_autostart_error(log_dir: &std::path::Path, message: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(log_dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("autostart.log"))
+    {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let _ = writeln!(f, "[{secs}] 자동 실행 실패: {message}");
+    }
 }
 
 fn navigation_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {

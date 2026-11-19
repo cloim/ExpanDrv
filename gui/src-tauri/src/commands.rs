@@ -510,7 +510,8 @@ async fn settings_view(state: &AppState) -> Result<SettingsView> {
     })
 }
 
-/// 로그인 자동 실행을 켜거나 끕니다. 등록 명령은 CLI 에이전트를 가리킵니다(`expandrv autostart enable`과 같음).
+/// 로그인 자동 실행(시작 앱)을 켜거나 끕니다. 등록 명령은 콘솔 창이 없는 이 GUI를
+/// `--autostart`로 실행하며, GUI는 창 없이 CLI 에이전트를 띄우고 끝납니다(`expandrv autostart enable`과 같음).
 #[tauri::command]
 pub async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<SettingsView> {
     use expandrv_autostart::{disable, enable};
@@ -519,9 +520,9 @@ pub async fn set_autostart(state: State<'_, AppState>, enabled: bool) -> Result<
         if !p.cli.is_file() {
             return Err(format!("CLI 실행 파일이 없습니다: {}", p.cli.display()));
         }
-        let exe = std::path::absolute(&p.cli).map_err(|e| e.to_string())?;
+        let gui = std::env::current_exe().map_err(|e| e.to_string())?;
         let cfg = std::path::absolute(&p.config).map_err(|e| e.to_string())?;
-        enable(&exe, &cfg)
+        enable(&gui, &cfg)
     } else {
         disable()
     };

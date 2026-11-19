@@ -95,7 +95,7 @@ pub async fn start(pipe: &str, cfg_path: &Path, cli: &Path, log_dir: &Path) -> R
     if let Some(link) = connect(pipe).await? {
         return Ok(link);
     }
-    let mut child = spawn(pipe, cfg_path, cli)?;
+    let mut child = spawn(pipe, cfg_path, cli, false)?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         match IpcClient::connect_to(pipe, Duration::from_millis(200)).await {
@@ -116,8 +116,16 @@ pub async fn start(pipe: &str, cfg_path: &Path, cli: &Path, log_dir: &Path) -> R
     }
 }
 
+/// 로그인 자동 실행: 에이전트가 없으면 `--autostart`로 띄우고 응답을 기다리지 않습니다.
+pub async fn launch_autostart(pipe: &str, cfg_path: &Path, cli: &Path) -> Result<()> {
+    if connect(pipe).await?.is_some() {
+        return Ok(());
+    }
+    spawn(pipe, cfg_path, cli, true).map(drop)
+}
+
 /// 콘솔 창 없이, GUI와 분리된 프로세스 그룹으로 에이전트를 띄웁니다. GUI를 닫아도 에이전트는 남습니다.
-fn spawn(pipe: &str, cfg_path: &Path, cli: &Path) -> Result<std::process::Child> {
+fn spawn(pipe: &str, cfg_path: &Path, cli: &Path, autostart: bool) -> Result<std::process::Child> {
     if !cli.is_file() {
         return Err(format!(
             "CLI 실행 파일이 없습니다: {}. GUI와 같은 폴더에 expandrv.exe를 두세요",
@@ -134,6 +142,9 @@ fn spawn(pipe: &str, cfg_path: &Path, cli: &Path) -> Result<std::process::Child>
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if autostart {
+        cmd.arg("--autostart");
+    }
     if let Some(dir) = cli.parent() {
         cmd.current_dir(dir);
     }

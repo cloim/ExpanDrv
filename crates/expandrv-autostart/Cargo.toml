@@ -1,6 +1,6 @@
 [package]
 name = "expandrv-autostart"
-description = "ExpanDrv 로그인 자동 실행 등록(시작 앱 바로가기). CLI와 GUI가 함께 씁니다"
+description = "ExpanDrv 로그인 자동 실행 등록(현재 사용자 Run 키, 시작 앱). CLI와 GUI가 함께 씁니다"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,15 +11,8 @@ license.workspace = true
 expandrv-core.workspace = true
 windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Com",
     "Win32_System_Registry",
-    "Win32_UI_Shell",
 ] }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
-

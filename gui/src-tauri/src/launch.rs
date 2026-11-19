@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub struct Launch {
     pub config: Option<PathBuf>,
     pub manage_path: Option<PathBuf>,
+    /// 로그인 자동 실행(시작 앱): 창 없이 에이전트만 띄우고 끝냅니다.
+    pub autostart: bool,
 }
 
 impl Launch {
@@ -14,6 +16,13 @@ impl Launch {
         let mut launch = Self::default();
         while let Some(arg) = args.next() {
             let slot = match arg.to_str() {
+                Some("--autostart") => {
+                    if launch.autostart {
+                        return Err("GUI 실행 인자가 중복되었습니다".into());
+                    }
+                    launch.autostart = true;
+                    continue;
+                }
                 Some("--config") => &mut launch.config,
                 Some("--manage-path") => &mut launch.manage_path,
                 _ => return Err("지원하지 않는 GUI 실행 인자입니다".into()),
@@ -51,6 +60,13 @@ mod tests {
             PathBuf::from(r"C:\한글 설정\config.toml")
         );
         assert_eq!(launch.manage_path.unwrap(), PathBuf::from(r"X:\\."));
+        assert!(!launch.autostart);
+        let auto =
+            Launch::parse(["--config", r"C:\cfg\config.toml", "--autostart"].map(OsString::from))
+                .unwrap();
+        assert!(auto.autostart);
+        assert_eq!(auto.config.unwrap(), PathBuf::from(r"C:\cfg\config.toml"));
+        assert!(Launch::parse(["--autostart", "--autostart"].map(OsString::from)).is_err());
         assert!(Launch::parse(["--manage-path"].map(OsString::from)).is_err());
         assert!(Launch::parse(["--unknown", "path"].map(OsString::from)).is_err());
         assert!(Launch::parse(["--config", "a", "--config", "b"].map(OsString::from)).is_err());

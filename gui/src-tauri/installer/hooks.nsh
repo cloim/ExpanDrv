@@ -63,10 +63,27 @@ FunctionEnd
   ${EndIf}
 !macroend
 
+; 실패해도 설치를 멈추지 않는 CLI 실행(자동 실행 등록 등 부가 작업)
+!macro ExpanDrvTryCli ARGUMENTS
+  ${If} ${FileExists} "$INSTDIR\expandrv.exe"
+    nsExec::ExecToStack /TIMEOUT=30000 '"$INSTDIR\expandrv.exe" ${ARGUMENTS}'
+    Pop $0
+    Pop $1
+    DetailPrint "$1"
+  ${EndIf}
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  ; 로그인 자동 실행을 시작 앱(HKCU Run → 콘솔 창 없는 GUI)으로 등록합니다.
+  ; 사용자가 끈 상태는 유지하고, 이전 버전의 시작 프로그램 바로가기는 새 방식으로 옮깁니다.
+  !insertmacro ExpanDrvTryCli "autostart install"
+!macroend
+
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro ExpanDrvRunCli "stop"
   ${If} $UpdateMode != 1
     !insertmacro ExpanDrvRunCli "shell disable-local"
+    !insertmacro ExpanDrvTryCli "autostart uninstall"
   ${EndIf}
   DetailPrint "설정, 자격 증명, 캐시와 업로드 대기 파일은 보존합니다."
 !macroend

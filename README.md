@@ -38,7 +38,7 @@ FTPS에서 `UnknownIssuer`가 표시되면 서버 인증서의 발급자를 Wind
   - 로그에 섞인 비밀번호, 토큰, URL 자격 증명, 서명 값, 사용자 계정 이름을 출력 직전에 가립니다.
   - TLS는 rustls(ring)로 처리하고 TLS 1.2 이상만 허용합니다. 텔레메트리는 없습니다.
 - **전송 제한과 프록시:** 드라이브별 업로드와 다운로드 속도 제한, SOCKS5(socks5h)와 HTTP CONNECT 프록시(FTP 데이터 연결 포함)
-- **자동 실행:** 로그인할 때 에이전트를 시작하고 지정한 드라이브를 자동으로 마운트
+- **자동 실행:** Windows `시작 앱`(현재 사용자 Run 키)에 등록해 로그인할 때 콘솔 창 없이 에이전트를 시작하고 지정한 드라이브를 자동으로 마운트. 설치 프로그램이 기본으로 등록하며, 사용자가 끈 상태는 다시 설치해도 유지
 
 ## 요구 사항
 
@@ -129,7 +129,7 @@ expandrv unmount nas        # 남은 업로드를 마친 뒤 해제
 expandrv stop               # 모두 해제하고 에이전트 종료
 expandrv secret set nas password    # 저장한 암호 바꾸기
 expandrv secret list                # 저장한 비밀 값 대상 이름(값은 보이지 않음)
-expandrv autostart enable           # 로그인할 때 시작하고 --auto-mount 드라이브 마운트
+expandrv autostart enable           # 시작 앱 등록: 로그인할 때 창 없이 시작하고 --auto-mount 드라이브 마운트
 ```
 
 `--ask-*` 옵션은 터미널이면 화면에 보이지 않게 입력받고, 파이프로 실행하면 표준 입력 한 줄을 읽습니다. 저장 위치는 `ExpanDrv/<드라이브 id>/<항목>`이고, `expandrv remove`로 드라이브를 지우면 함께 지워집니다.
@@ -242,7 +242,7 @@ pwsh -File scripts/check.ps1   # fmt, clippy -D warnings, test
 | `expandrv-ipc` | 소유자 전용 이름 있는 파이프 IPC(GUI와 CLI가 에이전트를 제어) |
 | `expandrv-log` | 로그 비밀 값과 개인정보 마스킹 |
 | `expandrv-shell` | 현재 사용자 탐색기 메뉴 등록과 마운트 경로 식별 |
-| `expandrv-autostart` | 로그인 자동 실행 등록(현재 사용자 Run 키) |
+| `expandrv-autostart` | 로그인 자동 실행 등록(현재 사용자 Run 키 → `expandrv-gui.exe --autostart`, 시작 앱) |
 | `expandrv-agent` | `expandrv` CLI와 상주 에이전트 |
 | `gui` | 데스크톱 GUI(Tauri 2, React). `gui/src-tauri`가 `expandrv-gui` 크레이트 |
 

@@ -116,6 +116,12 @@ enum AutostartAction {
     Enable,
     Disable,
     Status,
+    /// 설치 프로그램용: 사용자가 끄지 않았으면 등록하고 이전 방식 등록을 옮깁니다
+    #[command(hide = true)]
+    Install,
+    /// 제거 프로그램용: 등록을 지웁니다(사용자가 끈 기록은 남김)
+    #[command(hide = true)]
+    Uninstall,
 }
 
 #[derive(Args)]
@@ -820,11 +826,22 @@ fn secret(action: SecretAction) -> Result<()> {
 }
 
 fn autostart_cmd(action: AutostartAction, cfg_path: &Path) -> Result<()> {
+    // 시작 앱은 콘솔이 없는 GUI 실행 파일을 가리켜 로그인할 때 터미널 창이 뜨지 않게 합니다.
+    let gui = || -> Result<PathBuf> {
+        let gui = autostart::gui_exe_for(&std::env::current_exe()?);
+        if !gui.is_file() {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "GUI 실행 파일이 없습니다: {}. CLI와 같은 폴더에 {}를 두세요",
+                gui.display(),
+                autostart::GUI_EXE
+            ))));
+        }
+        Ok(gui)
+    };
     match action {
         AutostartAction::Enable => {
-            let exe = std::env::current_exe()?;
             let cfg_abs = std::path::absolute(cfg_path)?;
-            autostart::enable(&exe, &cfg_abs)?;
+            autostart::enable(&gui()?, &cfg_abs)?;
             println!("로그인할 때 에이전트를 자동으로 시작합니다(시작 앱).");
             let cfg = Config::load(cfg_path)?;
             if !cfg.drives.iter().any(|d| d.auto_mount) {
@@ -839,6 +856,22 @@ fn autostart_cmd(action: AutostartAction, cfg_path: &Path) -> Result<()> {
             Some(cmd) => println!("켜짐: {cmd}"),
             None => println!("꺼짐"),
         },
+        AutostartAction::Install => {
+            let cfg_abs = std::path::absolute(cfg_path)?;
+            if autostart::install(&gui()?, &cfg_abs)? {
+                println!("시작 앱으로 등록했습니다.");
+            } else {
+                println!("사용자가 끈 자동 시작은 그대로 둡니다.");
+            }
+        }
+        AutostartAction::Uninstall => {
+            let gui = autostart::gui_exe_for(&std::env::current_exe()?);
+            if autostart::uninstall(&gui)? {
+                println!("시작 앱 등록을 지웠습니다.");
+            } else {
+                println!("이 설치본의 시작 앱 등록이 없습니다.");
+            }
+        }
     }
     Ok(())
 }
